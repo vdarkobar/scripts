@@ -36,7 +36,7 @@ trap 'trap - ERR; rc=$?;
   exit "$rc"
 ' ERR
 
-# ── Preflight ─────────────────────────────────────────────────────────────────
+# ── Preflight (root) ──────────────────────────────────────────────────────────
 [[ "$(id -u)" -eq 0 ]] || { echo "  ERROR: Run as root on the Proxmox host." >&2; exit 1; }
 
 for cmd in pvesh pveam pct pvesm; do
@@ -44,14 +44,6 @@ for cmd in pvesh pveam pct pvesm; do
 done
 
 [[ -n "$CT_ID" ]] || { echo "  ERROR: Could not obtain next CT ID." >&2; exit 1; }
-
-pvesm status | awk -v s="$TEMPLATE_STORAGE" '$1==s{f=1} END{exit(!f)}' \
-  || { echo "  ERROR: Template storage not found: $TEMPLATE_STORAGE" >&2; exit 1; }
-
-pvesm status | awk -v s="$CONTAINER_STORAGE" '$1==s{f=1} END{exit(!f)}' \
-  || { echo "  ERROR: Container storage not found: $CONTAINER_STORAGE" >&2; exit 1; }
-
-ip link show "$BRIDGE" >/dev/null 2>&1 || { echo "  ERROR: Bridge not found: $BRIDGE" >&2; exit 1; }
 
 # ── Show defaults & confirm ───────────────────────────────────────────────────
 cat <<EOF
@@ -85,6 +77,15 @@ case "$response" in
   *) echo "  Cancelled."; exit 0 ;;
 esac
 echo ""
+
+# ── Preflight (environment) ───────────────────────────────────────────────────
+pvesm status | awk -v s="$TEMPLATE_STORAGE" '$1==s{f=1} END{exit(!f)}' \
+  || { echo "  ERROR: Template storage not found: $TEMPLATE_STORAGE" >&2; exit 1; }
+
+pvesm status | awk -v s="$CONTAINER_STORAGE" '$1==s{f=1} END{exit(!f)}' \
+  || { echo "  ERROR: Container storage not found: $CONTAINER_STORAGE" >&2; exit 1; }
+
+ip link show "$BRIDGE" >/dev/null 2>&1 || { echo "  ERROR: Bridge not found: $BRIDGE" >&2; exit 1; }
 
 # ── Root password ─────────────────────────────────────────────────────────────
 PASSWORD=""
