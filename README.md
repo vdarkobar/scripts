@@ -12,7 +12,7 @@ chmod +x scripts/npm-podman.sh && \
   
 ```bash
 mkdir -p scripts && \
-wget -O scripts/npm-podman.sh https://raw.githubusercontent.com/vdarkobar/scripts/main/unbound.sh && \
+wget -O scripts/unbound.sh https://raw.githubusercontent.com/vdarkobar/scripts/main/unbound.sh && \
 chmod +x scripts/unbound.sh && \
 ./scripts/unbound.sh  
 ```
