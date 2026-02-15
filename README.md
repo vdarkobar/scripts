@@ -2,6 +2,13 @@
 Proxmox scripts
 
 ### Quick Install:  
+
+```bash
+mkdir -p scripts && \
+wget -O scripts/deblxc.sh https://raw.githubusercontent.com/vdarkobar/scripts/main/deblxc.sh && \
+chmod +x scripts/deblxc.sh && \
+./scripts/deblxc.sh 
+```
   
 ```bash
 mkdir -p scripts && \
