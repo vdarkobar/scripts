@@ -1,7 +1,7 @@
 # scripts
-Proxmox scripts
+###Proxmox scripts  
 
-### Quick Install:  
+## Quick Install:  
 
 ```bash
 mkdir -p scripts && \
@@ -26,17 +26,18 @@ chmod +x scripts/unbound.sh && \
   
 ```bash
 mkdir -p scripts && \
-wget -O scripts/updatelxc.sh https://raw.githubusercontent.com/vdarkobar/scripts/main/updatelxc.sh && \
-chmod +x scripts/updatelxc.sh && \
-./scripts/updatelxc.sh
-```
-  
-```bash
-mkdir -p scripts && \
 wget -O scripts/samba.sh https://raw.githubusercontent.com/vdarkobar/scripts/main/samba.sh && \
 chmod +x scripts/samba.sh && \
 ./scripts/samba.sh
 ```
+  
+```bash
+mkdir -p scripts && \
+wget -O scripts/updatelxc.sh https://raw.githubusercontent.com/vdarkobar/scripts/main/updatelxc.sh && \
+chmod +x scripts/updatelxc.sh && \
+./scripts/updatelxc.sh
+```
+
 
 
 
