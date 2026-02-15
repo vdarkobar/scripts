@@ -25,10 +25,9 @@ DEBIAN_VERSION=13
 CLEANUP_ON_FAIL=1  # 1 = destroy CT on error, 0 = keep for debugging
 
 # ── Trap cleanup ──────────────────────────────────────────────────────────────
-# Error
-CREATED=0
 trap 'trap - ERR; rc=$?;
   echo "  ERROR: failed (rc=$rc) near line ${BASH_LINENO[0]:-?}" >&2
+  echo "  Command: $BASH_COMMAND" >&2
   if [[ "${CLEANUP_ON_FAIL:-0}" -eq 1 && "${CREATED:-0}" -eq 1 ]]; then
     echo "  Cleanup: stopping/destroying CT ${CT_ID} ..." >&2
     pct stop "${CT_ID}" >/dev/null 2>&1 || true
@@ -37,9 +36,9 @@ trap 'trap - ERR; rc=$?;
   exit "$rc"
 ' ERR
 
-# Ctrl+C / stop
 trap 'rc=$?;
-  echo "  Interrupted (rc=$rc). Cleaning up..." >&2
+  echo "  Interrupted (rc=$rc)" >&2
+  echo "  Command: $BASH_COMMAND" >&2
   if [[ "${CLEANUP_ON_FAIL:-0}" -eq 1 && "${CREATED:-0}" -eq 1 ]]; then
     echo "  Cleanup: stopping/destroying CT ${CT_ID} ..." >&2
     pct stop "${CT_ID}" >/dev/null 2>&1 || true
