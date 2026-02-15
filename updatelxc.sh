@@ -160,7 +160,9 @@ while read -r CT_ID CT_STATUS _LOCK _NAME; do
     continue
   fi
 
-  # ── Snapshot ──────────────────────────────────────────────────────────────
+  # ── Process container ──────────────────────────────────────────────────────
+  echo ""
+
   if [[ $TAKE_SNAPSHOT -eq 1 ]]; then
     snap_name="${SNAPSHOT_PREFIX}-${CT_ID}-$(date '+%Y%m%d-%H%M%S')"
     echo "  Snapshot $CT_ID → $snap_name"
