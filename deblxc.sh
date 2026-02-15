@@ -20,7 +20,6 @@ DEBIAN_VERSION=13
 CLEANUP_ON_FAIL=1  # 1 = destroy CT on error, 0 = keep for debugging
 
 # ── Trap cleanup ──────────────────────────────────────────────────────────────
-
 # Error
 CREATED=0
 trap 'trap - ERR; rc=$?;
