@@ -667,6 +667,8 @@ pct exec "$CT_ID" -- bash -lc '
 Unattended-Upgrade::Origins-Pattern {
         "origin=Debian,codename=${distro_codename},label=Debian-Security";
         "origin=Debian,codename=${distro_codename}-security";
+        "origin=Debian,codename=${distro_codename},label=Debian";
+        "origin=Debian,codename=${distro_codename}-updates,label=Debian";
 };
 Unattended-Upgrade::Package-Blacklist {
 };
