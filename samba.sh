@@ -40,8 +40,8 @@ fail=""
 [[ "$SMB_GROUP"          =~ ^[a-z_][a-z0-9_-]*$ ]]   || fail="SMB_GROUP"
 [[ "$SMB_SHARE_PATH"     =~ ^/[A-Za-z0-9/_.-]+$ ]]   || fail="SMB_SHARE_PATH"
 [[ "$SMB_MIN_PROTOCOL"   =~ ^[A-Za-z0-9_]+$ ]]       || fail="SMB_MIN_PROTOCOL"
-[[ "$SMB_SERVER_SIGNING" =~ ^[a-z]+$ ]]               || fail="SMB_SERVER_SIGNING"
-[[ "$SMB_ENCRYPTION"     =~ ^[a-z]+$ ]]               || fail="SMB_ENCRYPTION"
+[[ "$SMB_SERVER_SIGNING" =~ ^[a-z]+$ ]]              || fail="SMB_SERVER_SIGNING"
+[[ "$SMB_ENCRYPTION"     =~ ^[a-z]+$ ]]              || fail="SMB_ENCRYPTION"
 if [[ -n "$fail" ]]; then
   echo "  ERROR: Invalid characters in $fail — check the Config section." >&2
   exit 1
