@@ -138,7 +138,7 @@ PCT_OPTIONS=(
   -unprivileged 1
   -features "nesting=1"
   -tags "$TAGS"
-  -net0 "name=eth0,bridge=${BRIDGE},ip=dhcp,ip6=SLAAC"
+  -net0 "name=eth0,bridge=${BRIDGE},ip=dhcp"
 )
 [[ -n "$PASSWORD" ]] && PCT_OPTIONS+=(-password "$PASSWORD")
 
