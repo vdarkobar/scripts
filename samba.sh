@@ -267,20 +267,6 @@ pct exec "$CT_ID" -- bash -lc '
   apt-get install -y samba samba-common-bin acl attr
 '
 
-# ── Harden system crypto policy ─────────────────────────────────────────────
-pct exec "$CT_ID" -- bash -lc '
-  set -euo pipefail
-  mkdir -p /etc/gnutls
-  cat > /etc/gnutls/config <<EOF
-[global]
-override-mode = blocklist
-
-[overrides]
-insecure-hash = SHA1
-insecure-sig = RSA-SHA1
-EOF
-'
-
 # ── Create group and share directory ─────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc "
   set -euo pipefail
@@ -386,6 +372,9 @@ pct exec "$CT_ID" -- bash -lc "
 "
 
 # ── Validate config ─────────────────────────────────────────────────────────
+# Note: "Weak crypto is allowed by GnuTLS" is a cosmetic testparm message
+# reflecting system GnuTLS state, not a config problem. Safe to ignore —
+# smb.conf enforces SMB3 + mandatory encryption + ntlmv2-only.
 if pct exec "$CT_ID" -- testparm -s /etc/samba/smb.conf >/dev/null 2>&1; then
   echo "  Configuration validation passed"
 else
