@@ -32,6 +32,21 @@ DEBIAN_VERSION=13
 # Behavior
 CLEANUP_ON_FAIL=1  # 1 = destroy CT on error, 0 = keep for debugging
 
+# ── Validate config values (guard against sed injection) ─────────────────────
+fail=""
+[[ "$SMB_WORKGROUP"      =~ ^[A-Za-z0-9._-]+$ ]]     || fail="SMB_WORKGROUP"
+[[ "$SMB_SERVER_NAME"    =~ ^[A-Za-z0-9._-]+$ ]]     || fail="SMB_SERVER_NAME"
+[[ "$SMB_SHARE_NAME"     =~ ^[A-Za-z0-9_-]+$ ]]      || fail="SMB_SHARE_NAME"
+[[ "$SMB_GROUP"          =~ ^[a-z_][a-z0-9_-]*$ ]]   || fail="SMB_GROUP"
+[[ "$SMB_SHARE_PATH"     =~ ^/[A-Za-z0-9/_.-]+$ ]]   || fail="SMB_SHARE_PATH"
+[[ "$SMB_MIN_PROTOCOL"   =~ ^[A-Za-z0-9]+$ ]]        || fail="SMB_MIN_PROTOCOL"
+[[ "$SMB_SERVER_SIGNING" =~ ^[a-z]+$ ]]               || fail="SMB_SERVER_SIGNING"
+[[ "$SMB_ENCRYPTION"     =~ ^[a-z]+$ ]]               || fail="SMB_ENCRYPTION"
+if [[ -n "$fail" ]]; then
+  echo "  ERROR: Invalid characters in $fail — check the Config section." >&2
+  exit 1
+fi
+
 # ── Trap cleanup ──────────────────────────────────────────────────────────────
 trap 'trap - ERR; rc=$?;
   echo "  ERROR: failed (rc=$rc) near line ${BASH_LINENO[0]:-?}" >&2
@@ -361,14 +376,14 @@ SAMBA_CONF
 # Replace placeholders
 pct exec "$CT_ID" -- bash -lc "
   set -euo pipefail
-  sed -i 's/__WORKGROUP__/${SMB_WORKGROUP}/g'     /etc/samba/smb.conf
-  sed -i 's/__SERVER_NAME__/${SMB_SERVER_NAME}/g'  /etc/samba/smb.conf
-  sed -i 's/__MIN_PROTOCOL__/${SMB_MIN_PROTOCOL}/g' /etc/samba/smb.conf
-  sed -i 's/__SERVER_SIGNING__/${SMB_SERVER_SIGNING}/g' /etc/samba/smb.conf
-  sed -i 's/__SMB_ENCRYPTION__/${SMB_ENCRYPTION}/g' /etc/samba/smb.conf
-  sed -i 's/__SHARE_NAME__/${SMB_SHARE_NAME}/g'   /etc/samba/smb.conf
-  sed -i 's|__SHARE_PATH__|${SMB_SHARE_PATH}|g'   /etc/samba/smb.conf
-  sed -i 's/__GROUP__/${SMB_GROUP}/g'              /etc/samba/smb.conf
+  sed -i 's|__WORKGROUP__|${SMB_WORKGROUP}|g'            /etc/samba/smb.conf
+  sed -i 's|__SERVER_NAME__|${SMB_SERVER_NAME}|g'        /etc/samba/smb.conf
+  sed -i 's|__MIN_PROTOCOL__|${SMB_MIN_PROTOCOL}|g'      /etc/samba/smb.conf
+  sed -i 's|__SERVER_SIGNING__|${SMB_SERVER_SIGNING}|g'  /etc/samba/smb.conf
+  sed -i 's|__SMB_ENCRYPTION__|${SMB_ENCRYPTION}|g'      /etc/samba/smb.conf
+  sed -i 's|__SHARE_NAME__|${SMB_SHARE_NAME}|g'          /etc/samba/smb.conf
+  sed -i 's|__SHARE_PATH__|${SMB_SHARE_PATH}|g'          /etc/samba/smb.conf
+  sed -i 's|__GROUP__|${SMB_GROUP}|g'                    /etc/samba/smb.conf
 "
 
 # ── Validate config ─────────────────────────────────────────────────────────
@@ -400,12 +415,10 @@ fi
 
 # ── Create first Samba user ──────────────────────────────────────────────────
 if [[ -n "$SMB_USER" ]]; then
-  pct exec "$CT_ID" -- bash -lc "
-    set -euo pipefail
-    useradd -M -s /usr/sbin/nologin -G '${SMB_GROUP}' '${SMB_USER}'
-    printf '%s\n%s\n' '${SMB_USER_PASS}' '${SMB_USER_PASS}' | smbpasswd -a -s '${SMB_USER}'
-    smbpasswd -e '${SMB_USER}'
-  "
+  pct exec "$CT_ID" -- useradd -M -s /usr/sbin/nologin -G "$SMB_GROUP" "$SMB_USER"
+  printf '%s\n%s\n' "$SMB_USER_PASS" "$SMB_USER_PASS" \
+    | pct exec "$CT_ID" -- smbpasswd -a -s "$SMB_USER"
+  pct exec "$CT_ID" -- smbpasswd -e "$SMB_USER"
   echo "  Samba user created: $SMB_USER"
 fi
 
