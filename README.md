@@ -23,7 +23,13 @@ wget -O scripts/unbound.sh https://raw.githubusercontent.com/vdarkobar/scripts/m
 chmod +x scripts/unbound.sh && \
 ./scripts/unbound.sh  
 ```
-
+  
+```bash
+mkdir -p scripts && \
+wget -O scripts/updatelxc.sh https://raw.githubusercontent.com/vdarkobar/scripts/main/updatelxc.sh && \
+chmod +x scripts/updatelxc.sh && \
+./scripts/updatelxc.sh  
+```
 
 
 
