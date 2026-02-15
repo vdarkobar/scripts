@@ -4,8 +4,8 @@ set -Eeo pipefail
 # ── Config ────────────────────────────────────────────────────────────────────
 CT_ID="$(pvesh get /cluster/nextid)"
 HN="samba"
-CPU=2
-RAM=2048
+CPU=4
+RAM=4096
 DISK=8
 BRIDGE="vmbr0"
 TEMPLATE_STORAGE="local"
@@ -18,7 +18,7 @@ SMB_SHARE_PATH="/srv/samba/Data"
 SMB_GROUP="sambashare"
 SMB_WORKGROUP="WORKGROUP"
 SMB_SERVER_NAME="FILESERVER"
-SMB_MIN_PROTOCOL="SMB3"
+SMB_MIN_PROTOCOL="SMB3_11"
 SMB_SERVER_SIGNING="required"
 SMB_ENCRYPTION="required"
 TAGS="samba;fileserver;lxc"
@@ -39,9 +39,9 @@ fail=""
 [[ "$SMB_SHARE_NAME"     =~ ^[A-Za-z0-9_-]+$ ]]      || fail="SMB_SHARE_NAME"
 [[ "$SMB_GROUP"          =~ ^[a-z_][a-z0-9_-]*$ ]]   || fail="SMB_GROUP"
 [[ "$SMB_SHARE_PATH"     =~ ^/[A-Za-z0-9/_.-]+$ ]]   || fail="SMB_SHARE_PATH"
-[[ "$SMB_MIN_PROTOCOL"   =~ ^[A-Za-z0-9]+$ ]]        || fail="SMB_MIN_PROTOCOL"
-[[ "$SMB_SERVER_SIGNING" =~ ^[a-z]+$ ]]              || fail="SMB_SERVER_SIGNING"
-[[ "$SMB_ENCRYPTION"     =~ ^[a-z]+$ ]]              || fail="SMB_ENCRYPTION"
+[[ "$SMB_MIN_PROTOCOL"   =~ ^[A-Za-z0-9_]+$ ]]       || fail="SMB_MIN_PROTOCOL"
+[[ "$SMB_SERVER_SIGNING" =~ ^[a-z]+$ ]]               || fail="SMB_SERVER_SIGNING"
+[[ "$SMB_ENCRYPTION"     =~ ^[a-z]+$ ]]               || fail="SMB_ENCRYPTION"
 if [[ -n "$fail" ]]; then
   echo "  ERROR: Invalid characters in $fail — check the Config section." >&2
   exit 1
@@ -197,7 +197,7 @@ PCT_OPTIONS=(
   -unprivileged 1
   -features "nesting=1"
   -tags "$TAGS"
-  -net0 "name=eth0,bridge=${BRIDGE},ip=dhcp"
+  -net0 "name=eth0,bridge=${BRIDGE},ip=dhcp,ip6=manual"
 )
 [[ -n "$PASSWORD" ]] && PCT_OPTIONS+=(-password "$PASSWORD")
 
@@ -435,8 +435,6 @@ pct exec "$CT_ID" -- bash -lc '
 Unattended-Upgrade::Origins-Pattern {
         "origin=Debian,codename=${distro_codename},label=Debian-Security";
         "origin=Debian,codename=${distro_codename}-security";
-        "origin=Debian,codename=${distro_codename},label=Debian";
-        "origin=Debian,codename=${distro_codename}-updates,label=Debian";
 };
 Unattended-Upgrade::Package-Blacklist {
 };
