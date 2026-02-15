@@ -1,4 +1,4 @@
-# scripts
+# Scripts
 ### Proxmox scripts  
 
 ## Quick Install:  
