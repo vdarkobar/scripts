@@ -25,7 +25,8 @@ DEBIAN_VERSION=13
 # Behavior
 CLEANUP_ON_FAIL=1  # 1 = destroy CT on error, 0 = keep for debugging
 
-# ── Trap cleanup (no functions) ──────────────────────────────────────────────
+# ── Trap cleanup ──────────────────────────────────────────────────────────────
+# Error
 CREATED=0
 trap 'trap - ERR; rc=$?;
   echo "  ERROR: failed (rc=$rc) near line ${BASH_LINENO[0]:-?}" >&2
@@ -36,6 +37,17 @@ trap 'trap - ERR; rc=$?;
   fi
   exit "$rc"
 ' ERR
+
+# Ctrl+C / stop
+trap 'rc=$?;
+  echo "  Interrupted (rc=$rc). Cleaning up..." >&2
+  if [[ "${CLEANUP_ON_FAIL:-0}" -eq 1 && "${CREATED:-0}" -eq 1 ]]; then
+    echo "  Cleanup: stopping/destroying CT ${CT_ID} ..." >&2
+    pct stop "${CT_ID}" >/dev/null 2>&1 || true
+    pct destroy "${CT_ID}" >/dev/null 2>&1 || true
+  fi
+  exit "$rc"
+' INT TERM
 
 # ── Preflight ─────────────────────────────────────────────────────────────────
 [[ "$(id -u)" -eq 0 ]] || { echo "  ERROR: Run as root on the Proxmox host." >&2; exit 1; }
