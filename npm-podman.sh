@@ -21,6 +21,9 @@ NPM_IMAGE="docker.io/jc21/nginx-proxy-manager:latest"
 DB_IMAGE="docker.io/jc21/mariadb-aria:latest"
 DEBIAN_VERSION=13
 
+# Cloudflare Tunnel (optional)
+INSTALL_CLOUDFLARED=0  # 1 = install cloudflared, 0 = skip
+
 # Behavior
 CLEANUP_ON_FAIL=1  # 1 = destroy CT on error, 0 = keep for debugging
 
@@ -28,6 +31,7 @@ CLEANUP_ON_FAIL=1  # 1 = destroy CT on error, 0 = keep for debugging
 #   /etc/update-motd.d/00-header
 #   /etc/update-motd.d/10-sysinfo
 #   /etc/update-motd.d/30-app
+#   /etc/update-motd.d/35-cloudflared           (if INSTALL_CLOUDFLARED=1)
 #   /etc/update-motd.d/99-footer
 #   /etc/systemd/system/container-getty@1.service.d/override.conf
 #   /etc/systemd/system/npm-stack.service
@@ -88,6 +92,7 @@ cat <<EOF
   NPM Image:         $NPM_IMAGE
   DB Image:          $DB_IMAGE
   Cleanup on fail:   $CLEANUP_ON_FAIL
+  Cloudflare Tunnel: $([ "$INSTALL_CLOUDFLARED" -eq 1 ] && echo "yes" || echo "no")
   ────────────────────────────────────────
   To change defaults, press Enter and
   edit the Config section at the top of
@@ -125,6 +130,28 @@ echo ""
 
 if [[ -z "$PASSWORD" ]]; then
   echo "  WARNING: Blank password enables root auto-login on the Proxmox console."
+  echo ""
+fi
+
+# ── Cloudflare Tunnel token ──────────────────────────────────────────────────
+TUNNEL_TOKEN=""
+if [[ "$INSTALL_CLOUDFLARED" -eq 1 ]]; then
+  echo "  Cloudflare Tunnel token is required."
+  echo "  Get it from: Zero Trust dashboard → Networks → Tunnels"
+  echo "  Token looks like: eyJhIjoiNjk2..."
+  echo ""
+  while true; do
+    read -r -p "  Tunnel token: " TUNNEL_TOKEN
+    [[ -z "$TUNNEL_TOKEN" ]] && { echo "  Token cannot be empty."; continue; }
+    if [[ ! "$TUNNEL_TOKEN" =~ ^eyJ ]]; then
+      read -r -p "  Token format looks unusual (should start with 'eyJ'). Continue? [y/N]: " cf_confirm
+      case "$cf_confirm" in
+        [yY][eE][sS]|[yY]) ;;
+        *) continue ;;
+      esac
+    fi
+    break
+  done
   echo ""
 fi
 
@@ -511,6 +538,42 @@ EOF
   sysctl --system >/dev/null 2>&1 || true
 '
 
+# ── Cloudflare Tunnel (optional) ─────────────────────────────────────────────
+if [[ "$INSTALL_CLOUDFLARED" -eq 1 && -n "$TUNNEL_TOKEN" ]]; then
+  echo "  Installing Cloudflare Tunnel..."
+
+  pct exec "$CT_ID" -- bash -lc '
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get install -y curl gnupg lsb-release ca-certificates
+
+    mkdir -p --mode=0755 /usr/share/keyrings
+    curl -fsSL https://pkg.cloudflare.com/cloudflare-public-v2.gpg \
+      | tee /usr/share/keyrings/cloudflare-public-v2.gpg >/dev/null
+
+    echo "deb [signed-by=/usr/share/keyrings/cloudflare-public-v2.gpg] https://pkg.cloudflare.com/cloudflared any main" \
+      > /etc/apt/sources.list.d/cloudflared.list
+
+    apt-get update -qq
+    apt-get install -y cloudflared
+    cloudflared --version
+  '
+
+  pct exec "$CT_ID" -- bash -lc "cloudflared service install '${TUNNEL_TOKEN}'"
+  pct exec "$CT_ID" -- bash -lc '
+    systemctl daemon-reload
+    systemctl enable cloudflared
+    systemctl start cloudflared
+  '
+
+  # Verify
+  sleep 3
+  if pct exec "$CT_ID" -- systemctl is-active --quiet cloudflared 2>/dev/null; then
+    echo "  Cloudflared service is running"
+  else
+    echo "  WARNING: Cloudflared service may not be running — check: pct exec $CT_ID -- journalctl -u cloudflared" >&2
+  fi
+fi
+
 # ── Cleanup unnecessary packages ──────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc '
   export DEBIAN_FRONTEND=noninteractive
@@ -537,7 +600,7 @@ MOTD
 ip=\$(ip -4 -o addr show scope global 2>/dev/null | awk '{print \$4}' | cut -d/ -f1 | head -n1)
 printf '  Hostname:  %s\n' \"\$(hostname)\"
 printf '  IP:        %s\n' \"\${ip:-n/a}\"
-printf '  Uptime:   %s\n' \"\$(uptime -p 2>/dev/null || uptime)\"
+printf '  Uptime:    %s\n' \"\$(uptime -p 2>/dev/null || uptime)\"
 printf '  Disk:      %s\n' \"\$(df -h / | awk 'NR==2{printf \"%s/%s (%s used)\", \$3, \$2, \$5}')\"
 MOTD
 
@@ -559,6 +622,23 @@ MOTD
   chmod +x /etc/update-motd.d/*
 "
 
+# Add cloudflared MOTD drop-in if installed
+if [[ "$INSTALL_CLOUDFLARED" -eq 1 && -n "$TUNNEL_TOKEN" ]]; then
+  pct exec "$CT_ID" -- bash -lc '
+    cat > /etc/update-motd.d/35-cloudflared <<'\''MOTD'\''
+#!/bin/sh
+if command -v cloudflared >/dev/null 2>&1; then
+  status=$(systemctl is-active cloudflared 2>/dev/null || echo "unknown")
+  printf "  Tunnel:    cloudflared (%s)\n" "$status"
+fi
+MOTD
+    chmod +x /etc/update-motd.d/35-cloudflared
+  '
+
+  # Update tags to include cloudflared
+  pct set "$CT_ID" --tags "${TAGS};cloudflared"
+fi
+
 pct exec "$CT_ID" -- bash -lc '
   set -euo pipefail
   touch /root/.bashrc
@@ -566,8 +646,10 @@ pct exec "$CT_ID" -- bash -lc '
 '
 
 # ── Proxmox UI description ────────────────────────────────────────────────────
+CF_NOTE=""
+[[ "$INSTALL_CLOUDFLARED" -eq 1 && -n "$TUNNEL_TOKEN" ]] && CF_NOTE=" + Cloudflare Tunnel"
 NPM_DESC="<a href='http://${CT_IP}:${NPM_ADMIN_PORT}/' target='_blank' rel='noopener noreferrer' style='text-decoration: none; color: #00617f;'>NPM Admin</a>
-<details><summary>Details</summary>Nginx Proxy Manager (Podman) on Debian 13 LXC
+<details><summary>Details</summary>Nginx Proxy Manager (Podman)${CF_NOTE} on Debian 13 LXC
 Created by npm-lxc-podman.sh</details>"
 pct set "$CT_ID" --description "$NPM_DESC"
 
@@ -576,7 +658,7 @@ pct set "$CT_ID" --protection 1
 
 # ── Summary ───────────────────────────────────────────────────────────────────
 echo ""
-echo "CT: $CT_ID | IP: ${CT_IP} | Admin: http://${CT_IP}:${NPM_ADMIN_PORT} | Login: $([ -n "$PASSWORD" ] && echo 'password set' || echo 'auto-login')"
+echo "CT: $CT_ID | IP: ${CT_IP} | Admin: http://${CT_IP}:${NPM_ADMIN_PORT} | Login: $([ -n "$PASSWORD" ] && echo 'password set' || echo 'auto-login')$([ "$INSTALL_CLOUDFLARED" -eq 1 ] && echo ' | Tunnel: cloudflared')"
 echo ""
 
 # ── Reboot CT so all settings take effect cleanly ────────────────────────────
