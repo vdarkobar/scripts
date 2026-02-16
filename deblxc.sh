@@ -19,6 +19,14 @@ DEBIAN_VERSION=13
 # Behavior
 CLEANUP_ON_FAIL=1  # 1 = destroy CT on error, 0 = keep for debugging
 
+# ── Custom configs created by this script ─────────────────────────────────────
+#   /etc/update-motd.d/00-header
+#   /etc/update-motd.d/10-sysinfo
+#   /etc/update-motd.d/99-footer
+#   /etc/systemd/system/container-getty@1.service.d/override.conf
+#   /etc/apt/apt.conf.d/52unattended-debian.conf
+#   /etc/sysctl.d/99-hardening.conf
+
 # ── Trap cleanup ──────────────────────────────────────────────────────────────
 trap 'trap - ERR; rc=$?;
   echo "  ERROR: failed (rc=$rc) near line ${BASH_LINENO[0]:-?}" >&2

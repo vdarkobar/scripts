@@ -32,6 +32,15 @@ DEBIAN_VERSION=13
 # Behavior
 CLEANUP_ON_FAIL=1  # 1 = destroy CT on error, 0 = keep for debugging
 
+# ── Custom configs created by this script ─────────────────────────────────────
+#   /etc/update-motd.d/00-header
+#   /etc/update-motd.d/10-sysinfo
+#   /etc/update-motd.d/30-app
+#   /etc/update-motd.d/99-footer
+#   /etc/systemd/system/container-getty@1.service.d/override.conf
+#   /etc/apt/apt.conf.d/52unattended-samba.conf
+#   /etc/sysctl.d/99-hardening.conf
+
 # ── Validate config values (guard against sed injection) ─────────────────────
 fail=""
 [[ "$SMB_WORKGROUP"      =~ ^[A-Za-z0-9._-]+$ ]]     || fail="SMB_WORKGROUP"
