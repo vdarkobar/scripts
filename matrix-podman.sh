@@ -23,7 +23,6 @@ SYNAPSE_IMAGE="ghcr.io/element-hq/synapse:latest"
 POSTGRES_IMAGE="docker.io/library/postgres:18-alpine"
 ELEMENT_IMAGE="docker.io/vectorim/element-web:latest"
 REDIS_IMAGE="docker.io/library/redis:8-alpine"
-NGINX_IMAGE="docker.io/library/nginx:alpine"
 DEBIAN_VERSION=13
 
 # Behavior
@@ -34,9 +33,7 @@ CLEANUP_ON_FAIL=1  # 1 = destroy CT on error, 0 = keep for debugging
 #   /opt/matrix/.env
 #   /opt/matrix/.secrets/db_password.secret
 #   /opt/matrix/element-config.json
-#   /opt/matrix/nginx/matrix.conf
-#   /opt/matrix/nginx/www/.well-known/matrix/client
-#   /opt/matrix/nginx/www/.well-known/matrix/server
+#   /opt/matrix/element-nginx.conf
 #   /opt/matrix/synapse/homeserver.yaml        (generated + patched)
 #   /etc/update-motd.d/00-header
 #   /etc/update-motd.d/10-sysinfo
@@ -312,11 +309,25 @@ pct exec "$CT_ID" -- bash -lc "
   umask 077
   mkdir -p /opt/matrix/.secrets
   mkdir -p /opt/matrix/synapse
-  mkdir -p /opt/matrix/nginx/www/.well-known/matrix
   chmod 700 /opt/matrix/.secrets
   printf '%s' '${DB_PASSWORD}' > /opt/matrix/.secrets/db_password.secret
   chmod 600 /opt/matrix/.secrets/*.secret
 "
+
+# ── Element nginx config (port >1024 — required for unprivileged Podman) ────
+pct exec "$CT_ID" -- bash -lc 'cat > /opt/matrix/element-nginx.conf <<EOF
+server {
+    listen 8080;
+    server_name _;
+
+    root /app;
+    index index.html;
+
+    location / {
+        try_files \$uri \$uri/ /index.html;
+    }
+}
+EOF'
 
 # ── Compose file ─────────────────────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc 'cat > /opt/matrix/docker-compose.yml <<YAML
@@ -405,22 +416,13 @@ services:
     networks:
       - matrix
     ports:
-      - "__ELEMENT_PORT__:80"
+      - "__ELEMENT_PORT__:8080"
     volumes:
       - ./element-config.json:/app/config.json:ro
+      - ./element-nginx.conf:/etc/nginx/templates/default.conf.template:ro
     depends_on:
       synapse:
         condition: service_healthy
-
-  nginx:
-    image: __NGINX_IMAGE__
-    container_name: nginx
-    restart: unless-stopped
-    networks:
-      - matrix
-    volumes:
-      - ./nginx/matrix.conf:/etc/nginx/conf.d/matrix.conf:ro
-      - ./nginx/www:/var/www/:ro
 YAML
 '
 
@@ -429,7 +431,6 @@ pct exec "$CT_ID" -- sed -i \
   -e "s|__POSTGRES_IMAGE__|${POSTGRES_IMAGE}|g" \
   -e "s|__ELEMENT_IMAGE__|${ELEMENT_IMAGE}|g" \
   -e "s|__REDIS_IMAGE__|${REDIS_IMAGE}|g" \
-  -e "s|__NGINX_IMAGE__|${NGINX_IMAGE}|g" \
   -e "s|__SYNAPSE_PORT__|${SYNAPSE_PORT}|g" \
   -e "s|__ELEMENT_PORT__|${ELEMENT_PORT}|g" \
   -e "s|__TZ__|${MATRIX_TZ}|g" \
@@ -468,70 +469,6 @@ pct exec "$CT_ID" -- bash -lc "cat > /opt/matrix/element-config.json <<EOF
     },
     \"features\": {},
     \"map_style_url\": \"https://api.maptiler.com/maps/streets/style.json?key=fU3vlMsMn4Jb6dnEIFsx\"
-}
-EOF"
-
-# ── nginx config ─────────────────────────────────────────────────────────────
-pct exec "$CT_ID" -- bash -lc "cat > /opt/matrix/nginx/matrix.conf <<'EOF'
-server {
-    listen 80;
-    server_name matrix.__DOMAIN__;
-
-    location /.well-known/matrix/ {
-        root /var/www/;
-        default_type application/json;
-        add_header Access-Control-Allow-Origin *;
-        add_header Access-Control-Allow-Methods 'GET, POST, PUT, DELETE, OPTIONS';
-        add_header Access-Control-Allow-Headers 'X-Requested-With, Content-Type, Authorization';
-    }
-
-    location ~* ^(\/_matrix|\/_synapse\/client) {
-        proxy_pass http://__CT_IP__:__SYNAPSE_PORT__;
-        proxy_set_header X-Forwarded-For \$remote_addr;
-        proxy_set_header X-Forwarded-Proto \$scheme;
-        proxy_set_header Host \$host;
-
-        client_max_body_size 50M;
-
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection \"upgrade\";
-
-        proxy_read_timeout 600s;
-        proxy_send_timeout 600s;
-    }
-
-    location / {
-        return 404;
-    }
-}
-EOF"
-
-pct exec "$CT_ID" -- sed -i \
-  -e "s|__DOMAIN__|${MATRIX_DOMAIN}|g" \
-  -e "s|__CT_IP__|${CT_IP}|g" \
-  -e "s|__SYNAPSE_PORT__|${SYNAPSE_PORT}|g" \
-  /opt/matrix/nginx/matrix.conf
-
-# ── .well-known/matrix/client ────────────────────────────────────────────────
-pct exec "$CT_ID" -- bash -lc "cat > /opt/matrix/nginx/www/.well-known/matrix/client <<EOF
-{
-    \"m.homeserver\": {
-        \"base_url\": \"https://matrix.${MATRIX_DOMAIN}\"
-    },
-    \"m.identity_server\": {
-        \"base_url\": \"https://vector.im\"
-    },
-    \"org.matrix.msc3575.proxy\": {
-        \"url\": \"https://matrix.${MATRIX_DOMAIN}\"
-    }
-}
-EOF"
-
-# ── .well-known/matrix/server ────────────────────────────────────────────────
-pct exec "$CT_ID" -- bash -lc "cat > /opt/matrix/nginx/www/.well-known/matrix/server <<EOF
-{
-    \"m.server\": \"matrix.${MATRIX_DOMAIN}:443\"
 }
 EOF"
 
@@ -687,10 +624,10 @@ EOF
   systemctl enable --now matrix-stack.service
 '
 
-# Wait until all containers are running
+# Wait until all containers are running (4: postgres, redis, synapse, element)
 for i in $(seq 1 90); do
   RUNNING="$(pct exec "$CT_ID" -- sh -lc 'podman ps --format "{{.Names}}" 2>/dev/null | wc -l' 2>/dev/null || echo 0)"
-  [[ "$RUNNING" -ge 5 ]] && break
+  [[ "$RUNNING" -ge 4 ]] && break
   sleep 2
 done
 pct exec "$CT_ID" -- bash -lc 'cd /opt/matrix && podman-compose ps'
@@ -711,6 +648,22 @@ else
   echo "  WARNING: Synapse not responding yet — containers may still be initializing." >&2
   echo "  Check manually: pct enter $CT_ID -> curl -sf http://127.0.0.1:${SYNAPSE_PORT}/health" >&2
   pct exec "$CT_ID" -- bash -lc 'cd /opt/matrix && podman-compose logs --tail=80' >&2 || true
+fi
+
+# Health check — verify Element is responding
+ELEMENT_HEALTHY=0
+for i in $(seq 1 15); do
+  if pct exec "$CT_ID" -- curl -sf -o /dev/null --max-time 3 "http://127.0.0.1:${ELEMENT_PORT}/"; then
+    ELEMENT_HEALTHY=1
+    break
+  fi
+  sleep 2
+done
+
+if [[ "$ELEMENT_HEALTHY" -eq 1 ]]; then
+  echo "  Element is responding"
+else
+  echo "  WARNING: Element not responding yet — check: pct exec $CT_ID -- podman logs element-web" >&2
 fi
 
 # ── Unattended upgrades (do NOT overwrite Debian defaults) ───────────────────
@@ -750,6 +703,7 @@ EOF
 # ── Sysctl hardening ─────────────────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc '
   cat > /etc/sysctl.d/99-hardening.conf <<EOF
+net.ipv4.ip_unprivileged_port_start = 0
 net.ipv4.conf.all.rp_filter = 1
 net.ipv4.conf.default.rp_filter = 1
 net.ipv4.conf.all.accept_redirects = 0
@@ -834,33 +788,54 @@ pct set "$CT_ID" --description "$MATRIX_DESC"
 pct set "$CT_ID" --protection 1
 
 # ── Summary ──────────────────────────────────────────────────────────────────
-echo ""
-echo "CT: $CT_ID | IP: ${CT_IP} | Synapse: http://${CT_IP}:${SYNAPSE_PORT} | Element: http://${CT_IP}:${ELEMENT_PORT} | Login: $([ -n "$PASSWORD" ] && echo 'password set' || echo 'auto-login')"
-echo ""
-echo "  NPM proxy hosts:"
-echo "    matrix.${MATRIX_DOMAIN} -> http://${CT_IP}:${SYNAPSE_PORT}  (Websocket Support)"
-echo "    chat.${MATRIX_DOMAIN}   -> http://${CT_IP}:${ELEMENT_PORT}"
-echo ""
-echo "  Create admin user:"
-echo "    pct exec $CT_ID -- podman exec -it synapse register_new_matrix_user \\"
-echo "      http://localhost:8008 -c /data/homeserver.yaml"
-echo ""
-echo "  Federation test:"
-echo "    https://federationtester.matrix.org/#matrix.${MATRIX_DOMAIN}"
-echo ""
+cat <<EOF
+
+  CT: $CT_ID | IP: ${CT_IP} | Login: $([ -n "$PASSWORD" ] && echo 'password set' || echo 'auto-login')
+  Synapse: http://${CT_IP}:${SYNAPSE_PORT}
+  Element: http://${CT_IP}:${ELEMENT_PORT}
+
+  NPM proxy hosts:
+    matrix.${MATRIX_DOMAIN} -> http://${CT_IP}:${SYNAPSE_PORT}
+      SSL tab: enable SSL, Force SSL
+      Advanced tab:
+        client_max_body_size 50M;
+        proxy_read_timeout 600s;
+        proxy_send_timeout 600s;
+        location /.well-known/matrix/server {
+            default_type application/json;
+            add_header Access-Control-Allow-Origin *;
+            return 200 '{"m.server": "matrix.${MATRIX_DOMAIN}:443"}';
+        }
+        location /.well-known/matrix/client {
+            default_type application/json;
+            add_header Access-Control-Allow-Origin *;
+            return 200 '{"m.homeserver": {"base_url": "https://matrix.${MATRIX_DOMAIN}"}, "m.identity_server": {"base_url": "https://vector.im"}, "org.matrix.msc3575.proxy": {"url": "https://matrix.${MATRIX_DOMAIN}"}}';
+        }
+
+    chat.${MATRIX_DOMAIN} -> http://${CT_IP}:${ELEMENT_PORT}
+      SSL tab: enable SSL, Force SSL
+
+  Create admin user:
+    pct exec $CT_ID -- podman exec -it synapse register_new_matrix_user \\
+      http://localhost:8008 -c /data/homeserver.yaml
+
+  Federation test:
+    https://federationtester.matrix.org/#matrix.${MATRIX_DOMAIN}
+
+EOF
 
 # ── Reboot CT so all settings take effect cleanly ────────────────────────────
 echo "  Rebooting container..."
 pct reboot "$CT_ID"
 
-# Wait for stack to come back
+# Wait for stack to come back (4 containers: postgres, redis, synapse, element)
 RUNNING=0
 for i in $(seq 1 90); do
   RUNNING="$(pct exec "$CT_ID" -- sh -lc 'podman ps --format "{{.Names}}" 2>/dev/null | wc -l' 2>/dev/null || echo 0)"
-  [[ "$RUNNING" -ge 5 ]] && break
+  [[ "$RUNNING" -ge 4 ]] && break
   sleep 2
 done
-[[ "$RUNNING" -ge 5 ]] && echo "  Stack came up after reboot" \
+[[ "$RUNNING" -ge 4 ]] && echo "  Stack came up after reboot" \
   || echo "  WARNING: Stack not fully up after reboot — check matrix-stack.service" >&2
 
 echo "  Done."
