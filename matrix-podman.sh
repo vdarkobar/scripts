@@ -542,7 +542,7 @@ redis:
   password: \"${REDIS_PASSWORD}\"
 
 suppress_key_server_warning: true
-max_upload_size: 50M
+max_upload_size: 200M
 enable_registration: false
 
 url_preview_enabled: true
@@ -798,7 +798,7 @@ cat <<EOF
     matrix.${MATRIX_DOMAIN} -> http://${CT_IP}:${SYNAPSE_PORT}
       SSL tab: enable SSL, Force SSL
       Advanced tab:
-        client_max_body_size 50M;
+        client_max_body_size 200M;
         proxy_read_timeout 600s;
         proxy_send_timeout 600s;
         location /.well-known/matrix/server {
