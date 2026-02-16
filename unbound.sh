@@ -716,21 +716,48 @@ pct exec "$CT_ID" -- bash -lc '
   apt-get -y clean
 '
 
-# ── MOTD ─────────────────────────────────────────────────────────────────────
+# ── MOTD (dynamic drop-ins) ───────────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc "
   set -euo pipefail
-  cat > /etc/motd <<EOF
-
-  Unbound DNS Resolver (DNS-over-TLS)
-  ────────────────────────────────────
-  Config:   /etc/unbound/unbound.conf
-  VLANs:    /etc/unbound/unbound.conf.d/vlans.conf
-  Hosts:    /etc/unbound/unbound.conf.d/30-static-hosts.conf
-  Reload:   systemctl reload unbound
-  Test:     dig google.com
-
-EOF
+  > /etc/motd
   chmod -x /etc/update-motd.d/* 2>/dev/null || true
+  rm -f /etc/update-motd.d/*
+
+  cat > /etc/update-motd.d/00-header <<'MOTD'
+#!/bin/sh
+printf '\n  Unbound DNS Resolver (DNS-over-TLS)\n'
+printf '  ────────────────────────────────────\n'
+MOTD
+
+  cat > /etc/update-motd.d/10-sysinfo <<'MOTD'
+#!/bin/sh
+ip=\$(ip -4 -o addr show scope global 2>/dev/null | awk '{print \$4}' | cut -d/ -f1 | head -n1)
+printf '  Hostname:  %s\n' \"\$(hostname)\"
+printf '  IP:        %s\n' \"\${ip:-n/a}\"
+printf '  Uptime:   %s\n' \"\$(uptime -p 2>/dev/null || uptime)\"
+printf '  Disk:      %s\n' \"\$(df -h / | awk 'NR==2{printf \"%s/%s (%s used)\", \$3, \$2, \$5}')\"
+MOTD
+
+  cat > /etc/update-motd.d/30-app <<'MOTD'
+#!/bin/sh
+if systemctl is-active --quiet unbound 2>/dev/null; then
+  printf '  Unbound:   running\n'
+else
+  printf '  Unbound:   stopped\n'
+fi
+printf '  Config:    /etc/unbound/unbound.conf\n'
+printf '  VLANs:     /etc/unbound/unbound.conf.d/vlans.conf\n'
+printf '  Hosts:     /etc/unbound/unbound.conf.d/30-static-hosts.conf\n'
+printf '  Reload:    systemctl reload unbound\n'
+printf '  Test:      dig google.com\n'
+MOTD
+
+  cat > /etc/update-motd.d/99-footer <<'MOTD'
+#!/bin/sh
+printf '  ────────────────────────────────────\n\n'
+MOTD
+
+  chmod +x /etc/update-motd.d/*
 "
 
 pct exec "$CT_ID" -- bash -lc '

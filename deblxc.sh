@@ -277,17 +277,35 @@ pct exec "$CT_ID" -- bash -lc '
   apt-get -y clean
 '
 
-# ── MOTD ──────────────────────────────────────────────────────────────────────
-pct exec "$CT_ID" -- bash -lc '
+# ── MOTD (dynamic drop-ins) ───────────────────────────────────────────────────
+pct exec "$CT_ID" -- bash -lc "
   set -euo pipefail
-  cat > /etc/motd <<EOF
-
-  Debian LXC Container
-  ────────────────────────────────────
-
-EOF
+  > /etc/motd
   chmod -x /etc/update-motd.d/* 2>/dev/null || true
-'
+  rm -f /etc/update-motd.d/*
+
+  cat > /etc/update-motd.d/00-header <<'MOTD'
+#!/bin/sh
+printf '\n  Debian LXC Container\n'
+printf '  ────────────────────────────────────\n'
+MOTD
+
+  cat > /etc/update-motd.d/10-sysinfo <<'MOTD'
+#!/bin/sh
+ip=\$(ip -4 -o addr show scope global 2>/dev/null | awk '{print \$4}' | cut -d/ -f1 | head -n1)
+printf '  Hostname:  %s\n' \"\$(hostname)\"
+printf '  IP:        %s\n' \"\${ip:-n/a}\"
+printf '  Uptime:   %s\n' \"\$(uptime -p 2>/dev/null || uptime)\"
+printf '  Disk:      %s\n' \"\$(df -h / | awk 'NR==2{printf \"%s/%s (%s used)\", \$3, \$2, \$5}')\"
+MOTD
+
+  cat > /etc/update-motd.d/99-footer <<'MOTD'
+#!/bin/sh
+printf '  ────────────────────────────────────\n\n'
+MOTD
+
+  chmod +x /etc/update-motd.d/*
+"
 
 pct exec "$CT_ID" -- bash -lc '
   set -euo pipefail

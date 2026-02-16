@@ -484,26 +484,53 @@ pct exec "$CT_ID" -- bash -lc '
   apt-get -y clean
 '
 
-# ── MOTD ─────────────────────────────────────────────────────────────────────
+# ── MOTD (dynamic drop-ins) ───────────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc "
   set -euo pipefail
-  cat > /etc/motd <<EOF
-
-  Samba File Server (SMB3 encrypted)
-  ────────────────────────────────────
-  Config:   /etc/samba/smb.conf
-  Share:    ${SMB_SHARE_PATH}
-  Group:    ${SMB_GROUP}
-  Validate: testparm -s
-  Restart:  systemctl restart smbd
-
-  Add user:
-    useradd -M -s /usr/sbin/nologin -G ${SMB_GROUP} <user>
-    smbpasswd -a <user>
-    smbpasswd -e <user>
-
-EOF
+  > /etc/motd
   chmod -x /etc/update-motd.d/* 2>/dev/null || true
+  rm -f /etc/update-motd.d/*
+
+  cat > /etc/update-motd.d/00-header <<'MOTD'
+#!/bin/sh
+printf '\n  Samba File Server (SMB3 encrypted)\n'
+printf '  ────────────────────────────────────\n'
+MOTD
+
+  cat > /etc/update-motd.d/10-sysinfo <<'MOTD'
+#!/bin/sh
+ip=\$(ip -4 -o addr show scope global 2>/dev/null | awk '{print \$4}' | cut -d/ -f1 | head -n1)
+printf '  Hostname:  %s\n' \"\$(hostname)\"
+printf '  IP:        %s\n' \"\${ip:-n/a}\"
+printf '  Uptime:   %s\n' \"\$(uptime -p 2>/dev/null || uptime)\"
+printf '  Disk:      %s\n' \"\$(df -h / | awk 'NR==2{printf \"%s/%s (%s used)\", \$3, \$2, \$5}')\"
+MOTD
+
+  cat > /etc/update-motd.d/30-app <<'MOTD'
+#!/bin/sh
+if systemctl is-active --quiet smbd 2>/dev/null; then
+  printf '  Samba:     running\n'
+else
+  printf '  Samba:     stopped\n'
+fi
+printf '  Config:    /etc/samba/smb.conf\n'
+printf '  Share:     ${SMB_SHARE_PATH}\n'
+printf '  Group:     ${SMB_GROUP}\n'
+printf '  Validate:  testparm -s\n'
+printf '  Restart:   systemctl restart smbd\n'
+printf '\n'
+printf '  Add user:\n'
+printf '    useradd -M -s /usr/sbin/nologin -G ${SMB_GROUP} <user>\n'
+printf '    smbpasswd -a <user>\n'
+printf '    smbpasswd -e <user>\n'
+MOTD
+
+  cat > /etc/update-motd.d/99-footer <<'MOTD'
+#!/bin/sh
+printf '  ────────────────────────────────────\n\n'
+MOTD
+
+  chmod +x /etc/update-motd.d/*
 "
 
 pct exec "$CT_ID" -- bash -lc '
