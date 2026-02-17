@@ -175,7 +175,44 @@ pct exec <CT_ID> -- podman exec -it synapse register_new_matrix_user \
 It prompts for username, password, and admin status. Say yes to admin for the first user.
 
 
-## Step 6 — Verify
+## Step 6 — Invite Users (Registration Tokens)
+
+Token-based registration is enabled by default — nobody can sign up without a valid invite code that only the admin can create.
+
+To manage tokens, you need your admin access token from Element Web: **Settings → Help & About → Access Token**.
+
+**Create a one-time invite token:**
+
+```bash
+pct exec <CT_ID> -- podman exec synapse curl -s -X POST \
+  -H "Authorization: Bearer <ADMIN_ACCESS_TOKEN>" \
+  -H "Content-Type: application/json" \
+  -d '{"uses_allowed": 1}' \
+  http://localhost:8008/_synapse/admin/v1/registration_tokens/new
+```
+
+The response contains the token to share with the invited person. They enter it during signup in Element.
+
+**List all tokens:**
+
+```bash
+pct exec <CT_ID> -- podman exec synapse curl -s \
+  -H "Authorization: Bearer <ADMIN_ACCESS_TOKEN>" \
+  http://localhost:8008/_synapse/admin/v1/registration_tokens
+```
+
+**Delete a token:**
+
+```bash
+pct exec <CT_ID> -- podman exec synapse curl -s -X DELETE \
+  -H "Authorization: Bearer <ADMIN_ACCESS_TOKEN>" \
+  http://localhost:8008/_synapse/admin/v1/registration_tokens/<TOKEN>
+```
+
+Token options: `uses_allowed` (integer or null for unlimited), `expiry_time` (unix milliseconds or null for no expiry), `token` (custom string up to 64 chars, or omit for random).
+
+
+## Step 7 — Verify
 
 ### Federation test
 
@@ -242,7 +279,7 @@ And that `/opt/matrix/element-nginx.conf` exists with `listen 8080;`. This is re
 
 The `.well-known/matrix/server` response tells federation clients to connect on port 443 instead of the default 8448. If this file isn't served, clients fall back to 8448 which isn't open.
 
-Fix: ensure the Custom Nginx Configuration for `matrix.example.com` contains the `.well-known` location blocks (see Step 5).
+Fix: ensure the Custom Nginx Configuration for `matrix.example.com` contains the `.well-known` location blocks (see Step 4).
 
 ### Synapse not starting
 
