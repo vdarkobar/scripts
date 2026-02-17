@@ -379,3 +379,5 @@ Or use Proxmox Backup Server to snapshot the entire LXC.
 **Passwords are in config files.** The database and Redis passwords are baked into `docker-compose.yml` and `homeserver.yaml` at creation time. Both files are root-owned with restricted permissions inside the unprivileged LXC. There is no separate secrets file — the compose file is the source of truth.
 
 **No firewall inside the CT.** The container relies on host-level and network-level controls (Proxmox firewall, UniFi rules, Cloudflare Tunnel). All traffic enters through NPM — no ports are exposed directly to the internet.
+
+**Enabled by default:** Presence (online/offline status), remote media retention (cached media from other servers is purged after 90 days to save disk), and forgotten room cleanup (rooms abandoned by all local users are removed after 7 days). These can be tuned in `homeserver.yaml`.
