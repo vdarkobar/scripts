@@ -31,7 +31,6 @@ CLEANUP_ON_FAIL=1  # 1 = destroy CT on error, 0 = keep for debugging
 # ── Custom configs created by this script ─────────────────────────────────────
 #   /opt/matrix/docker-compose.yml
 #   /opt/matrix/.env
-#   /opt/matrix/.secrets/db_password.secret
 #   /opt/matrix/element-config.json
 #   /opt/matrix/element-nginx.conf
 #   /opt/matrix/synapse/homeserver.yaml        (generated + patched)
@@ -306,12 +305,7 @@ set -o pipefail
 [[ ${#DB_PASSWORD} -eq 63 && ${#REDIS_PASSWORD} -eq 32 ]] || { echo "  ERROR: Failed to generate secrets." >&2; exit 1; }
 
 pct exec "$CT_ID" -- bash -lc "
-  umask 077
-  mkdir -p /opt/matrix/.secrets
   mkdir -p /opt/matrix/synapse
-  chmod 700 /opt/matrix/.secrets
-  printf '%s' '${DB_PASSWORD}' > /opt/matrix/.secrets/db_password.secret
-  chmod 600 /opt/matrix/.secrets/*.secret
 "
 
 # ── Element nginx config (port >1024 — required for unprivileged Podman) ────
@@ -541,6 +535,8 @@ redis:
   port: 6379
   password: \"${REDIS_PASSWORD}\"
 
+public_baseurl: "https://matrix.${MATRIX_DOMAIN}/"
+
 suppress_key_server_warning: true
 max_upload_size: 200M
 enable_registration: false
@@ -564,6 +560,15 @@ url_preview_ip_range_blacklist:
   - 'ff00::/8'
   - 'fec0::/10'
 EOF"
+
+# Validate patch
+pct exec "$CT_ID" -- bash -lc '
+  cfg=/opt/matrix/synapse/homeserver.yaml
+  grep -q "psycopg2" "$cfg"    || { echo "  ERROR: psycopg2 not found in homeserver.yaml" >&2; exit 1; }
+  grep -q "public_baseurl" "$cfg" || { echo "  ERROR: public_baseurl not found in homeserver.yaml" >&2; exit 1; }
+  ! grep -q "sqlite3" "$cfg"   || { echo "  ERROR: sqlite3 still present in homeserver.yaml" >&2; exit 1; }
+  echo "  homeserver.yaml validated"
+'
 
 # ── Auto-update timer ────────────────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc '
@@ -703,7 +708,6 @@ EOF
 # ── Sysctl hardening ─────────────────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc '
   cat > /etc/sysctl.d/99-hardening.conf <<EOF
-net.ipv4.ip_unprivileged_port_start = 0
 net.ipv4.conf.all.rp_filter = 1
 net.ipv4.conf.default.rp_filter = 1
 net.ipv4.conf.all.accept_redirects = 0
@@ -797,7 +801,7 @@ cat <<EOF
   NPM proxy hosts:
     matrix.${MATRIX_DOMAIN} -> http://${CT_IP}:${SYNAPSE_PORT}
       SSL tab: enable SSL, Force SSL
-      Advanced tab:
+      Custom Nginx Configuration (Proxy host > Settings):
         client_max_body_size 200M;
         proxy_read_timeout 600s;
         proxy_send_timeout 600s;
