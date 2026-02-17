@@ -34,10 +34,10 @@ Ports marked `(int)` are internal to the Podman network only.
 
 ## Prerequisites
 
-- Proxmox VE host
+- Proxmox VE 8.x host
 - NPM LXC with cloudflared already configured
-- Two DNS records in Cloudflare (see DNS Setup below)
 - A domain managed through Cloudflare
+- Podman is installed from Debian 13 repos by the script (no manual install needed)
 
 
 ## Step 1 — Run the Script
@@ -113,7 +113,7 @@ Create two proxy hosts in the NPM admin interface.
 - Websockets Support: **ON**
 
 **SSL tab:**
-- SSL Certificate: Request a new Let's Encrypt certificate (or "None" if using tunnel-only with Full mode)
+- SSL Certificate: Request a new Let's Encrypt certificate using DNS challenge (Cloudflare provider)
 - Force SSL: ON
 
 **Advanced tab** — paste this entire block:
@@ -147,7 +147,7 @@ Replace `example.com` with your actual domain in all three places.
 - Forward Port: `8080`
 
 **SSL tab:**
-- SSL Certificate: Request a new Let's Encrypt certificate (or "None" if tunnel-only)
+- SSL Certificate: Request a new Let's Encrypt certificate using DNS challenge (Cloudflare provider)
 - Force SSL: ON
 
 No advanced config needed for Element.
@@ -158,7 +158,11 @@ These control different things. **Scheme: http** is how NPM connects to the cont
 
 ### Note on SSL certificates with Cloudflare Tunnel
 
-When using cloudflared, the tunnel terminates at NPM on port 80 (HTTP). NPM's Let's Encrypt certs are optional in this setup — they're only needed if you also access NPM directly on your LAN over HTTPS. The tunnel itself doesn't require them. If Let's Encrypt issuance fails (common behind a tunnel since the HTTP-01 challenge can't reach NPM directly), you can skip the certificate in NPM and rely on Cloudflare's edge certificate instead. Just make sure Cloudflare SSL is set to "Full" (not "Full strict").
+When using cloudflared, the tunnel terminates at NPM on port 80 (HTTP). The HTTP-01 challenge used by default for Let's Encrypt will fail because Cloudflare intercepts the request before it reaches NPM.
+
+Use the **DNS challenge** instead. In NPM, when requesting a Let's Encrypt certificate, select "Use a DNS Challenge" and choose **Cloudflare** as the provider. Enter your Cloudflare API token. This validates domain ownership via DNS records rather than HTTP, so it works regardless of how traffic reaches NPM. It also allows issuing wildcard certificates.
+
+If you don't want to set up DNS challenge, you can skip the certificate entirely in NPM and rely on Cloudflare's edge certificate. Set Cloudflare SSL to "Full" (not "Full strict") since NPM won't have a valid cert to verify.
 
 
 ## Step 5 — Create Admin User
@@ -302,7 +306,6 @@ pct exec <CT_ID> -- systemctl status matrix-update.timer
 The data lives in `/opt/matrix/` inside the LXC. Key directories:
 - `synapse/` — homeserver config and media store
 - `postgresdata/` — PostgreSQL database files
-- `.secrets/` — database password
 
 For a consistent backup, stop the stack first:
 
@@ -321,7 +324,6 @@ Or use Proxmox Backup Server to snapshot the entire LXC.
 |------|---------|
 | `/opt/matrix/docker-compose.yml` | Podman Compose stack definition |
 | `/opt/matrix/.env` | Reference file (values baked into compose) |
-| `/opt/matrix/.secrets/db_password.secret` | PostgreSQL password (root:root 600) |
 | `/opt/matrix/element-config.json` | Element Web client configuration |
 | `/opt/matrix/element-nginx.conf` | Nginx template for Element (listen 8080) |
 | `/opt/matrix/synapse/homeserver.yaml` | Synapse homeserver configuration |
@@ -330,4 +332,13 @@ Or use Proxmox Backup Server to snapshot the entire LXC.
 | `/opt/matrix/redis/` | Redis AOF persistence |
 | `/etc/systemd/system/matrix-stack.service` | Auto-start stack on boot |
 | `/etc/systemd/system/matrix-update.timer` | Biweekly auto-update |
-| `/etc/sysctl.d/99-hardening.conf` | Network hardening + unprivileged port fix |
+| `/etc/sysctl.d/99-hardening.conf` | Network hardening |
+
+
+## Notes
+
+**IPv6 is disabled.** The script disables IPv6 via sysctl as a hardening measure. Nothing in the stack requires IPv6. If your network requires IPv6 connectivity, remove the `net.ipv6.conf.*` lines from `/etc/sysctl.d/99-hardening.conf` and run `sysctl --system`.
+
+**Passwords are in config files.** The database and Redis passwords are baked into `docker-compose.yml` and `homeserver.yaml` at creation time. Both files are root-owned with restricted permissions inside the unprivileged LXC. There is no separate secrets file — the compose file is the source of truth.
+
+**No firewall inside the CT.** The container relies on host-level and network-level controls (Proxmox firewall, UniFi rules, Cloudflare Tunnel). All traffic enters through NPM — no ports are exposed directly to the internet.
