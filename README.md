@@ -1,7 +1,7 @@
 ## Proxmox Scripts
-### *container creation, configuration and app install*  
+#### *container creation, configuration and app install*  
 
-## Quick Install:  
+Quick Install:  
 
 ```bash
 mkdir -p scripts && \
