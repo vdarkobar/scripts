@@ -116,7 +116,7 @@ Create two proxy hosts in the NPM admin interface.
 - SSL Certificate: Request a new Let's Encrypt certificate using DNS challenge (Cloudflare provider)
 - Force SSL: ON
 
-**Advanced tab** — paste this entire block:
+**Custom Nginx Configuration** (under Proxy host > Settings) — paste this entire block:
 
 ```nginx
 client_max_body_size 200M;
@@ -191,7 +191,7 @@ curl https://matrix.example.com/.well-known/matrix/client
 # Should return JSON with m.homeserver base_url
 ```
 
-If these return 404 or HTML errors, check the NPM Advanced tab config for `matrix.example.com`.
+If these return 404 or HTML errors, check the Custom Nginx Configuration for `matrix.example.com`.
 
 ### Element Web
 
@@ -242,7 +242,7 @@ And that `/opt/matrix/element-nginx.conf` exists with `listen 8080;`. This is re
 
 The `.well-known/matrix/server` response tells federation clients to connect on port 443 instead of the default 8448. If this file isn't served, clients fall back to 8448 which isn't open.
 
-Fix: ensure the NPM Advanced tab for `matrix.example.com` contains the `.well-known` location blocks (see Step 5).
+Fix: ensure the Custom Nginx Configuration for `matrix.example.com` contains the `.well-known` location blocks (see Step 5).
 
 ### Synapse not starting
 
