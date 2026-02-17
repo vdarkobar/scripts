@@ -539,7 +539,8 @@ public_baseurl: "https://matrix.${MATRIX_DOMAIN}/"
 
 suppress_key_server_warning: true
 max_upload_size: 200M
-enable_registration: false
+enable_registration: true
+registration_requires_token: true
 
 url_preview_enabled: true
 url_preview_ip_range_blacklist:
