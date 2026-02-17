@@ -30,6 +30,7 @@ chmod +x scripts/samba.sh && \
 ./scripts/samba.sh
 ```
 Matrix, decentralised communication
+<a href="https://github.com/vdarkobar/scripts/blob/main/misc/matrix-how-to.md">Matrix</a>
 ```bash
 mkdir -p scripts && \
 wget -O scripts/matrix-podman.sh https://raw.githubusercontent.com/vdarkobar/scripts/main/matrix-podman.sh && \
