@@ -8,6 +8,7 @@ wget -O scripts/deblxc.sh https://raw.githubusercontent.com/vdarkobar/scripts/ma
 chmod +x scripts/deblxc.sh && \
 ./scripts/deblxc.sh
 ```
+  
 NPM on Podman, optional Cloudflared
 ```bash
 mkdir -p scripts && \
@@ -15,6 +16,7 @@ wget -O scripts/npm-podman.sh https://raw.githubusercontent.com/vdarkobar/script
 chmod +x scripts/npm-podman.sh && \
 ./scripts/npm-podman.sh
 ```
+  
 Unbound DNS
 ```bash
 mkdir -p scripts && \
@@ -22,6 +24,7 @@ wget -O scripts/unbound.sh https://raw.githubusercontent.com/vdarkobar/scripts/m
 chmod +x scripts/unbound.sh && \
 ./scripts/unbound.sh
 ```
+  
 Samba File server
 ```bash
 mkdir -p scripts && \
@@ -29,14 +32,15 @@ wget -O scripts/samba.sh https://raw.githubusercontent.com/vdarkobar/scripts/mai
 chmod +x scripts/samba.sh && \
 ./scripts/samba.sh
 ```
-Matrix, decentralised communication
-<a href="https://github.com/vdarkobar/scripts/blob/main/misc/matrix-how-to.md">Matrix</a>
+  
+<a href="https://github.com/vdarkobar/scripts/blob/main/misc/matrix-how-to.md">Matrix</a>, decentralised communication
 ```bash
 mkdir -p scripts && \
 wget -O scripts/matrix-podman.sh https://raw.githubusercontent.com/vdarkobar/scripts/main/matrix-podman.sh && \
 chmod +x scripts/matrix-podman.sh && \
 ./scripts/matrix-podman.sh
 ```
+  
 LXC updater
 ```bash
 mkdir -p scripts && \
