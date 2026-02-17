@@ -550,6 +550,14 @@ media_retention:
 
 forgotten_room_retention_period: 7d
 
+turn_uris:
+  - "turns:staticauth.openrelay.metered.ca:443?transport=tcp"
+  - "turn:staticauth.openrelay.metered.ca:80?transport=udp"
+  - "turn:staticauth.openrelay.metered.ca:443?transport=tcp"
+turn_shared_secret: "openrelayprojectsecret"
+turn_user_lifetime: 86400000
+turn_allow_guests: false
+
 url_preview_enabled: true
 url_preview_ip_range_blacklist:
   - '127.0.0.0/8'
@@ -811,19 +819,20 @@ cat <<EOF
     matrix.${MATRIX_DOMAIN} -> http://${CT_IP}:${SYNAPSE_PORT}
       SSL tab: enable SSL, Force SSL
       Custom Nginx Configuration (Proxy host > Settings):
-        client_max_body_size 200M;
-        proxy_read_timeout 600s;
-        proxy_send_timeout 600s;
-        location /.well-known/matrix/server {
-            default_type application/json;
-            add_header Access-Control-Allow-Origin *;
-            return 200 '{"m.server": "matrix.${MATRIX_DOMAIN}:443"}';
-        }
-        location /.well-known/matrix/client {
-            default_type application/json;
-            add_header Access-Control-Allow-Origin *;
-            return 200 '{"m.homeserver": {"base_url": "https://matrix.${MATRIX_DOMAIN}"}, "m.identity_server": {"base_url": "https://vector.im"}, "org.matrix.msc3575.proxy": {"url": "https://matrix.${MATRIX_DOMAIN}"}}';
-        }
+
+client_max_body_size 200M;
+proxy_read_timeout 600s;
+proxy_send_timeout 600s;
+location /.well-known/matrix/server {
+    default_type application/json;
+    add_header Access-Control-Allow-Origin *;
+    return 200 '{"m.server": "matrix.${MATRIX_DOMAIN}:443"}';
+}
+location /.well-known/matrix/client {
+    default_type application/json;
+    add_header Access-Control-Allow-Origin *;
+    return 200 '{"m.homeserver": {"base_url": "https://matrix.${MATRIX_DOMAIN}"}, "m.identity_server": {"base_url": "https://vector.im"}, "org.matrix.msc3575.proxy": {"url": "https://matrix.${MATRIX_DOMAIN}"}}';
+}
 
     chat.${MATRIX_DOMAIN} -> http://${CT_IP}:${ELEMENT_PORT}
       SSL tab: enable SSL, Force SSL
