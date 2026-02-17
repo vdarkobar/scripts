@@ -33,6 +33,13 @@ chmod +x scripts/samba.sh && \
   
 ```bash
 mkdir -p scripts && \
+wget -O scripts/matrix-podman.sh https://raw.githubusercontent.com/vdarkobar/scripts/main/matrix-podman.sh && \
+chmod +x scripts/matrix-podman.sh && \
+./scripts/matrix-podman.sh
+```
+  
+```bash
+mkdir -p scripts && \
 wget -O scripts/updatelxc.sh https://raw.githubusercontent.com/vdarkobar/scripts/main/updatelxc.sh && \
 chmod +x scripts/updatelxc.sh && \
 ./scripts/updatelxc.sh
