@@ -381,3 +381,5 @@ Or use Proxmox Backup Server to snapshot the entire LXC.
 **No firewall inside the CT.** The container relies on host-level and network-level controls (Proxmox firewall, UniFi rules, Cloudflare Tunnel). All traffic enters through NPM — no ports are exposed directly to the internet.
 
 **Enabled by default:** Presence (online/offline status), remote media retention (cached media from other servers is purged after 90 days to save disk), and forgotten room cleanup (rooms abandoned by all local users are removed after 7 days). These can be tuned in `homeserver.yaml`.
+
+**Voice/video calls (TURN):** Calls between users on the same LAN work without TURN, but remote calls (e.g., mobile data, different networks) require a TURN relay to traverse NATs and firewalls — especially behind a Cloudflare Tunnel where there's no public IP for WebRTC to connect directly. The script configures the free [Open Relay](https://www.metered.ca/tools/openrelay/) TURN server by Metered (20GB/month, no signup needed, static shared secret). If you need higher volume or private credentials, replace the `turn_uris` and `turn_shared_secret` in `homeserver.yaml` with your own TURN provider.
