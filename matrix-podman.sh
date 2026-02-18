@@ -78,6 +78,12 @@ done
 [[ -n "$CT_ID" ]] || { echo "  ERROR: Could not obtain next CT ID." >&2; exit 1; }
 
 # ── Show defaults & confirm ──────────────────────────────────────────────────
+TMPL_STORES="$(pvesh get /storage --output-format json 2>/dev/null \
+  | python3 -c "import sys,json; print(', '.join(sorted(s['storage'] for s in json.load(sys.stdin) if 'vztmpl' in s.get('content',''))))" 2>/dev/null || echo "n/a")"
+CT_STORES="$(pvesh get /storage --output-format json 2>/dev/null \
+  | python3 -c "import sys,json; print(', '.join(sorted(s['storage'] for s in json.load(sys.stdin) if 'rootdir' in s.get('content',''))))" 2>/dev/null || echo "n/a")"
+BRIDGES="$(ip -o link show type bridge 2>/dev/null | awk -F': ' '{print $2}' | sort | paste -sd', ' || echo "n/a")"
+
 cat <<EOF
 
   Matrix-Podman LXC Creator — Configuration
@@ -87,9 +93,9 @@ cat <<EOF
   CPU:               $CPU core(s)
   RAM:               $RAM MiB
   Disk:              $DISK GB
-  Bridge:            $BRIDGE
-  Template Storage:  $TEMPLATE_STORAGE
-  Container Storage: $CONTAINER_STORAGE
+  Bridge:            $BRIDGE ($BRIDGES)
+  Template Storage:  $TEMPLATE_STORAGE ($TMPL_STORES)
+  Container Storage: $CONTAINER_STORAGE ($CT_STORES)
   Domain:            $MATRIX_DOMAIN
   Synapse URL:       matrix.${MATRIX_DOMAIN}
   Element URL:       chat.${MATRIX_DOMAIN}
@@ -298,15 +304,26 @@ pct exec "$CT_ID" -- podman --version
 pct exec "$CT_ID" -- podman-compose --version
 
 # ── Secrets ──────────────────────────────────────────────────────────────────
-set +o pipefail
-DB_PASSWORD="$(head -c 4096 /dev/urandom | tr -dc 'A-Za-z0-9' | head -c 63)"
-REDIS_PASSWORD="$(head -c 4096 /dev/urandom | tr -dc 'A-Za-z0-9' | head -c 32)"
-set -o pipefail
+DB_PASSWORD="$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 63 || true)"
+REDIS_PASSWORD="$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 32 || true)"
 [[ ${#DB_PASSWORD} -eq 63 && ${#REDIS_PASSWORD} -eq 32 ]] || { echo "  ERROR: Failed to generate secrets." >&2; exit 1; }
 
-pct exec "$CT_ID" -- bash -lc "
-  mkdir -p /opt/matrix/synapse
-"
+# ── Prepare persistent volumes (absolute paths) ──────────────────────────────
+# Verified UIDs: postgres:18-alpine=70, redis:8-alpine=999:1000, synapse:latest=991 (2025-02)
+echo "  Preparing persistent volumes with correct UIDs..."
+pct exec "$CT_ID" -- bash -lc '
+  set -euo pipefail
+  mkdir -p /opt/matrix/postgresdata /opt/matrix/redis /opt/matrix/synapse
+
+  chown -R 70:70 /opt/matrix/postgresdata
+  chmod 700 /opt/matrix/postgresdata
+
+  chown -R 999:1000 /opt/matrix/redis
+
+  chown -R 991:991 /opt/matrix/synapse
+
+  echo "  ✅ Volumes pre-created (postgres=70, redis=999:1000, synapse=991)"
+'
 
 # ── Element nginx config (port >1024 — required for unprivileged Podman) ────
 pct exec "$CT_ID" -- bash -lc 'cat > /opt/matrix/element-nginx.conf <<EOF
@@ -344,7 +361,7 @@ services:
       - POSTGRES_INITDB_ARGS=--encoding=UTF8 --lc-collate=C --lc-ctype=C
       - TZ=__TZ__
     volumes:
-      - ./postgresdata:/var/lib/postgresql/data
+      - /opt/matrix/postgresdata:/var/lib/postgresql:Z
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U synapse -d synapse"]
       interval: 30s
@@ -365,11 +382,12 @@ services:
     networks:
       - matrix
     volumes:
-      - ./redis:/data
+      - /opt/matrix/redis:/data:Z
     environment:
       - TZ=__TZ__
+      - REDIS_PASSWORD=__REDIS_PASSWORD__
     healthcheck:
-      test: ["CMD", "redis-cli", "-a", "__REDIS_PASSWORD__", "ping"]
+      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" ping"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -390,7 +408,7 @@ services:
       - SYNAPSE_CONFIG_PATH=/data/homeserver.yaml
       - TZ=__TZ__
     volumes:
-      - ./synapse:/data
+      - /opt/matrix/synapse:/data:Z
     healthcheck:
       test: ["CMD", "curl", "-fSs", "http://localhost:8008/health"]
       interval: 30s
@@ -412,8 +430,8 @@ services:
     ports:
       - "__ELEMENT_PORT__:8080"
     volumes:
-      - ./element-config.json:/app/config.json:ro
-      - ./element-nginx.conf:/etc/nginx/templates/default.conf.template:ro
+      - /opt/matrix/element-config.json:/app/config.json:ro,Z
+      - /opt/matrix/element-nginx.conf:/etc/nginx/templates/default.conf.template:ro,Z
     depends_on:
       synapse:
         condition: service_healthy
@@ -431,6 +449,8 @@ pct exec "$CT_ID" -- sed -i \
   -e "s|__DB_PASSWORD__|${DB_PASSWORD}|g" \
   -e "s|__REDIS_PASSWORD__|${REDIS_PASSWORD}|g" \
   /opt/matrix/docker-compose.yml
+
+pct exec "$CT_ID" -- chmod 600 /opt/matrix/docker-compose.yml
 
 # ── Element config ───────────────────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc "cat > /opt/matrix/element-config.json <<EOF
@@ -488,7 +508,8 @@ pct exec "$CT_ID" -- bash -lc "
     -v /opt/matrix/synapse:/data:Z \
     -e SYNAPSE_SERVER_NAME='matrix.${MATRIX_DOMAIN}' \
     -e SYNAPSE_REPORT_STATS=no \
-    '${SYNAPSE_IMAGE}' generate
+    '${SYNAPSE_IMAGE}' generate \
+  && chown -R 991:991 /opt/matrix/synapse
 "
 
 # Verify generation
@@ -535,7 +556,7 @@ redis:
   port: 6379
   password: \"${REDIS_PASSWORD}\"
 
-public_baseurl: "https://matrix.${MATRIX_DOMAIN}/"
+public_baseurl: \"https://matrix.${MATRIX_DOMAIN}/\"
 
 suppress_key_server_warning: true
 max_upload_size: 200M
@@ -551,10 +572,10 @@ media_retention:
 forgotten_room_retention_period: 7d
 
 turn_uris:
-  - "turns:staticauth.openrelay.metered.ca:443?transport=tcp"
-  - "turn:staticauth.openrelay.metered.ca:80?transport=udp"
-  - "turn:staticauth.openrelay.metered.ca:443?transport=tcp"
-turn_shared_secret: "openrelayprojectsecret"
+  - \"turns:staticauth.openrelay.metered.ca:443?transport=tcp\"
+  - \"turn:staticauth.openrelay.metered.ca:80?transport=udp\"
+  - \"turn:staticauth.openrelay.metered.ca:443?transport=tcp\"
+turn_shared_secret: \"openrelayprojectsecret\"
 turn_user_lifetime: 86400000
 turn_allow_guests: false
 
@@ -581,9 +602,9 @@ EOF"
 # Validate patch
 pct exec "$CT_ID" -- bash -lc '
   cfg=/opt/matrix/synapse/homeserver.yaml
-  grep -q "psycopg2" "$cfg"    || { echo "  ERROR: psycopg2 not found in homeserver.yaml" >&2; exit 1; }
+  grep -q "psycopg2" "$cfg"       || { echo "  ERROR: psycopg2 not found in homeserver.yaml" >&2; exit 1; }
   grep -q "public_baseurl" "$cfg" || { echo "  ERROR: public_baseurl not found in homeserver.yaml" >&2; exit 1; }
-  ! grep -q "sqlite3" "$cfg"   || { echo "  ERROR: sqlite3 still present in homeserver.yaml" >&2; exit 1; }
+  ! grep -q "sqlite3" "$cfg"      || { echo "  ERROR: sqlite3 still present in homeserver.yaml" >&2; exit 1; }
   echo "  homeserver.yaml validated"
 '
 
