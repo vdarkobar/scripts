@@ -69,6 +69,13 @@ done
 
 [[ -n "$CT_ID" ]] || { echo "  ERROR: Could not obtain next CT ID." >&2; exit 1; }
 
+# ── Discover available resources ───────────────────────────────────────────────
+AVAIL_BRIDGES="$(ip -o link show type bridge 2>/dev/null | awk -F': ' '{print $2}' | sort | paste -sd', ' || echo "n/a")"
+AVAIL_TMPL_STORES="$(pvesh get /storage --output-format json 2>/dev/null \
+  | python3 -c "import sys,json; print(', '.join(sorted(s['storage'] for s in json.load(sys.stdin) if 'vztmpl' in s.get('content',''))))" 2>/dev/null || echo "n/a")"
+AVAIL_CT_STORES="$(pvesh get /storage --output-format json 2>/dev/null \
+  | python3 -c "import sys,json; print(', '.join(sorted(s['storage'] for s in json.load(sys.stdin) if 'rootdir' in s.get('content',''))))" 2>/dev/null || echo "n/a")"
+
 # ── Show defaults & confirm ──────────────────────────────────────────────────
 cat <<EOF
 
@@ -79,9 +86,9 @@ cat <<EOF
   CPU:               $CPU core(s)
   RAM:               $RAM MiB
   Disk:              $DISK GB
-  Bridge:            $BRIDGE
-  Template Storage:  $TEMPLATE_STORAGE
-  Container Storage: $CONTAINER_STORAGE
+  Bridge:            $BRIDGE ($AVAIL_BRIDGES)
+  Template Storage:  $TEMPLATE_STORAGE ($AVAIL_TMPL_STORES)
+  Container Storage: $CONTAINER_STORAGE ($AVAIL_CT_STORES)
   Debian Version:    $DEBIAN_VERSION
   Timezone:          $UB_TZ
   Domain:            ${UB_DOMAIN:-"(auto-detect)"}
@@ -746,7 +753,7 @@ MOTD
 ip=\$(ip -4 -o addr show scope global 2>/dev/null | awk '{print \$4}' | cut -d/ -f1 | head -n1)
 printf '  Hostname:  %s\n' \"\$(hostname)\"
 printf '  IP:        %s\n' \"\${ip:-n/a}\"
-printf '  Uptime:   %s\n' \"\$(uptime -p 2>/dev/null || uptime)\"
+printf '  Uptime:    %s\n' \"\$(uptime -p 2>/dev/null || uptime)\"
 printf '  Disk:      %s\n' \"\$(df -h / | awk 'NR==2{printf \"%s/%s (%s used)\", \$3, \$2, \$5}')\"
 MOTD
 
