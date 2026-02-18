@@ -109,8 +109,8 @@ EOF
 
 if [[ $ASSUME_YES -eq 0 ]]; then
   read -r -p "  Continue with these settings? [y/N]: " response
-  case "${response,,}" in
-    y|yes) ;;
+  case "$response" in
+    [yY][eE][sS]|[yY]) ;;
     *) echo "  Cancelled."; exit 0 ;;
   esac
 fi
