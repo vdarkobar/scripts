@@ -72,6 +72,13 @@ done
 
 [[ -n "$CT_ID" ]] || { echo "  ERROR: Could not obtain next CT ID." >&2; exit 1; }
 
+# ── Discover available resources ───────────────────────────────────────────────
+AVAIL_BRIDGES="$(ip -o link show type bridge 2>/dev/null | awk -F': ' '{print $2}' | sort | paste -sd', ' || echo "n/a")"
+AVAIL_TMPL_STORES="$(pvesh get /storage --output-format json 2>/dev/null \
+  | python3 -c "import sys,json; print(', '.join(sorted(s['storage'] for s in json.load(sys.stdin) if 'vztmpl' in s.get('content',''))))" 2>/dev/null || echo "n/a")"
+AVAIL_CT_STORES="$(pvesh get /storage --output-format json 2>/dev/null \
+  | python3 -c "import sys,json; print(', '.join(sorted(s['storage'] for s in json.load(sys.stdin) if 'rootdir' in s.get('content',''))))" 2>/dev/null || echo "n/a")"
+
 # ── Show defaults & confirm ───────────────────────────────────────────────────
 cat <<EOF
 
@@ -82,9 +89,9 @@ cat <<EOF
   CPU:               $CPU core(s)
   RAM:               $RAM MiB
   Disk:              $DISK GB
-  Bridge:            $BRIDGE
-  Template Storage:  $TEMPLATE_STORAGE
-  Container Storage: $CONTAINER_STORAGE
+  Bridge:            $BRIDGE ($AVAIL_BRIDGES)
+  Template Storage:  $TEMPLATE_STORAGE ($AVAIL_TMPL_STORES)
+  Container Storage: $CONTAINER_STORAGE ($AVAIL_CT_STORES)
   NPM Admin Port:    $NPM_ADMIN_PORT
   Debian Version:    $DEBIAN_VERSION
   Timezone:          $NPM_TZ
@@ -210,6 +217,7 @@ done
 # ── Auto-login if no password ─────────────────────────────────────────────────
 if [[ -z "$PASSWORD" ]]; then
   pct exec "$CT_ID" -- bash -lc '
+    set -euo pipefail
     mkdir -p /etc/systemd/system/container-getty@1.service.d
     cat > /etc/systemd/system/container-getty@1.service.d/override.conf <<EOF
 [Service]
@@ -223,6 +231,7 @@ fi
 
 # ── OS update ─────────────────────────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc '
+  set -euo pipefail
   export DEBIAN_FRONTEND=noninteractive
   export LANG=C.UTF-8
   export LC_ALL=C.UTF-8
@@ -235,6 +244,7 @@ pct exec "$CT_ID" -- bash -lc '
 
 # ── Configure locale ──────────────────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc '
+  set -euo pipefail
   export DEBIAN_FRONTEND=noninteractive
   apt-get install -y locales
   sed -i "s/^# *en_US.UTF-8/en_US.UTF-8/" /etc/locale.gen
@@ -244,6 +254,7 @@ pct exec "$CT_ID" -- bash -lc '
 
 # ── Remove unnecessary services ───────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc '
+  set -euo pipefail
   export DEBIAN_FRONTEND=noninteractive
   systemctl disable --now ssh 2>/dev/null || true
   systemctl disable --now postfix 2>/dev/null || true
@@ -253,19 +264,22 @@ pct exec "$CT_ID" -- bash -lc '
 
 # ── Set timezone ──────────────────────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc "
+  set -euo pipefail
   ln -sf /usr/share/zoneinfo/${NPM_TZ} /etc/localtime
   echo '${NPM_TZ}' > /etc/timezone
 "
 
 # ── Install Podman ────────────────────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc '
+  set -euo pipefail
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -qq
-  apt-get install -y podman podman-compose fuse-overlayfs curl ca-certificates iproute2
+  apt-get install -y podman podman-compose fuse-overlayfs curl ca-certificates iproute2 python3
 '
 
 # ── Configure storage driver ──────────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc '
+  set -euo pipefail
   mkdir -p /etc/containers
   cat > /etc/containers/storage.conf <<EOF
 [storage]
@@ -281,6 +295,7 @@ EOF
 
 # ── Configure extended registries ─────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc '
+  set -euo pipefail
   mkdir -p /etc/containers
   cat > /etc/containers/registries.conf <<EOF
 unqualified-search-registries = [
@@ -297,6 +312,7 @@ EOF
 
 # ── Podman log rotation ───────────────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc '
+  set -euo pipefail
   mkdir -p /etc/containers
   cat > /etc/containers/containers.conf <<EOF
 [containers]
@@ -317,6 +333,7 @@ set -o pipefail
 [[ ${#DB_ROOT_PWD} -eq 35 && ${#MYSQL_PWD} -eq 35 ]] || { echo "  ERROR: Failed to generate secrets." >&2; exit 1; }
 
 pct exec "$CT_ID" -- bash -lc "
+  set -euo pipefail
   umask 077
   mkdir -p /opt/npm/.secrets /opt/npm/data /opt/npm/letsencrypt /opt/npm/mysql
   chmod 700 /opt/npm/.secrets
@@ -386,9 +403,11 @@ pct exec "$CT_ID" -- sed -i \
   -e "s|__NPM_IMAGE__|${NPM_IMAGE}|g" \
   -e "s|__DB_IMAGE__|${DB_IMAGE}|g" \
   /opt/npm/docker-compose.yml
+pct exec "$CT_ID" -- chmod 600 /opt/npm/docker-compose.yml
 
 # ── .env (reference only — values are baked into compose via sed) ─────────────
 pct exec "$CT_ID" -- bash -lc "
+  set -euo pipefail
   cat > /opt/npm/.env <<EOF
 # Reference only — these values are baked into docker-compose.yml at creation time.
 # To change ports/TZ, edit docker-compose.yml directly and run: podman-compose up -d
@@ -401,6 +420,7 @@ EOF
 
 # ── Auto-update timer ─────────────────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc '
+  set -euo pipefail
   cat > /etc/systemd/system/npm-update.service <<EOF
 [Unit]
 Description=Pull and update NPM Podman containers
@@ -436,6 +456,7 @@ pct exec "$CT_ID" -- bash -lc 'cd /opt/npm && podman-compose pull'
 
 # ── Auto-start on LXC boot (and start now) ────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc '
+  set -euo pipefail
   cat > /etc/systemd/system/npm-stack.service <<EOF
 [Unit]
 Description=Nginx Proxy Manager (Podman) stack
@@ -459,10 +480,10 @@ EOF
 '
 
 # Wait until both containers are running
-for i in $(seq 1 60); do
+for i in $(seq 1 90); do
   RUNNING="$(pct exec "$CT_ID" -- sh -lc 'podman ps --format "{{.Names}}" 2>/dev/null | wc -l' 2>/dev/null || echo 0)"
   [[ "$RUNNING" -ge 2 ]] && break
-  sleep 1
+  sleep 2
 done
 pct exec "$CT_ID" -- bash -lc 'cd /opt/npm && podman-compose ps'
 
@@ -486,6 +507,7 @@ fi
 
 # ── Unattended upgrades (do NOT overwrite Debian defaults) ────────────────────
 pct exec "$CT_ID" -- bash -lc '
+  set -euo pipefail
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -qq
   apt-get install -y unattended-upgrades
@@ -520,6 +542,7 @@ EOF
 
 # ── Sysctl hardening ──────────────────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc '
+  set -euo pipefail
   cat > /etc/sysctl.d/99-hardening.conf <<EOF
 net.ipv4.conf.all.rp_filter = 1
 net.ipv4.conf.default.rp_filter = 1
@@ -543,6 +566,7 @@ if [[ "$INSTALL_CLOUDFLARED" -eq 1 && -n "$TUNNEL_TOKEN" ]]; then
   echo "  Installing Cloudflare Tunnel..."
 
   pct exec "$CT_ID" -- bash -lc '
+    set -euo pipefail
     export DEBIAN_FRONTEND=noninteractive
     apt-get install -y curl gnupg lsb-release ca-certificates
 
@@ -560,6 +584,7 @@ if [[ "$INSTALL_CLOUDFLARED" -eq 1 && -n "$TUNNEL_TOKEN" ]]; then
 
   pct exec "$CT_ID" -- bash -lc "cloudflared service install '${TUNNEL_TOKEN}'"
   pct exec "$CT_ID" -- bash -lc '
+    set -euo pipefail
     systemctl daemon-reload
     systemctl enable cloudflared
     systemctl start cloudflared
@@ -576,6 +601,7 @@ fi
 
 # ── Cleanup unnecessary packages ──────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc '
+  set -euo pipefail
   export DEBIAN_FRONTEND=noninteractive
   apt-get purge -y man-db manpages 2>/dev/null || true
   apt-get -y autoremove
@@ -625,6 +651,7 @@ MOTD
 # Add cloudflared MOTD drop-in if installed
 if [[ "$INSTALL_CLOUDFLARED" -eq 1 && -n "$TUNNEL_TOKEN" ]]; then
   pct exec "$CT_ID" -- bash -lc '
+    set -euo pipefail
     cat > /etc/update-motd.d/35-cloudflared <<'\''MOTD'\''
 #!/bin/sh
 if command -v cloudflared >/dev/null 2>&1; then
