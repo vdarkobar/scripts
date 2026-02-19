@@ -49,6 +49,14 @@ chmod +x scripts/privatebin.sh && \
 ./scripts/privatebin.sh
 ```
   
+Cryptpad <a href="https://github.com/vdarkobar/scripts/blob/main/misc/matrix-how-to.md">*how-to*</a>
+```bash
+mkdir -p scripts && \
+wget -O scripts/cryptpad.sh https://raw.githubusercontent.com/vdarkobar/scripts/main/cryptpad.sh && \
+chmod +x scripts/cryptpad.sh && \
+./scripts/cryptpad.sh
+```
+  
 LXC updater
 ```bash
 mkdir -p scripts && \
