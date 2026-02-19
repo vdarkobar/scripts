@@ -41,6 +41,14 @@ chmod +x scripts/matrix-podman.sh && \
 ./scripts/matrix-podman.sh
 ```
   
+Privatebin <a href="https://github.com/vdarkobar/scripts/blob/main/misc/matrix-how-to.md">*how-to*</a>
+```bash
+mkdir -p scripts && \
+wget -O scripts/privatebin.sh https://raw.githubusercontent.com/vdarkobar/scripts/main/privatebin.sh && \
+chmod +x scripts/privatebin.sh && \
+./scripts/privatebin.sh
+```
+  
 LXC updater
 ```bash
 mkdir -p scripts && \
