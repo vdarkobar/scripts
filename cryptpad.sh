@@ -674,6 +674,7 @@ MOTD
   printf '\\n'
   printf '  CryptPad:\\n'
   printf '    App dir:       /opt/cryptpad\\n'
+  printf '    Config:        /opt/cryptpad/config/config.js\\n'
   printf '    Node.js:       %s\\n' \"\$node_ver\"
   printf '    Service:       %s\\n' \"\$service_active\"
   timer_next=\$(systemctl list-timers cryptpad-update.timer --no-pager 2>/dev/null | awk 'NR==2{for(i=1;i<=NF;i++) if(\$i ~ /^[0-9]{4}-/) {printf \"%s %s\", \$i, \$(i+1); break}}' || echo 'n/a')
@@ -686,6 +687,10 @@ MOTD
   printf '    cryptpad-maint.sh list-backups\\n'
   printf '    cryptpad-maint.sh restore <file>\\n'
   printf '    cryptpad-maint.sh restore-latest\\n'
+  printf '\\n'
+  printf '  Admin setup:\\n'
+  printf '    systemctl status cryptpad\\n'
+  printf '    (look for token URL to create admin account)\\n'
 MOTD
 
   cat > /etc/update-motd.d/99-footer <<'MOTD'
@@ -710,6 +715,8 @@ OO_NOTE=""
 DESC="<a href='http://${CT_IP}:${APP_PORT}/' target='_blank' rel='noopener noreferrer' style='text-decoration: none; color: #00617f;'>CryptPad Web UI</a>
 <details><summary>Details</summary>CryptPad on Debian ${DEBIAN_VERSION} LXC
 Node.js ${NODE_VERSION} (native)${OO_NOTE}
+Admin setup: systemctl status cryptpad (token URL)
+Config: /opt/cryptpad/config/config.js
 Maintenance: cryptpad-maint.sh
 Created by cryptpad.sh</details>"
 pct set "$CT_ID" --description "$DESC"
@@ -720,6 +727,8 @@ pct set "$CT_ID" --protection 1
 # ── Summary ──────────────────────────────────────────────────────────────────
 echo ""
 echo "  CT: $CT_ID | IP: ${CT_IP} | Web UI: http://${CT_IP}:${APP_PORT}/ | Login: $([ -n "$PASSWORD" ] && echo 'password set' || echo 'auto-login')"
+echo "  Admin setup: pct exec $CT_ID -- systemctl status cryptpad  (look for the token URL to create admin account)"
+echo "  Config: /opt/cryptpad/config/config.js"
 echo "  Maintenance: pct exec $CT_ID -- cryptpad-maint.sh {update|backup|restore|list-backups|restore-latest}"
 echo ""
 
