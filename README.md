@@ -61,16 +61,15 @@ chmod +x scripts/updatelxc.sh && \
 
 
 
-<details>
-  <summary><b>Debian LXC</b></summary>
-  <br>
+
+
   <button
     onclick="navigator.clipboard.writeText(`mkdir -p scripts && \
 wget -O scripts/deblxc.sh https://raw.githubusercontent.com/vdarkobar/scripts/main/deblxc.sh && \
 chmod +x scripts/deblxc.sh && \
 ./scripts/deblxc.sh`)"
   >Copy</button>
-</details>
+
 
 
 
