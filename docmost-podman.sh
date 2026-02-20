@@ -639,12 +639,8 @@ cat <<EOF
   Reverse proxy (NPM):
     docmost.example.com -> http://${CT_IP}:${APP_PORT}
       SSL tab: enable SSL, Force SSL
-      Custom Nginx Configuration (Advanced):
-
-proxy_set_header Upgrade \$http_upgrade;
-proxy_set_header Connection "upgrade";
-
-      (WebSockets required for real-time editor)
+      Enable "Websockets Support" toggle
+      (required for real-time collaborative editor)
 
     After setting up the reverse proxy, update APP_URL:
       pct enter $CT_ID
