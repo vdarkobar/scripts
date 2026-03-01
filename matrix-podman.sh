@@ -13,7 +13,7 @@ CONTAINER_STORAGE="local-lvm"
 
 # Matrix / Podman
 MATRIX_DOMAIN="example.com"
-MATRIX_TZ="Europe/Berlin"
+APP_TZ="Europe/Berlin"
 SYNAPSE_PORT=8008
 ELEMENT_PORT=8080
 TAGS="matrix;podman;lxc"
@@ -102,7 +102,7 @@ cat <<EOF
   Synapse Port:      $SYNAPSE_PORT
   Element Port:      $ELEMENT_PORT
   Debian Version:    $DEBIAN_VERSION
-  Timezone:          $MATRIX_TZ
+  Timezone:          $APP_TZ
   Tags:              $TAGS
   Synapse Image:     $SYNAPSE_IMAGE
   Postgres Image:    $POSTGRES_IMAGE
@@ -136,7 +136,7 @@ case "$response" in
     exit 0
     ;;
 esac
-
+echo ""
 # ── Preflight — environment ───────────────────────────────────────────────────
 pvesm status | awk -v s="$TEMPLATE_STORAGE" '$1==s{f=1} END{exit(!f)}' \
   || { echo "  ERROR: Template storage not found: $TEMPLATE_STORAGE" >&2; exit 1; }
@@ -267,8 +267,8 @@ pct exec "$CT_ID" -- bash -lc '
 # ── Set timezone ──────────────────────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc "
   set -euo pipefail
-  ln -sf /usr/share/zoneinfo/${MATRIX_TZ} /etc/localtime
-  echo '${MATRIX_TZ}' > /etc/timezone
+  ln -sf /usr/share/zoneinfo/${APP_TZ} /etc/localtime
+  echo '${APP_TZ}' > /etc/timezone
 "
 
 # ── Install Podman ────────────────────────────────────────────────────────────
@@ -469,7 +469,7 @@ pct exec "$CT_ID" -- sed -i \
   -e "s|__REDIS_IMAGE__|${REDIS_IMAGE}|g" \
   -e "s|__SYNAPSE_PORT__|${SYNAPSE_PORT}|g" \
   -e "s|__ELEMENT_PORT__|${ELEMENT_PORT}|g" \
-  -e "s|__TZ__|${MATRIX_TZ}|g" \
+  -e "s|__TZ__|${APP_TZ}|g" \
   -e "s|__DB_PASSWORD__|${DB_PASSWORD}|g" \
   -e "s|__REDIS_PASSWORD__|${REDIS_PASSWORD}|g" \
   /opt/matrix/docker-compose.yml
@@ -517,7 +517,7 @@ pct exec "$CT_ID" -- bash -lc "
 # Reference only — values are baked into docker-compose.yml at creation time.
 # To change, edit docker-compose.yml directly and run: podman-compose up -d
 COMPOSE_PROJECT_NAME=matrix
-MATRIX_TZ=${MATRIX_TZ}
+APP_TZ=${APP_TZ}
 MATRIX_DOMAIN=${MATRIX_DOMAIN}
 SYNAPSE_PORT=${SYNAPSE_PORT}
 ELEMENT_PORT=${ELEMENT_PORT}

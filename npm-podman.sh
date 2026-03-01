@@ -13,7 +13,7 @@ CONTAINER_STORAGE="local-lvm"
 
 # NPM / Podman
 NPM_ADMIN_PORT=49152
-NPM_TZ="Europe/Berlin"
+APP_TZ="Europe/Berlin"
 TAGS="npm;podman;lxc"
 
 # Images (pin here if you want)
@@ -94,7 +94,7 @@ cat <<EOF
   Container Storage: $CONTAINER_STORAGE ($AVAIL_CT_STORES)
   NPM Admin Port:    $NPM_ADMIN_PORT
   Debian Version:    $DEBIAN_VERSION
-  Timezone:          $NPM_TZ
+  Timezone:          $APP_TZ
   Tags:              $TAGS
   NPM Image:         $NPM_IMAGE
   DB Image:          $DB_IMAGE
@@ -127,7 +127,7 @@ case "$response" in
     exit 0
     ;;
 esac
-
+echo ""
 # ── Preflight — environment ───────────────────────────────────────────────────
 pvesm status | awk -v s="$TEMPLATE_STORAGE" '$1==s{f=1} END{exit(!f)}' \
   || { echo "  ERROR: Template storage not found: $TEMPLATE_STORAGE" >&2; exit 1; }
@@ -280,8 +280,8 @@ pct exec "$CT_ID" -- bash -lc '
 # ── Set timezone ──────────────────────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc "
   set -euo pipefail
-  ln -sf /usr/share/zoneinfo/${NPM_TZ} /etc/localtime
-  echo '${NPM_TZ}' > /etc/timezone
+  ln -sf /usr/share/zoneinfo/${APP_TZ} /etc/localtime
+  echo '${APP_TZ}' > /etc/timezone
 "
 
 # ── Install Podman ────────────────────────────────────────────────────────────
@@ -414,7 +414,7 @@ YAML
 
 pct exec "$CT_ID" -- sed -i \
   -e "s|__ADMIN_PORT__|${NPM_ADMIN_PORT}|g" \
-  -e "s|__TZ__|${NPM_TZ}|g" \
+  -e "s|__TZ__|${APP_TZ}|g" \
   -e "s|__NPM_IMAGE__|${NPM_IMAGE}|g" \
   -e "s|__DB_IMAGE__|${DB_IMAGE}|g" \
   /opt/npm/docker-compose.yml
@@ -427,7 +427,7 @@ pct exec "$CT_ID" -- bash -lc "
 # Reference only — these values are baked into docker-compose.yml at creation time.
 # To change ports/TZ, edit docker-compose.yml directly and run: podman-compose up -d
 COMPOSE_PROJECT_NAME=npm
-NPM_TZ=${NPM_TZ}
+APP_TZ=${APP_TZ}
 NPM_ADMIN_PORT=${NPM_ADMIN_PORT}
 EOF
   chmod 600 /opt/npm/.env
