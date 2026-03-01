@@ -37,7 +37,7 @@ CLEANUP_ON_FAIL=1  # 1 = destroy CT on error, 0 = keep for debugging
 #   /etc/systemd/system/npm-stack.service
 #   /etc/systemd/system/npm-update.service
 #   /etc/systemd/system/npm-update.timer
-#   /etc/apt/apt.conf.d/52unattended-npm.conf
+#   /etc/apt/apt.conf.d/52unattended-<hostname>.conf
 #   /etc/sysctl.d/99-hardening.conf
 
 # ── Trap cleanup ──────────────────────────────────────────────────────────────
@@ -72,7 +72,7 @@ done
 
 [[ -n "$CT_ID" ]] || { echo "  ERROR: Could not obtain next CT ID." >&2; exit 1; }
 
-# ── Discover available resources ───────────────────────────────────────────────
+# ── Discover available resources ─────────────────────────────────────────────
 AVAIL_BRIDGES="$(ip -o link show type bridge 2>/dev/null | awk -F': ' '{print $2}' | sort | paste -sd', ' || echo "n/a")"
 AVAIL_TMPL_STORES="$(pvesh get /storage --output-format json 2>/dev/null \
   | python3 -c "import sys,json; print(', '.join(sorted(s['storage'] for s in json.load(sys.stdin) if 'vztmpl' in s.get('content',''))))" 2>/dev/null || echo "n/a")"
@@ -137,7 +137,7 @@ pvesm status | awk -v s="$CONTAINER_STORAGE" '$1==s{f=1} END{exit(!f)}' \
 
 ip link show "$BRIDGE" >/dev/null 2>&1 || { echo "  ERROR: Bridge not found: $BRIDGE" >&2; exit 1; }
 
-# ── Root password ─────────────────────────────────────────────────────────────
+# ── Root password ────────────────────────────────────────────────────────────
 PASSWORD=""
 while true; do
   read -r -s -p "  Set root password (blank = auto-login): " PW1; echo
@@ -177,7 +177,7 @@ if [[ "$INSTALL_CLOUDFLARED" -eq 1 ]]; then
   echo ""
 fi
 
-# ── Template ──────────────────────────────────────────────────────────────────
+# ── Template discovery & download ────────────────────────────────────────────
 pveam update
 echo ""
 [[ "$DEBIAN_VERSION" =~ ^[0-9]+$ ]] || { echo "  ERROR: DEBIAN_VERSION must be numeric." >&2; exit 1; }
@@ -229,7 +229,7 @@ for i in $(seq 1 30); do
 done
 [[ -n "$CT_IP" ]] || { echo "  ERROR: No IPv4 address acquired via DHCP within timeout." >&2; exit 1; }
 
-# ── Auto-login if no password ─────────────────────────────────────────────────
+# ── Auto-login (if no password) ──────────────────────────────────────────────
 if [[ -z "$PASSWORD" ]]; then
   pct exec "$CT_ID" -- bash -lc '
     set -euo pipefail
@@ -257,7 +257,7 @@ pct exec "$CT_ID" -- bash -lc '
   apt-get -y clean
 '
 
-# ── Configure locale ──────────────────────────────────────────────────────────
+# ── Configure locale ─────────────────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc '
   set -euo pipefail
   export DEBIAN_FRONTEND=noninteractive
@@ -277,7 +277,7 @@ pct exec "$CT_ID" -- bash -lc '
   apt-get -y autoremove
 '
 
-# ── Set timezone ──────────────────────────────────────────────────────────────
+# ── Set timezone ─────────────────────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc "
   set -euo pipefail
   ln -sf /usr/share/zoneinfo/${NPM_TZ} /etc/localtime
@@ -529,7 +529,7 @@ pct exec "$CT_ID" -- bash -lc '
 
   distro_codename="$(. /etc/os-release && echo "$VERSION_CODENAME")"
 
-  cat > /etc/apt/apt.conf.d/52unattended-npm.conf <<EOF
+  cat > /etc/apt/apt.conf.d/52unattended-$(hostname).conf <<EOF
 Unattended-Upgrade::Origins-Pattern {
         "origin=Debian,codename=${distro_codename},label=Debian-Security";
         "origin=Debian,codename=${distro_codename}-security";
@@ -614,7 +614,7 @@ if [[ "$INSTALL_CLOUDFLARED" -eq 1 && -n "$TUNNEL_TOKEN" ]]; then
   fi
 fi
 
-# ── Cleanup unnecessary packages ──────────────────────────────────────────────
+# ── Cleanup packages ─────────────────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc '
   set -euo pipefail
   export DEBIAN_FRONTEND=noninteractive
@@ -695,7 +695,7 @@ NPM_DESC="<a href='http://${CT_IP}:${NPM_ADMIN_PORT}/' target='_blank' rel='noop
 Created by npm-lxc-podman.sh</details>"
 pct set "$CT_ID" --description "$NPM_DESC"
 
-# ── Protect container ─────────────────────────────────────────────────────────
+# ── Protect container ────────────────────────────────────────────────────────
 pct set "$CT_ID" --protection 1
 
 # ── Summary ───────────────────────────────────────────────────────────────────

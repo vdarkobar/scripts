@@ -38,7 +38,7 @@ CLEANUP_ON_FAIL=1  # 1 = destroy CT on error, 0 = keep for debugging
 #   /etc/update-motd.d/30-app
 #   /etc/update-motd.d/99-footer
 #   /etc/systemd/system/container-getty@1.service.d/override.conf
-#   /etc/apt/apt.conf.d/52unattended-cryptpad.conf
+#   /etc/apt/apt.conf.d/52unattended-<hostname>.conf
 #   /etc/sysctl.d/99-hardening.conf
 
 # ── Trap cleanup ──────────────────────────────────────────────────────────────
@@ -74,11 +74,11 @@ done
 [[ -n "$CT_ID" ]] || { echo "  ERROR: Could not obtain next CT ID." >&2; exit 1; }
 
 # ── Show defaults & confirm ──────────────────────────────────────────────────
-TMPL_STORES="$(pvesh get /storage --output-format json 2>/dev/null \
+AVAIL_TMPL_STORES="$(pvesh get /storage --output-format json 2>/dev/null \
   | python3 -c "import sys,json; print(', '.join(sorted(s['storage'] for s in json.load(sys.stdin) if 'vztmpl' in s.get('content',''))))" 2>/dev/null || echo "n/a")"
-CT_STORES="$(pvesh get /storage --output-format json 2>/dev/null \
+AVAIL_CT_STORES="$(pvesh get /storage --output-format json 2>/dev/null \
   | python3 -c "import sys,json; print(', '.join(sorted(s['storage'] for s in json.load(sys.stdin) if 'rootdir' in s.get('content',''))))" 2>/dev/null || echo "n/a")"
-BRIDGES="$(ip -o link show type bridge 2>/dev/null | awk -F': ' '{print $2}' | paste -sd', ' || echo "n/a")"
+AVAIL_BRIDGES="$(ip -o link show type bridge 2>/dev/null | awk -F': ' '{print $2}' | sort | paste -sd', ' || echo "n/a")"
 
 cat <<EOF
 
@@ -89,9 +89,9 @@ cat <<EOF
   CPU cores:         $CPU
   RAM (MB):          $RAM
   Disk (GB):         $DISK
-  Bridge:            $BRIDGE ($BRIDGES)
-  Template storage:  $TEMPLATE_STORAGE ($TMPL_STORES)
-  Container storage: $CONTAINER_STORAGE ($CT_STORES)
+  Bridge:            $BRIDGE ($AVAIL_BRIDGES)
+  Template storage:  $TEMPLATE_STORAGE ($AVAIL_TMPL_STORES)
+  Container storage: $CONTAINER_STORAGE ($AVAIL_CT_STORES)
   Node.js version:   $NODE_VERSION
   App port:          $APP_PORT
   OnlyOffice:        $([ "$INSTALL_ONLYOFFICE" -eq 1 ] && echo "yes" || echo "no")
@@ -135,7 +135,7 @@ pvesm status | awk -v s="$CONTAINER_STORAGE" '$1==s{f=1} END{exit(!f)}' \
 ip link show "$BRIDGE" >/dev/null 2>&1 \
   || { echo "  ERROR: Bridge not found: $BRIDGE" >&2; exit 1; }
 
-# ── Root password prompt ─────────────────────────────────────────────────────
+# ── Root password ────────────────────────────────────────────────────────────
 PASSWORD=""
 while true; do
   read -r -s -p "  Set root password (blank = auto-login): " PW1; echo
@@ -202,7 +202,7 @@ done
 [[ -n "$CT_IP" ]] || { echo "  ERROR: No IPv4 address acquired via DHCP within timeout." >&2; exit 1; }
 echo "  CT $CT_ID is up — IP: $CT_IP"
 
-# ── Auto-login (if no password) ─────────────────────────────────────────────
+# ── Auto-login (if no password) ──────────────────────────────────────────────
 if [[ -z "$PASSWORD" ]]; then
   pct exec "$CT_ID" -- bash -lc '
     set -euo pipefail
@@ -230,7 +230,7 @@ pct exec "$CT_ID" -- bash -lc '
   apt-get -y clean
 '
 
-# ── Locale ───────────────────────────────────────────────────────────────────
+# ── Configure locale ─────────────────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc '
   set -euo pipefail
   export DEBIAN_FRONTEND=noninteractive
@@ -250,7 +250,7 @@ pct exec "$CT_ID" -- bash -lc '
   apt-get -y autoremove
 '
 
-# ── Timezone ─────────────────────────────────────────────────────────────────
+# ── Set timezone ─────────────────────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc "
   set -euo pipefail
   ln -sf /usr/share/zoneinfo/${APP_TZ} /etc/localtime
@@ -605,7 +605,7 @@ pct exec "$CT_ID" -- bash -lc '
   apt-get update -qq
   apt-get install -y unattended-upgrades
   distro_codename="$(. /etc/os-release && echo "$VERSION_CODENAME")"
-  cat > /etc/apt/apt.conf.d/52unattended-cryptpad.conf <<EOF
+  cat > /etc/apt/apt.conf.d/52unattended-$(hostname).conf <<EOF
 Unattended-Upgrade::Origins-Pattern {
         "origin=Debian,codename=${distro_codename},label=Debian-Security";
         "origin=Debian,codename=${distro_codename}-security";
@@ -646,7 +646,7 @@ EOF
   sysctl --system >/dev/null 2>&1 || true
 '
 
-# ── Cleanup packages ────────────────────────────────────────────────────────
+# ── Cleanup packages ─────────────────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc '
   set -euo pipefail
   export DEBIAN_FRONTEND=noninteractive
@@ -664,53 +664,48 @@ pct exec "$CT_ID" -- bash -lc "
 
   cat > /etc/update-motd.d/00-header <<'MOTD'
 #!/bin/sh
-  printf '\\n'
-  printf '  CryptPad\\n'
-  printf '  ──────────────────────────────────────\\n'
+printf '\n  CryptPad\n'
+printf '  ────────────────────────────────────\n'
 MOTD
 
   cat > /etc/update-motd.d/10-sysinfo <<'MOTD'
 #!/bin/sh
-  hostname=\$(hostname)
-  ip=\$(ip -4 -o addr show scope global 2>/dev/null | awk '{print \$4}' | cut -d/ -f1 | head -n1)
-  uptime_str=\$(uptime -p 2>/dev/null | sed 's/^up //' || echo 'n/a')
-  disk=\$(df -h / 2>/dev/null | awk 'NR==2{printf \"%s / %s (%s)\", \$3, \$2, \$5}')
-  printf '  Hostname:  %s\\n' \"\$hostname\"
-  printf '  IP:        %s\\n' \"\$ip\"
-  printf '  Uptime:    %s\\n' \"\$uptime_str\"
-  printf '  Disk:      %s\\n' \"\$disk\"
+ip=\$(ip -4 -o addr show scope global 2>/dev/null | awk '{print \$4}' | cut -d/ -f1 | head -n1)
+printf '  Hostname:  %s\n' \"\$(hostname)\"
+printf '  IP:        %s\n' \"\${ip:-n/a}\"
+printf '  Uptime:    %s\n' \"\$(uptime -p 2>/dev/null || uptime)\"
+printf '  Disk:      %s\n' \"\$(df -h / | awk 'NR==2{printf \"%s/%s (%s used)\", \$3, \$2, \$5}')\"
 MOTD
 
   cat > /etc/update-motd.d/30-app <<'MOTD'
 #!/bin/sh
-  node_ver=\$(node --version 2>/dev/null || echo 'n/a')
-  service_active=\$(systemctl is-active cryptpad 2>/dev/null || echo 'unknown')
-  printf '\\n'
-  printf '  CryptPad:\\n'
-  printf '    App dir:       /opt/cryptpad\\n'
-  printf '    Config:        /opt/cryptpad/config/config.js\\n'
-  printf '    Node.js:       %s\\n' \"\$node_ver\"
-  printf '    Service:       %s\\n' \"\$service_active\"
-  timer_next=\$(systemctl list-timers cryptpad-update.timer --no-pager 2>/dev/null | awk 'NR==2{for(i=1;i<=NF;i++) if(\$i ~ /^[0-9]{4}-/) {printf \"%s %s\", \$i, \$(i+1); break}}' || echo 'n/a')
-  printf '    Auto-update:   %s\\n' \"\${timer_next:-enabled}\"
-  printf '    Web UI:        http://%s:${APP_PORT}/\\n' \"\$(ip -4 -o addr show scope global 2>/dev/null | awk '{print \$4}' | cut -d/ -f1 | head -n1)\"
-  printf '\\n'
-  printf '  Maintenance:\\n'
-  printf '    cryptpad-maint.sh update\\n'
-  printf '    cryptpad-maint.sh backup\\n'
-  printf '    cryptpad-maint.sh list-backups\\n'
-  printf '    cryptpad-maint.sh restore <file>\\n'
-  printf '    cryptpad-maint.sh restore-latest\\n'
-  printf '\\n'
-  printf '  Admin setup:\\n'
-  printf '    systemctl status cryptpad\\n'
-  printf '    (look for token URL to create admin account)\\n'
+node_ver=\$(node --version 2>/dev/null || echo 'n/a')
+service_active=\$(systemctl is-active cryptpad 2>/dev/null || echo 'unknown')
+printf '\n'
+printf '  CryptPad:\n'
+printf '    App dir:       /opt/cryptpad\n'
+printf '    Config:        /opt/cryptpad/config/config.js\n'
+printf '    Node.js:       %s\n' \"\$node_ver\"
+printf '    Service:       %s\n' \"\$service_active\"
+timer_next=\$(systemctl list-timers cryptpad-update.timer --no-pager 2>/dev/null | awk 'NR==2{for(i=1;i<=NF;i++) if(\$i ~ /^[0-9]{4}-/) {printf \"%s %s\", \$i, \$(i+1); break}}' || echo 'n/a')
+printf '    Auto-update:   %s\n' \"\${timer_next:-enabled}\"
+printf '    Web UI:        http://%s:${APP_PORT}/\n' \"\$(ip -4 -o addr show scope global 2>/dev/null | awk '{print \$4}' | cut -d/ -f1 | head -n1)\"
+printf '\n'
+printf '  Maintenance:\n'
+printf '    cryptpad-maint.sh update\n'
+printf '    cryptpad-maint.sh backup\n'
+printf '    cryptpad-maint.sh list-backups\n'
+printf '    cryptpad-maint.sh restore <file>\n'
+printf '    cryptpad-maint.sh restore-latest\n'
+printf '\n'
+printf '  Admin setup:\n'
+printf '    systemctl status cryptpad\n'
+printf '    (look for token URL to create admin account)\n'
 MOTD
 
   cat > /etc/update-motd.d/99-footer <<'MOTD'
 #!/bin/sh
-  printf '  ──────────────────────────────────────\\n'
-  printf '\\n'
+printf '  ────────────────────────────────────\n\n'
 MOTD
 
   chmod +x /etc/update-motd.d/*
@@ -735,7 +730,7 @@ Maintenance: cryptpad-maint.sh
 Created by cryptpad.sh</details>"
 pct set "$CT_ID" --description "$DESC"
 
-# ── Protection ───────────────────────────────────────────────────────────────
+# ── Protect container ────────────────────────────────────────────────────────
 pct set "$CT_ID" --protection 1
 
 # ── Summary ──────────────────────────────────────────────────────────────────

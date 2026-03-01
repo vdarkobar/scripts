@@ -42,7 +42,7 @@ CLEANUP_ON_FAIL=1  # 1 = destroy CT on error, 0 = keep for debugging
 #   /etc/systemd/system/matrix-stack.service
 #   /etc/systemd/system/matrix-update.service
 #   /etc/systemd/system/matrix-update.timer
-#   /etc/apt/apt.conf.d/52unattended-matrix.conf
+#   /etc/apt/apt.conf.d/52unattended-<hostname>.conf
 #   /etc/sysctl.d/99-hardening.conf
 
 # ── Trap cleanup ──────────────────────────────────────────────────────────────
@@ -78,11 +78,11 @@ done
 [[ -n "$CT_ID" ]] || { echo "  ERROR: Could not obtain next CT ID." >&2; exit 1; }
 
 # ── Show defaults & confirm ──────────────────────────────────────────────────
-TMPL_STORES="$(pvesh get /storage --output-format json 2>/dev/null \
+AVAIL_TMPL_STORES="$(pvesh get /storage --output-format json 2>/dev/null \
   | python3 -c "import sys,json; print(', '.join(sorted(s['storage'] for s in json.load(sys.stdin) if 'vztmpl' in s.get('content',''))))" 2>/dev/null || echo "n/a")"
-CT_STORES="$(pvesh get /storage --output-format json 2>/dev/null \
+AVAIL_CT_STORES="$(pvesh get /storage --output-format json 2>/dev/null \
   | python3 -c "import sys,json; print(', '.join(sorted(s['storage'] for s in json.load(sys.stdin) if 'rootdir' in s.get('content',''))))" 2>/dev/null || echo "n/a")"
-BRIDGES="$(ip -o link show type bridge 2>/dev/null | awk -F': ' '{print $2}' | sort | paste -sd', ' || echo "n/a")"
+AVAIL_BRIDGES="$(ip -o link show type bridge 2>/dev/null | awk -F': ' '{print $2}' | sort | paste -sd', ' || echo "n/a")"
 
 cat <<EOF
 
@@ -93,9 +93,9 @@ cat <<EOF
   CPU:               $CPU core(s)
   RAM:               $RAM MiB
   Disk:              $DISK GB
-  Bridge:            $BRIDGE ($BRIDGES)
-  Template Storage:  $TEMPLATE_STORAGE ($TMPL_STORES)
-  Container Storage: $CONTAINER_STORAGE ($CT_STORES)
+  Bridge:            $BRIDGE ($AVAIL_BRIDGES)
+  Template Storage:  $TEMPLATE_STORAGE ($AVAIL_TMPL_STORES)
+  Container Storage: $CONTAINER_STORAGE ($AVAIL_CT_STORES)
   Domain:            $MATRIX_DOMAIN
   Synapse URL:       matrix.${MATRIX_DOMAIN}
   Element URL:       chat.${MATRIX_DOMAIN}
@@ -146,7 +146,7 @@ pvesm status | awk -v s="$CONTAINER_STORAGE" '$1==s{f=1} END{exit(!f)}' \
 
 ip link show "$BRIDGE" >/dev/null 2>&1 || { echo "  ERROR: Bridge not found: $BRIDGE" >&2; exit 1; }
 
-# ── Root password ─────────────────────────────────────────────────────────────
+# ── Root password ────────────────────────────────────────────────────────────
 PASSWORD=""
 while true; do
   read -r -s -p "  Set root password (blank = auto-login): " PW1; echo
@@ -164,7 +164,7 @@ if [[ -z "$PASSWORD" ]]; then
   echo ""
 fi
 
-# ── Template ─────────────────────────────────────────────────────────────────
+# ── Template discovery & download ────────────────────────────────────────────
 pveam update
 echo ""
 [[ "$DEBIAN_VERSION" =~ ^[0-9]+$ ]] || { echo "  ERROR: DEBIAN_VERSION must be numeric." >&2; exit 1; }
@@ -216,9 +216,10 @@ for i in $(seq 1 30); do
 done
 [[ -n "$CT_IP" ]] || { echo "  ERROR: No IPv4 address acquired via DHCP within timeout." >&2; exit 1; }
 
-# ── Auto-login if no password ────────────────────────────────────────────────
+# ── Auto-login (if no password) ──────────────────────────────────────────────
 if [[ -z "$PASSWORD" ]]; then
   pct exec "$CT_ID" -- bash -lc '
+    set -euo pipefail
     mkdir -p /etc/systemd/system/container-getty@1.service.d
     cat > /etc/systemd/system/container-getty@1.service.d/override.conf <<EOF
 [Service]
@@ -232,6 +233,7 @@ fi
 
 # ── OS update ─────────────────────────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc '
+  set -euo pipefail
   export DEBIAN_FRONTEND=noninteractive
   export LANG=C.UTF-8
   export LC_ALL=C.UTF-8
@@ -244,6 +246,7 @@ pct exec "$CT_ID" -- bash -lc '
 
 # ── Configure locale ─────────────────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc '
+  set -euo pipefail
   export DEBIAN_FRONTEND=noninteractive
   apt-get install -y locales
   sed -i "s/^# *en_US.UTF-8/en_US.UTF-8/" /etc/locale.gen
@@ -253,6 +256,7 @@ pct exec "$CT_ID" -- bash -lc '
 
 # ── Remove unnecessary services ──────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc '
+  set -euo pipefail
   export DEBIAN_FRONTEND=noninteractive
   systemctl disable --now ssh 2>/dev/null || true
   systemctl disable --now postfix 2>/dev/null || true
@@ -262,12 +266,14 @@ pct exec "$CT_ID" -- bash -lc '
 
 # ── Set timezone ─────────────────────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc "
+  set -euo pipefail
   ln -sf /usr/share/zoneinfo/${MATRIX_TZ} /etc/localtime
   echo '${MATRIX_TZ}' > /etc/timezone
 "
 
 # ── Install Podman ────────────────────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc '
+  set -euo pipefail
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -qq
   apt-get install -y podman podman-compose fuse-overlayfs curl ca-certificates iproute2 python3
@@ -275,6 +281,7 @@ pct exec "$CT_ID" -- bash -lc '
 
 # ── Configure storage driver ─────────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc '
+  set -euo pipefail
   mkdir -p /etc/containers
   cat > /etc/containers/storage.conf <<EOF
 [storage]
@@ -290,6 +297,7 @@ EOF
 
 # ── Configure extended registries ────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc '
+  set -euo pipefail
   mkdir -p /etc/containers
   cat > /etc/containers/registries.conf <<EOF
 unqualified-search-registries = [
@@ -306,6 +314,7 @@ EOF
 
 # ── Podman log rotation ──────────────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc '
+  set -euo pipefail
   mkdir -p /etc/containers
   cat > /etc/containers/containers.conf <<EOF
 [containers]
@@ -503,6 +512,7 @@ EOF"
 
 # ── .env (reference only) ────────────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc "
+  set -euo pipefail
   cat > /opt/matrix/.env <<EOF
 # Reference only — values are baked into docker-compose.yml at creation time.
 # To change, edit docker-compose.yml directly and run: podman-compose up -d
@@ -519,6 +529,7 @@ EOF
 echo "  Generating Synapse configuration..."
 
 pct exec "$CT_ID" -- bash -lc "
+  set -euo pipefail
   podman run --rm \
     -v /opt/matrix/synapse:/data:Z \
     -e SYNAPSE_SERVER_NAME='matrix.${MATRIX_DOMAIN}' \
@@ -616,6 +627,7 @@ EOF"
 
 # Validate patch
 pct exec "$CT_ID" -- bash -lc '
+  set -euo pipefail
   cfg=/opt/matrix/synapse/homeserver.yaml
   grep -q "psycopg2" "$cfg"       || { echo "  ERROR: psycopg2 not found in homeserver.yaml" >&2; exit 1; }
   grep -q "public_baseurl" "$cfg" || { echo "  ERROR: public_baseurl not found in homeserver.yaml" >&2; exit 1; }
@@ -625,6 +637,7 @@ pct exec "$CT_ID" -- bash -lc '
 
 # ── Auto-update timer ────────────────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc '
+  set -euo pipefail
   cat > /etc/systemd/system/matrix-update.service <<EOF
 [Unit]
 Description=Pull and update Matrix Podman containers
@@ -660,6 +673,7 @@ pct exec "$CT_ID" -- bash -lc 'cd /opt/matrix && podman-compose pull'
 
 # ── Auto-start on LXC boot (and start now) ───────────────────────────────────
 pct exec "$CT_ID" -- bash -lc '
+  set -euo pipefail
   cat > /etc/systemd/system/matrix-stack.service <<EOF
 [Unit]
 Description=Matrix Synapse (Podman) stack
@@ -726,13 +740,14 @@ fi
 
 # ── Unattended upgrades (do NOT overwrite Debian defaults) ───────────────────
 pct exec "$CT_ID" -- bash -lc '
+  set -euo pipefail
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -qq
   apt-get install -y unattended-upgrades
 
   distro_codename="$(. /etc/os-release && echo "$VERSION_CODENAME")"
 
-  cat > /etc/apt/apt.conf.d/52unattended-matrix.conf <<EOF
+  cat > /etc/apt/apt.conf.d/52unattended-$(hostname).conf <<EOF
 Unattended-Upgrade::Origins-Pattern {
         "origin=Debian,codename=${distro_codename},label=Debian-Security";
         "origin=Debian,codename=${distro_codename}-security";
@@ -760,6 +775,7 @@ EOF
 
 # ── Sysctl hardening ─────────────────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc '
+  set -euo pipefail
   cat > /etc/sysctl.d/99-hardening.conf <<EOF
 net.ipv4.conf.all.rp_filter = 1
 net.ipv4.conf.default.rp_filter = 1
@@ -778,8 +794,9 @@ EOF
   sysctl --system >/dev/null 2>&1 || true
 '
 
-# ── Cleanup unnecessary packages ─────────────────────────────────────────────
+# ── Cleanup packages ─────────────────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc '
+  set -euo pipefail
   export DEBIAN_FRONTEND=noninteractive
   apt-get purge -y man-db manpages 2>/dev/null || true
   apt-get -y autoremove

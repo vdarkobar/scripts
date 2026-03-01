@@ -36,7 +36,7 @@ CLEANUP_ON_FAIL=1  # 1 = destroy CT on error, 0 = keep for debugging
 #   /etc/update-motd.d/30-app
 #   /etc/update-motd.d/99-footer
 #   /etc/systemd/system/container-getty@1.service.d/override.conf
-#   /etc/apt/apt.conf.d/52unattended-docmost.conf
+#   /etc/apt/apt.conf.d/52unattended-<hostname>.conf
 #   /etc/sysctl.d/99-hardening.conf
 
 # ── Trap cleanup ──────────────────────────────────────────────────────────────
@@ -72,11 +72,11 @@ done
 [[ -n "$CT_ID" ]] || { echo "  ERROR: Could not obtain next CT ID." >&2; exit 1; }
 
 # ── Show defaults & confirm ───────────────────────────────────────────────────
-TMPL_STORES="$(pvesh get /storage --output-format json 2>/dev/null \
+AVAIL_TMPL_STORES="$(pvesh get /storage --output-format json 2>/dev/null \
   | python3 -c "import sys,json; print(', '.join(sorted(s['storage'] for s in json.load(sys.stdin) if 'vztmpl' in s.get('content',''))))" 2>/dev/null || echo "n/a")"
-CT_STORES="$(pvesh get /storage --output-format json 2>/dev/null \
+AVAIL_CT_STORES="$(pvesh get /storage --output-format json 2>/dev/null \
   | python3 -c "import sys,json; print(', '.join(sorted(s['storage'] for s in json.load(sys.stdin) if 'rootdir' in s.get('content',''))))" 2>/dev/null || echo "n/a")"
-BRIDGES="$(ip -o link show type bridge 2>/dev/null | awk -F': ' '{print $2}' | paste -sd', ' || echo "n/a")"
+AVAIL_BRIDGES="$(ip -o link show type bridge 2>/dev/null | awk -F': ' '{print $2}' | sort | paste -sd', ' || echo "n/a")"
 
 cat <<EOF
 
@@ -87,9 +87,9 @@ cat <<EOF
   CPU cores:         $CPU
   RAM (MB):          $RAM
   Disk (GB):         $DISK
-  Bridge:            $BRIDGE ($BRIDGES)
-  Template storage:  $TEMPLATE_STORAGE ($TMPL_STORES)
-  Container storage: $CONTAINER_STORAGE ($CT_STORES)
+  Bridge:            $BRIDGE ($AVAIL_BRIDGES)
+  Template storage:  $TEMPLATE_STORAGE ($AVAIL_TMPL_STORES)
+  Container storage: $CONTAINER_STORAGE ($AVAIL_CT_STORES)
   Node.js:           $NODE_VERSION
   PostgreSQL:        $PG_VERSION
   Timezone:          $APP_TZ
@@ -132,7 +132,7 @@ pvesm status | awk -v s="$CONTAINER_STORAGE" '$1==s{f=1} END{exit(!f)}' \
 ip link show "$BRIDGE" >/dev/null 2>&1 \
   || { echo "  ERROR: Bridge not found: $BRIDGE" >&2; exit 1; }
 
-# ── Root password prompt ──────────────────────────────────────────────────────
+# ── Root password ────────────────────────────────────────────────────────────
 PASSWORD=""
 while true; do
   read -r -s -p "  Set root password (blank = auto-login): " PW1; echo
@@ -149,7 +149,7 @@ if [[ -z "$PASSWORD" ]]; then
   echo ""
 fi
 
-# ── Template discovery & download ─────────────────────────────────────────────
+# ── Template discovery & download ────────────────────────────────────────────
 pveam update
 echo ""
 [[ "$DEBIAN_VERSION" =~ ^[0-9]+$ ]] || { echo "  ERROR: DEBIAN_VERSION must be numeric." >&2; exit 1; }
@@ -227,7 +227,7 @@ pct exec "$CT_ID" -- bash -lc '
   apt-get -y clean
 '
 
-# ── Locale ────────────────────────────────────────────────────────────────────
+# ── Configure locale ─────────────────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc '
   set -euo pipefail
   export DEBIAN_FRONTEND=noninteractive
@@ -247,7 +247,7 @@ pct exec "$CT_ID" -- bash -lc '
   apt-get -y autoremove
 '
 
-# ── Timezone ──────────────────────────────────────────────────────────────────
+# ── Set timezone ─────────────────────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc "
   set -euo pipefail
   ln -sf /usr/share/zoneinfo/${APP_TZ} /etc/localtime
@@ -510,7 +510,7 @@ pct exec "$CT_ID" -- bash -lc '
   apt-get update -qq
   apt-get install -y unattended-upgrades
   distro_codename="$(. /etc/os-release && echo "$VERSION_CODENAME")"
-  cat > /etc/apt/apt.conf.d/52unattended-docmost.conf <<EOF
+  cat > /etc/apt/apt.conf.d/52unattended-$(hostname).conf <<EOF
 Unattended-Upgrade::Origins-Pattern {
         "origin=Debian,codename=${distro_codename},label=Debian-Security";
         "origin=Debian,codename=${distro_codename}-security";
@@ -569,49 +569,44 @@ pct exec "$CT_ID" -- bash -lc "
 
   cat > /etc/update-motd.d/00-header <<'MOTD'
 #!/bin/sh
-  printf '\\n'
-  printf '  Docmost\\n'
-  printf '  ──────────────────────────────────────\\n'
+printf '\n  Docmost\n'
+printf '  ────────────────────────────────────\n'
 MOTD
 
   cat > /etc/update-motd.d/10-sysinfo <<'MOTD'
 #!/bin/sh
-  hostname=\$(hostname)
-  ip=\$(ip -4 -o addr show scope global 2>/dev/null | awk '{print \$4}' | cut -d/ -f1 | head -n1)
-  uptime_str=\$(uptime -p 2>/dev/null | sed 's/^up //' || echo 'n/a')
-  disk=\$(df -h / 2>/dev/null | awk 'NR==2{printf \"%s / %s (%s)\", \$3, \$2, \$5}')
-  printf '  Hostname:  %s\\n' \"\$hostname\"
-  printf '  IP:        %s\\n' \"\$ip\"
-  printf '  Uptime:    %s\\n' \"\$uptime_str\"
-  printf '  Disk:      %s\\n' \"\$disk\"
+ip=\$(ip -4 -o addr show scope global 2>/dev/null | awk '{print \$4}' | cut -d/ -f1 | head -n1)
+printf '  Hostname:  %s\n' \"\$(hostname)\"
+printf '  IP:        %s\n' \"\${ip:-n/a}\"
+printf '  Uptime:    %s\n' \"\$(uptime -p 2>/dev/null || uptime)\"
+printf '  Disk:      %s\n' \"\$(df -h / | awk 'NR==2{printf \"%s/%s (%s used)\", \$3, \$2, \$5}')\"
 MOTD
 
   cat > /etc/update-motd.d/30-app <<'MOTD'
 #!/bin/sh
-  node_ver=\$(node -v 2>/dev/null || echo 'n/a')
-  docmost_active=\$(systemctl is-active docmost 2>/dev/null || echo 'unknown')
-  pg_active=\$(systemctl is-active postgresql 2>/dev/null || echo 'unknown')
-  redis_active=\$(systemctl is-active redis-server 2>/dev/null || echo 'unknown')
-  printf '\\n'
-  printf '  Docmost:\\n'
-  printf '    App dir:       /opt/docmost\\n'
-  printf '    Node.js:       %s\\n' \"\$node_ver\"
-  printf '    Docmost:       %s\\n' \"\$docmost_active\"
-  printf '    PostgreSQL:    %s\\n' \"\$pg_active\"
-  printf '    Redis:         %s\\n' \"\$redis_active\"
-  timer_next=\$(systemctl list-timers docmost-update.timer --no-pager 2>/dev/null | awk 'NR==2{for(i=1;i<=NF;i++) if(\$i ~ /^[0-9]{4}-/) {printf \"%s %s\", \$i, \$(i+1); break}}' || echo 'n/a')
-  printf '    Auto-update:   %s\\n' \"\${timer_next:-enabled}\"
-  printf '    Web UI:        http://%s:${APP_PORT}/\\n' \"\$(ip -4 -o addr show scope global 2>/dev/null | awk '{print \$4}' | cut -d/ -f1 | head -n1)\"
-  printf '\\n'
-  printf '  Maintenance:\\n'
-  printf '    docmost-maint.sh update\\n'
-  printf '    Snapshot before manual update: pct snapshot <CT_ID> pre-update\\n'
+node_ver=\$(node -v 2>/dev/null || echo 'n/a')
+docmost_active=\$(systemctl is-active docmost 2>/dev/null || echo 'unknown')
+pg_active=\$(systemctl is-active postgresql 2>/dev/null || echo 'unknown')
+redis_active=\$(systemctl is-active redis-server 2>/dev/null || echo 'unknown')
+printf '\n'
+printf '  Docmost:\n'
+printf '    App dir:       /opt/docmost\n'
+printf '    Node.js:       %s\n' \"\$node_ver\"
+printf '    Docmost:       %s\n' \"\$docmost_active\"
+printf '    PostgreSQL:    %s\n' \"\$pg_active\"
+printf '    Redis:         %s\n' \"\$redis_active\"
+timer_next=\$(systemctl list-timers docmost-update.timer --no-pager 2>/dev/null | awk 'NR==2{for(i=1;i<=NF;i++) if(\$i ~ /^[0-9]{4}-/) {printf \"%s %s\", \$i, \$(i+1); break}}' || echo 'n/a')
+printf '    Auto-update:   %s\n' \"\${timer_next:-enabled}\"
+printf '    Web UI:        http://%s:${APP_PORT}/\n' \"\$(ip -4 -o addr show scope global 2>/dev/null | awk '{print \$4}' | cut -d/ -f1 | head -n1)\"
+printf '\n'
+printf '  Maintenance:\n'
+printf '    docmost-maint.sh update\n'
+printf '    Snapshot before manual update: pct snapshot <CT_ID> pre-update\n'
 MOTD
 
   cat > /etc/update-motd.d/99-footer <<'MOTD'
 #!/bin/sh
-  printf '  ──────────────────────────────────────\\n'
-  printf '\\n'
+printf '  ────────────────────────────────────\n\n'
 MOTD
 
   chmod +x /etc/update-motd.d/*
@@ -632,7 +627,7 @@ Maintenance: docmost-maint.sh
 Created by docmost.sh</details>"
 pct set "$CT_ID" --description "$DESC"
 
-# ── Protection ────────────────────────────────────────────────────────────────
+# ── Protect container ────────────────────────────────────────────────────────
 pct set "$CT_ID" --protection 1
 
 # ── Summary ───────────────────────────────────────────────────────────────────

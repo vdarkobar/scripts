@@ -38,7 +38,7 @@ CLEANUP_ON_FAIL=1  # 1 = destroy CT on error, 0 = keep for debugging
 #   /etc/update-motd.d/30-app
 #   /etc/update-motd.d/99-footer
 #   /etc/systemd/system/container-getty@1.service.d/override.conf
-#   /etc/apt/apt.conf.d/52unattended-samba.conf
+#   /etc/apt/apt.conf.d/52unattended-<hostname>.conf
 #   /etc/sysctl.d/99-hardening.conf
 
 # ── Validate config values (guard against sed injection) ─────────────────────
@@ -88,7 +88,7 @@ done
 
 [[ -n "$CT_ID" ]] || { echo "  ERROR: Could not obtain next CT ID." >&2; exit 1; }
 
-# ── Discover available resources ───────────────────────────────────────────────
+# ── Discover available resources ─────────────────────────────────────────────
 AVAIL_BRIDGES="$(ip -o link show type bridge 2>/dev/null | awk -F': ' '{print $2}' | sort | paste -sd', ' || echo "n/a")"
 AVAIL_TMPL_STORES="$(pvesh get /storage --output-format json 2>/dev/null \
   | python3 -c "import sys,json; print(', '.join(sorted(s['storage'] for s in json.load(sys.stdin) if 'vztmpl' in s.get('content',''))))" 2>/dev/null || echo "n/a")"
@@ -198,7 +198,7 @@ while true; do
 done
 echo ""
 
-# ── Template ─────────────────────────────────────────────────────────────────
+# ── Template discovery & download ────────────────────────────────────────────
 pveam update
 echo ""
 [[ "$DEBIAN_VERSION" =~ ^[0-9]+$ ]] || { echo "  ERROR: DEBIAN_VERSION must be numeric." >&2; exit 1; }
@@ -250,7 +250,7 @@ for i in $(seq 1 30); do
 done
 [[ -n "$CT_IP" ]] || { echo "  ERROR: No IPv4 address acquired via DHCP within timeout." >&2; exit 1; }
 
-# ── Auto-login if no password ────────────────────────────────────────────────
+# ── Auto-login (if no password) ──────────────────────────────────────────────
 if [[ -z "$PASSWORD" ]]; then
   pct exec "$CT_ID" -- bash -lc '
     set -euo pipefail
@@ -464,7 +464,7 @@ pct exec "$CT_ID" -- bash -lc '
 
   distro_codename="$(. /etc/os-release && echo "$VERSION_CODENAME")"
 
-  cat > /etc/apt/apt.conf.d/52unattended-samba.conf <<EOF
+  cat > /etc/apt/apt.conf.d/52unattended-$(hostname).conf <<EOF
 Unattended-Upgrade::Origins-Pattern {
         "origin=Debian,codename=${distro_codename},label=Debian-Security";
         "origin=Debian,codename=${distro_codename}-security";
@@ -508,7 +508,7 @@ EOF
   sysctl --system >/dev/null 2>&1 || true
 '
 
-# ── Cleanup unnecessary packages ────────────────────────────────────────────
+# ── Cleanup packages ─────────────────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc '
   set -euo pipefail
   export DEBIAN_FRONTEND=noninteractive
@@ -580,7 +580,7 @@ Workgroup: ${SMB_WORKGROUP}
 Created by samba-lxc.sh</details>"
 pct set "$CT_ID" --description "$SMB_DESC"
 
-# ── Protect container ───────────────────────────────────────────────────────
+# ── Protect container ────────────────────────────────────────────────────────
 pct set "$CT_ID" --protection 1
 
 # ── Summary ──────────────────────────────────────────────────────────────────
