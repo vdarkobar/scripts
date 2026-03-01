@@ -107,7 +107,7 @@ cat <<EOF
 
 EOF
 
-SCRIPT_URL="https://raw.githubusercontent.com/vdarkobar/scripts/refs/heads/main/npm-podman.sh"
+SCRIPT_URL="https://raw.githubusercontent.com/vdarkobar/scripts/main/npm-podman.sh"
 SCRIPT_LOCAL="/root/npm-podman.sh"
 
 read -r -p "  Continue with these settings? [y/N]: " response
