@@ -89,12 +89,6 @@ cat <<EOF
   this script, then re-run.
 
 EOF
-#read -r -p "  Continue with these settings? [y/N]: " response
-#case "$response" in
-#  [yY][eE][sS]|[yY]) ;;
-#  *) echo "  Cancelled."; exit 0 ;;
-#esac
-#echo ""
 
 # New:
 SCRIPT_URL="https://raw.githubusercontent.com/vdarkobar/scripts/main/deblxc.sh"
@@ -117,7 +111,6 @@ case "$response" in
     exit 0
     ;;
 esac
-
 
 # ── Validate storage & network ────────────────────────────────────────────────
 pvesm status | awk -v s="$TEMPLATE_STORAGE" '$1==s{f=1} END{exit(!f)}' \
