@@ -19,7 +19,7 @@ ELEMENT_PORT=8080
 TAGS="matrix;podman;lxc"
 
 # Images (pin here if you want)
-SYNAPSE_IMAGE="ghcr.io/element-hq/synapse:latest"
+SYNAPSE_IMAGE="ghcr.io/element-hq/synapse:v1.148.0"
 POSTGRES_IMAGE="docker.io/library/postgres:18-alpine"
 ELEMENT_IMAGE="docker.io/vectorim/element-web:latest"
 REDIS_IMAGE="docker.io/library/redis:8-alpine"
@@ -376,6 +376,7 @@ services:
     image: __POSTGRES_IMAGE__
     container_name: postgres_db
     restart: unless-stopped
+    shm_size: 512mb
     networks:
       - matrix
     environment:
@@ -439,6 +440,10 @@ services:
       timeout: 10s
       retries: 3
       start_period: 30s
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
     depends_on:
       postgres_db:
         condition: service_healthy
@@ -876,6 +881,11 @@ cat <<EOF
 client_max_body_size 200M;
 proxy_read_timeout 600s;
 proxy_send_timeout 600s;
+
+location ^~ /_synapse/admin {
+    return 403;
+}
+
 location /.well-known/matrix/server {
     default_type application/json;
     add_header Access-Control-Allow-Origin *;
