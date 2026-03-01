@@ -50,3 +50,7 @@ LXC updater
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/updatelxc.sh)
 ```
+
+LXC updater
+
+```bash <(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/updatelxc.sh)```
