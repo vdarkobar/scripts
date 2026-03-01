@@ -23,7 +23,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/unbou
 bash <(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/samba.sh)
 ```
   
-#### *Matrix, decentralised communication <a href="https://github.com/vdarkobar/scripts/blob/main/misc/matrix-how-to.md">how-to</a>*
+#### *<a href="https://github.com/vdarkobar/scripts/blob/main/misc/matrix-how-to.md">Matrix</a>, decentralised communication*
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/matrix-podman.sh)
 ```
