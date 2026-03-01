@@ -19,7 +19,7 @@ ELEMENT_PORT=8080
 TAGS="matrix;podman;lxc"
 
 # Images (pin here if you want)
-SYNAPSE_IMAGE="ghcr.io/element-hq/synapse:v1.148.0"
+SYNAPSE_IMAGE="ghcr.io/element-hq/synapse:latest"
 POSTGRES_IMAGE="docker.io/library/postgres:18-alpine"
 ELEMENT_IMAGE="docker.io/vectorim/element-web:latest"
 REDIS_IMAGE="docker.io/library/redis:8-alpine"
