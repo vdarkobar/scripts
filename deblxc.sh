@@ -89,12 +89,35 @@ cat <<EOF
   this script, then re-run.
 
 EOF
+#read -r -p "  Continue with these settings? [y/N]: " response
+#case "$response" in
+#  [yY][eE][sS]|[yY]) ;;
+#  *) echo "  Cancelled."; exit 0 ;;
+#esac
+#echo ""
+
+# New:
+SCRIPT_URL="https://raw.githubusercontent.com/vdarkobar/scripts/main/deblxc.sh"
+SCRIPT_LOCAL="/root/deblxc.sh"
+
 read -r -p "  Continue with these settings? [y/N]: " response
 case "$response" in
   [yY][eE][sS]|[yY]) ;;
-  *) echo "  Cancelled."; exit 0 ;;
+  *)
+    echo ""
+    echo "  Downloading script to ${SCRIPT_LOCAL} for editing..."
+    if curl -fsSL "$SCRIPT_URL" -o "$SCRIPT_LOCAL"; then
+      chmod +x "$SCRIPT_LOCAL"
+      echo "  Edit:  nano ${SCRIPT_LOCAL}"
+      echo "  Run:   bash ${SCRIPT_LOCAL}"
+      echo ""
+    else
+      echo "  ERROR: Failed to download script." >&2
+    fi
+    exit 0
+    ;;
 esac
-echo ""
+
 
 # ── Validate storage & network ────────────────────────────────────────────────
 pvesm status | awk -v s="$TEMPLATE_STORAGE" '$1==s{f=1} END{exit(!f)}' \
