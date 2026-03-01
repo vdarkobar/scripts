@@ -50,7 +50,7 @@ trap 'rc=$?;
   exit "$rc"
 ' INT TERM
 
-# ── Preflight ─────────────────────────────────────────────────────────────────
+# ── Preflight — root & commands ───────────────────────────────────────────────
 [[ "$(id -u)" -eq 0 ]] || { echo "  ERROR: Run as root on the Proxmox host." >&2; exit 1; }
 
 for cmd in pvesh pveam pct pvesm; do
@@ -59,7 +59,7 @@ done
 
 [[ -n "$CT_ID" ]] || { echo "  ERROR: Could not obtain next CT ID." >&2; exit 1; }
 
-# ── Discover available resources ─────────────────────────────────────────────
+# ── Discover available resources ──────────────────────────────────────────────
 AVAIL_BRIDGES="$(ip -o link show type bridge 2>/dev/null | awk -F': ' '{print $2}' | sort | paste -sd', ' || echo "n/a")"
 AVAIL_TMPL_STORES="$(pvesh get /storage --output-format json 2>/dev/null \
   | python3 -c "import sys,json; print(', '.join(sorted(s['storage'] for s in json.load(sys.stdin) if 'vztmpl' in s.get('content',''))))" 2>/dev/null || echo "n/a")"
@@ -111,7 +111,7 @@ case "$response" in
     ;;
 esac
 
-# ── Validate storage & network ────────────────────────────────────────────────
+# ── Preflight — environment ───────────────────────────────────────────────────
 pvesm status | awk -v s="$TEMPLATE_STORAGE" '$1==s{f=1} END{exit(!f)}' \
   || { echo "  ERROR: Template storage not found: $TEMPLATE_STORAGE" >&2; exit 1; }
 
@@ -120,7 +120,7 @@ pvesm status | awk -v s="$CONTAINER_STORAGE" '$1==s{f=1} END{exit(!f)}' \
 
 ip link show "$BRIDGE" >/dev/null 2>&1 || { echo "  ERROR: Bridge not found: $BRIDGE" >&2; exit 1; }
 
-# ── Root password ────────────────────────────────────────────────────────────
+# ── Root password ─────────────────────────────────────────────────────────────
 PASSWORD=""
 while true; do
   read -r -s -p "  Set root password (blank = auto-login): " PW1; echo
@@ -138,7 +138,7 @@ if [[ -z "$PASSWORD" ]]; then
   echo ""
 fi
 
-# ── Template discovery & download ────────────────────────────────────────────
+# ── Template discovery & download ─────────────────────────────────────────────
 pveam update
 echo ""
 [[ "$DEBIAN_VERSION" =~ ^[0-9]+$ ]] || { echo "  ERROR: DEBIAN_VERSION must be numeric." >&2; exit 1; }
@@ -175,7 +175,7 @@ PCT_OPTIONS=(
 pct create "$CT_ID" "${TEMPLATE_STORAGE}:vztmpl/${TEMPLATE}" "${PCT_OPTIONS[@]}"
 CREATED=1
 
-# ── Start & wait for IPv4 ────────────────────────────────────────────────────
+# ── Start & wait for IPv4 ─────────────────────────────────────────────────────
 pct start "$CT_ID"
 
 CT_IP=""
@@ -190,7 +190,7 @@ for i in $(seq 1 30); do
 done
 [[ -n "$CT_IP" ]] || { echo "  ERROR: No IPv4 address acquired via DHCP within timeout." >&2; exit 1; }
 
-# ── Auto-login (if no password) ──────────────────────────────────────────────
+# ── Auto-login (if no password) ───────────────────────────────────────────────
 if [[ -z "$PASSWORD" ]]; then
   pct exec "$CT_ID" -- bash -lc '
     set -euo pipefail
@@ -218,7 +218,7 @@ pct exec "$CT_ID" -- bash -lc '
   apt-get -y clean
 '
 
-# ── Configure locale ─────────────────────────────────────────────────────────
+# ── Configure locale ──────────────────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc '
   set -euo pipefail
   export DEBIAN_FRONTEND=noninteractive
@@ -238,14 +238,14 @@ pct exec "$CT_ID" -- bash -lc '
   apt-get -y autoremove
 '
 
-# ── Set timezone ─────────────────────────────────────────────────────────────
+# ── Set timezone ──────────────────────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc "
   set -euo pipefail
   ln -sf /usr/share/zoneinfo/${DEB_TZ} /etc/localtime
   echo '${DEB_TZ}' > /etc/timezone
 "
 
-# ── Unattended upgrades ──────────────────────────────────────────────────────
+# ── Unattended upgrades ───────────────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc '
   set -euo pipefail
   export DEBIAN_FRONTEND=noninteractive
@@ -298,7 +298,7 @@ EOF
   sysctl --system >/dev/null 2>&1 || true
 '
 
-# ── Cleanup packages ─────────────────────────────────────────────────────────
+# ── Cleanup packages ──────────────────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc '
   set -euo pipefail
   export DEBIAN_FRONTEND=noninteractive
@@ -343,13 +343,13 @@ pct exec "$CT_ID" -- bash -lc '
   grep -q "^export TERM=" /root/.bashrc 2>/dev/null || echo "export TERM=xterm-256color" >> /root/.bashrc
 '
 
-# ── Proxmox UI description ───────────────────────────────────────────────────
+# ── Proxmox UI description ────────────────────────────────────────────────────
 DEB_DESC="Debian ${DEBIAN_VERSION} (${CT_IP})
 <details><summary>Details</summary>Debian ${DEBIAN_VERSION} LXC
 Created by deblxc.sh</details>"
 pct set "$CT_ID" --description "$DEB_DESC"
 
-# ── Protect container ────────────────────────────────────────────────────────
+# ── Protect container ─────────────────────────────────────────────────────────
 pct set "$CT_ID" --protection 1
 
 # ── Summary ───────────────────────────────────────────────────────────────────

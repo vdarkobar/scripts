@@ -60,7 +60,7 @@ trap 'rc=$?;
   exit "$rc"
 ' INT TERM
 
-# ── Preflight ─────────────────────────────────────────────────────────────────
+# ── Preflight — root & commands ───────────────────────────────────────────────
 [[ "$(id -u)" -eq 0 ]] || { echo "  ERROR: Run as root on the Proxmox host." >&2; exit 1; }
 
 for cmd in pvesh pveam pct pvesm; do
@@ -69,14 +69,14 @@ done
 
 [[ -n "$CT_ID" ]] || { echo "  ERROR: Could not obtain next CT ID." >&2; exit 1; }
 
-# ── Discover available resources ─────────────────────────────────────────────
+# ── Discover available resources ──────────────────────────────────────────────
 AVAIL_BRIDGES="$(ip -o link show type bridge 2>/dev/null | awk -F': ' '{print $2}' | sort | paste -sd', ' || echo "n/a")"
 AVAIL_TMPL_STORES="$(pvesh get /storage --output-format json 2>/dev/null \
   | python3 -c "import sys,json; print(', '.join(sorted(s['storage'] for s in json.load(sys.stdin) if 'vztmpl' in s.get('content',''))))" 2>/dev/null || echo "n/a")"
 AVAIL_CT_STORES="$(pvesh get /storage --output-format json 2>/dev/null \
   | python3 -c "import sys,json; print(', '.join(sorted(s['storage'] for s in json.load(sys.stdin) if 'rootdir' in s.get('content',''))))" 2>/dev/null || echo "n/a")"
 
-# ── Show defaults & confirm ──────────────────────────────────────────────────
+# ── Show defaults & confirm ───────────────────────────────────────────────────
 cat <<EOF
 
   Unbound DNS LXC Creator — Configuration
@@ -122,7 +122,7 @@ case "$response" in
     ;;
 esac
 
-# ── Validate storage & network ───────────────────────────────────────────────
+# ── Preflight — environment ───────────────────────────────────────────────────
 pvesm status | awk -v s="$TEMPLATE_STORAGE" '$1==s{f=1} END{exit(!f)}' \
   || { echo "  ERROR: Template storage not found: $TEMPLATE_STORAGE" >&2; exit 1; }
 
@@ -131,7 +131,7 @@ pvesm status | awk -v s="$CONTAINER_STORAGE" '$1==s{f=1} END{exit(!f)}' \
 
 ip link show "$BRIDGE" >/dev/null 2>&1 || { echo "  ERROR: Bridge not found: $BRIDGE" >&2; exit 1; }
 
-# ── Root password ────────────────────────────────────────────────────────────
+# ── Root password ─────────────────────────────────────────────────────────────
 PASSWORD=""
 while true; do
   read -r -s -p "  Set root password (blank = auto-login): " PW1; echo
@@ -149,7 +149,7 @@ if [[ -z "$PASSWORD" ]]; then
   echo ""
 fi
 
-# ── Template discovery & download ────────────────────────────────────────────
+# ── Template discovery & download ─────────────────────────────────────────────
 pveam update
 echo ""
 [[ "$DEBIAN_VERSION" =~ ^[0-9]+$ ]] || { echo "  ERROR: DEBIAN_VERSION must be numeric." >&2; exit 1; }
@@ -168,7 +168,7 @@ else
   pveam download "$TEMPLATE_STORAGE" "$TEMPLATE"
 fi
 
-# ── Create LXC ───────────────────────────────────────────────────────────────
+# ── Create LXC ────────────────────────────────────────────────────────────────
 PCT_OPTIONS=(
   -hostname "$HN"
   -cores "$CPU"
@@ -186,7 +186,7 @@ PCT_OPTIONS=(
 pct create "$CT_ID" "${TEMPLATE_STORAGE}:vztmpl/${TEMPLATE}" "${PCT_OPTIONS[@]}"
 CREATED=1
 
-# ── Start & wait for IPv4 ───────────────────────────────────────────────────
+# ── Start & wait for IPv4 ─────────────────────────────────────────────────────
 pct start "$CT_ID"
 
 CT_IP=""
@@ -201,7 +201,7 @@ for i in $(seq 1 30); do
 done
 [[ -n "$CT_IP" ]] || { echo "  ERROR: No IPv4 address acquired via DHCP within timeout." >&2; exit 1; }
 
-# ── Auto-login (if no password) ──────────────────────────────────────────────
+# ── Auto-login (if no password) ───────────────────────────────────────────────
 if [[ -z "$PASSWORD" ]]; then
   pct exec "$CT_ID" -- bash -lc '
     set -euo pipefail
@@ -216,7 +216,7 @@ EOF
   '
 fi
 
-# ── OS update ────────────────────────────────────────────────────────────────
+# ── OS update ─────────────────────────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc '
   set -euo pipefail
   export DEBIAN_FRONTEND=noninteractive
@@ -229,7 +229,7 @@ pct exec "$CT_ID" -- bash -lc '
   apt-get -y clean
 '
 
-# ── Configure locale ─────────────────────────────────────────────────────────
+# ── Configure locale ──────────────────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc '
   set -euo pipefail
   export DEBIAN_FRONTEND=noninteractive
@@ -239,7 +239,7 @@ pct exec "$CT_ID" -- bash -lc '
   update-locale LANG=en_US.UTF-8
 '
 
-# ── Remove unnecessary services ──────────────────────────────────────────────
+# ── Remove unnecessary services ───────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc '
   set -euo pipefail
   export DEBIAN_FRONTEND=noninteractive
@@ -249,14 +249,14 @@ pct exec "$CT_ID" -- bash -lc '
   apt-get -y autoremove
 '
 
-# ── Set timezone ─────────────────────────────────────────────────────────────
+# ── Set timezone ──────────────────────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc "
   set -euo pipefail
   ln -sf /usr/share/zoneinfo/${UB_TZ} /etc/localtime
   echo '${UB_TZ}' > /etc/timezone
 "
 
-# ── Detect domain name (inside CT) ──────────────────────────────────────────
+# ── Detect domain name (inside CT) ────────────────────────────────────────────
 if [[ -z "$UB_DOMAIN" ]]; then
   UB_DOMAIN="$(pct exec "$CT_ID" -- sh -lc "
     awk '/^domain/ {print \$2; exit}' /etc/resolv.conf 2>/dev/null || true
@@ -273,7 +273,7 @@ if [[ -z "$UB_DOMAIN" ]]; then
 fi
 echo "  Domain: $UB_DOMAIN"
 
-# ── Install Unbound ──────────────────────────────────────────────────────────
+# ── Install Unbound ───────────────────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc '
   set -euo pipefail
   export DEBIAN_FRONTEND=noninteractive
@@ -281,7 +281,7 @@ pct exec "$CT_ID" -- bash -lc '
   apt-get install -y unbound dnsutils dns-root-data wget
 '
 
-# ── Update root hints (atomic) ──────────────────────────────────────────────
+# ── Update root hints (atomic) ────────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc '
   set -euo pipefail
   tmp="$(mktemp)"
@@ -293,7 +293,7 @@ pct exec "$CT_ID" -- bash -lc '
   rm -f "$tmp"
 '
 
-# ── Write unbound.conf ──────────────────────────────────────────────────────
+# ── Write unbound.conf ────────────────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc "
   set -euo pipefail
   cat > /etc/unbound/unbound.conf <<'UNBOUND_CONF'
@@ -556,7 +556,7 @@ UNBOUND_CONF
 # Replace domain placeholder
 pct exec "$CT_ID" -- sed -i "s/__DOMAIN__/${UB_DOMAIN}/g" /etc/unbound/unbound.conf
 
-# ── Create drop-in: vlans.conf ───────────────────────────────────────────────
+# ── Create drop-in: vlans.conf ────────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc '
   set -euo pipefail
   mkdir -p /etc/unbound/unbound.conf.d
@@ -590,7 +590,7 @@ server:
 VLANS
 '
 
-# ── Create drop-in: 30-static-hosts.conf ────────────────────────────────────
+# ── Create drop-in: 30-static-hosts.conf ──────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc "
   set -euo pipefail
   cat > /etc/unbound/unbound.conf.d/30-static-hosts.conf <<HOSTS
@@ -620,14 +620,14 @@ server:
 HOSTS
 "
 
-# ── Validate config ─────────────────────────────────────────────────────────
+# ── Validate config ───────────────────────────────────────────────────────────
 if pct exec "$CT_ID" -- unbound-checkconf /etc/unbound/unbound.conf >/dev/null 2>&1; then
   echo "  Configuration validation passed"
 else
   echo "  WARNING: Configuration validation had warnings (may still work)"
 fi
 
-# ── Cron: quarterly root hints update (atomic) ─────────────────────────────
+# ── Cron: quarterly root hints update (atomic) ────────────────────────────────
 pct exec "$CT_ID" -- bash -lc '
   set -euo pipefail
   ( crontab -l 2>/dev/null || true
@@ -637,7 +637,7 @@ pct exec "$CT_ID" -- bash -lc '
   ) | crontab -
 '
 
-# ── Start service ────────────────────────────────────────────────────────────
+# ── Start service ─────────────────────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc '
   set -euo pipefail
   systemctl enable unbound
@@ -645,7 +645,7 @@ pct exec "$CT_ID" -- bash -lc '
 '
 sleep 2
 
-# ── Persist DNS settings via Proxmox (CT will use itself on boot) ────────────
+# ── Persist DNS settings via Proxmox (CT will use itself on boot) ─────────────
 pct set "$CT_ID" --nameserver 127.0.0.1 --searchdomain "$UB_DOMAIN"
 
 # Apply immediately (pct set only takes effect on next boot)
@@ -658,7 +658,7 @@ search ${UB_DOMAIN}
 EOF
 "
 
-# ── Prevent DHCP from overriding DNS settings ───────────────────────────────
+# ── Prevent DHCP from overriding DNS settings ─────────────────────────────────
 pct exec "$CT_ID" -- bash -lc "
   set -euo pipefail
   mkdir -p /etc/dhcp
@@ -688,7 +688,7 @@ else
   pct exec "$CT_ID" -- journalctl -u unbound --no-pager -n 20 >&2 || true
 fi
 
-# ── Unattended upgrades (do NOT overwrite Debian defaults) ──────────────────
+# ── Unattended upgrades (do NOT overwrite Debian defaults) ────────────────────
 pct exec "$CT_ID" -- bash -lc '
   set -euo pipefail
   export DEBIAN_FRONTEND=noninteractive
@@ -723,7 +723,7 @@ EOF
   systemctl enable --now unattended-upgrades
 '
 
-# ── Sysctl hardening ────────────────────────────────────────────────────────
+# ── Sysctl hardening ──────────────────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc '
   set -euo pipefail
   cat > /etc/sysctl.d/99-hardening.conf <<EOF
@@ -741,7 +741,7 @@ EOF
   sysctl --system >/dev/null 2>&1 || true
 '
 
-# ── Cleanup packages ─────────────────────────────────────────────────────────
+# ── Cleanup packages ──────────────────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc '
   set -euo pipefail
   export DEBIAN_FRONTEND=noninteractive
@@ -800,22 +800,22 @@ pct exec "$CT_ID" -- bash -lc '
   grep -q "^export TERM=" /root/.bashrc 2>/dev/null || echo "export TERM=xterm-256color" >> /root/.bashrc
 '
 
-# ── Proxmox UI description ──────────────────────────────────────────────────
+# ── Proxmox UI description ────────────────────────────────────────────────────
 UB_DESC="Unbound DNS (${CT_IP})
 <details><summary>Details</summary>Unbound DNS Resolver (DNS-over-TLS) on Debian ${DEBIAN_VERSION} LXC
 Domain: ${UB_DOMAIN}
-Created by unbound-lxc.sh</details>"
+Created by unbound.sh</details>"
 pct set "$CT_ID" --description "$UB_DESC"
 
-# ── Protect container ────────────────────────────────────────────────────────
+# ── Protect container ─────────────────────────────────────────────────────────
 pct set "$CT_ID" --protection 1
 
-# ── Summary ──────────────────────────────────────────────────────────────────
+# ── Summary ───────────────────────────────────────────────────────────────────
 echo ""
 echo "CT: $CT_ID | IP: ${CT_IP} | DNS: ${CT_IP}:53 | Domain: ${UB_DOMAIN} | Login: $([ -n "$PASSWORD" ] && echo 'password set' || echo 'auto-login')"
 echo ""
 
-# ── Reboot CT so all DNS settings take effect cleanly ────────────────────────
+# ── Reboot CT so all DNS settings take effect cleanly ─────────────────────────
 echo "  Rebooting container..."
 pct reboot "$CT_ID"
 echo "  Done."

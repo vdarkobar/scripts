@@ -62,7 +62,7 @@ trap 'rc=$?;
   exit "$rc"
 ' INT TERM
 
-# ── Preflight (root) ─────────────────────────────────────────────────────────
+# ── Preflight — root & commands ───────────────────────────────────────────────
 [[ "$(id -u)" -eq 0 ]] || { echo "  ERROR: Run as root on the Proxmox host." >&2; exit 1; }
 
 for cmd in pvesh pveam pct pvesm; do
@@ -71,14 +71,14 @@ done
 
 [[ -n "$CT_ID" ]] || { echo "  ERROR: Could not obtain next CT ID." >&2; exit 1; }
 
-# ── Discover available resources ─────────────────────────────────────────────
+# ── Discover available resources ──────────────────────────────────────────────
 AVAIL_BRIDGES="$(ip -o link show type bridge 2>/dev/null | awk -F': ' '{print $2}' | sort | paste -sd', ' || echo "n/a")"
 AVAIL_TMPL_STORES="$(pvesh get /storage --output-format json 2>/dev/null \
   | python3 -c "import sys,json; print(', '.join(sorted(s['storage'] for s in json.load(sys.stdin) if 'vztmpl' in s.get('content',''))))" 2>/dev/null || echo "n/a")"
 AVAIL_CT_STORES="$(pvesh get /storage --output-format json 2>/dev/null \
   | python3 -c "import sys,json; print(', '.join(sorted(s['storage'] for s in json.load(sys.stdin) if 'rootdir' in s.get('content',''))))" 2>/dev/null || echo "n/a")"
 
-# ── Show defaults & confirm ──────────────────────────────────────────────────
+# ── Show defaults & confirm ───────────────────────────────────────────────────
 cat <<EOF
 
   Docmost-Podman LXC Creator — Configuration
@@ -127,7 +127,7 @@ case "$response" in
     ;;
 esac
 
-# ── Preflight (environment) ──────────────────────────────────────────────────
+# ── Preflight — environment ───────────────────────────────────────────────────
 pvesm status | awk -v s="$TEMPLATE_STORAGE" '$1==s{f=1} END{exit(!f)}' \
   || { echo "  ERROR: Template storage not found: $TEMPLATE_STORAGE" >&2; exit 1; }
 
@@ -136,7 +136,7 @@ pvesm status | awk -v s="$CONTAINER_STORAGE" '$1==s{f=1} END{exit(!f)}' \
 
 ip link show "$BRIDGE" >/dev/null 2>&1 || { echo "  ERROR: Bridge not found: $BRIDGE" >&2; exit 1; }
 
-# ── Root password ────────────────────────────────────────────────────────────
+# ── Root password ─────────────────────────────────────────────────────────────
 PASSWORD=""
 while true; do
   read -r -s -p "  Set root password (blank = auto-login): " PW1; echo
@@ -154,7 +154,7 @@ if [[ -z "$PASSWORD" ]]; then
   echo ""
 fi
 
-# ── Template discovery & download ────────────────────────────────────────────
+# ── Template discovery & download ─────────────────────────────────────────────
 pveam update
 echo ""
 [[ "$DEBIAN_VERSION" =~ ^[0-9]+$ ]] || { echo "  ERROR: DEBIAN_VERSION must be numeric." >&2; exit 1; }
@@ -191,7 +191,7 @@ PCT_OPTIONS=(
 pct create "$CT_ID" "${TEMPLATE_STORAGE}:vztmpl/${TEMPLATE}" "${PCT_OPTIONS[@]}"
 CREATED=1
 
-# ── Start & wait for IPv4 ────────────────────────────────────────────────────
+# ── Start & wait for IPv4 ─────────────────────────────────────────────────────
 pct start "$CT_ID"
 
 CT_IP=""
@@ -206,7 +206,7 @@ for i in $(seq 1 30); do
 done
 [[ -n "$CT_IP" ]] || { echo "  ERROR: No IPv4 address acquired via DHCP within timeout." >&2; exit 1; }
 
-# ── Auto-login (if no password) ──────────────────────────────────────────────
+# ── Auto-login (if no password) ───────────────────────────────────────────────
 if [[ -z "$PASSWORD" ]]; then
   pct exec "$CT_ID" -- bash -lc '
     set -euo pipefail
@@ -234,7 +234,7 @@ pct exec "$CT_ID" -- bash -lc '
   apt-get -y clean
 '
 
-# ── Configure locale ─────────────────────────────────────────────────────────
+# ── Configure locale ──────────────────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc '
   set -euo pipefail
   export DEBIAN_FRONTEND=noninteractive
@@ -244,7 +244,7 @@ pct exec "$CT_ID" -- bash -lc '
   update-locale LANG=en_US.UTF-8
 '
 
-# ── Remove unnecessary services ──────────────────────────────────────────────
+# ── Remove unnecessary services ───────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc '
   set -euo pipefail
   export DEBIAN_FRONTEND=noninteractive
@@ -254,7 +254,7 @@ pct exec "$CT_ID" -- bash -lc '
   apt-get -y autoremove
 '
 
-# ── Set timezone ─────────────────────────────────────────────────────────────
+# ── Set timezone ──────────────────────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc "
   set -euo pipefail
   ln -sf /usr/share/zoneinfo/${APP_TZ} /etc/localtime
@@ -269,7 +269,7 @@ pct exec "$CT_ID" -- bash -lc '
   apt-get install -y podman podman-compose fuse-overlayfs curl ca-certificates iproute2 python3
 '
 
-# ── Configure storage driver ─────────────────────────────────────────────────
+# ── Configure storage driver ──────────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc '
   set -euo pipefail
   mkdir -p /etc/containers
@@ -285,7 +285,7 @@ EOF
   podman system reset --force 2>/dev/null || true
 '
 
-# ── Configure extended registries ────────────────────────────────────────────
+# ── Configure extended registries ─────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc '
   set -euo pipefail
   mkdir -p /etc/containers
@@ -302,7 +302,7 @@ short-name-mode = "enforcing"
 EOF
 '
 
-# ── Podman log rotation ──────────────────────────────────────────────────────
+# ── Podman log rotation ───────────────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc '
   set -euo pipefail
   mkdir -p /etc/containers
@@ -317,12 +317,12 @@ pct exec "$CT_ID" -- podman info >/dev/null 2>&1
 pct exec "$CT_ID" -- podman --version
 pct exec "$CT_ID" -- podman-compose --version
 
-# ── Secrets ──────────────────────────────────────────────────────────────────
+# ── Secrets ───────────────────────────────────────────────────────────────────
 DB_PASSWORD="$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 63 || true)"
 APP_SECRET="$(tr -dc 'a-f0-9' </dev/urandom | head -c 64 || true)"
 [[ ${#DB_PASSWORD} -eq 63 && ${#APP_SECRET} -eq 64 ]] || { echo "  ERROR: Failed to generate secrets." >&2; exit 1; }
 
-# ── Prepare persistent volumes (absolute paths) ─────────────────────────────
+# ── Prepare persistent volumes (absolute paths) ───────────────────────────────
 # Verified UIDs: postgres:18(debian)=999, redis:8(debian)=999, docmost=node(1000) (2025-02)
 echo "  Preparing persistent volumes with correct UIDs..."
 pct exec "$CT_ID" -- bash -lc '
@@ -339,7 +339,7 @@ pct exec "$CT_ID" -- bash -lc '
   echo "  ✅ Volumes pre-created (postgres=999, redis=999, docmost=1000)"
 '
 
-# ── Compose file ─────────────────────────────────────────────────────────────
+# ── Compose file ──────────────────────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc 'cat > /opt/docmost/docker-compose.yml <<YAML
 networks:
   docmost:
@@ -420,7 +420,7 @@ pct exec "$CT_ID" -- sed -i \
 
 pct exec "$CT_ID" -- chmod 600 /opt/docmost/docker-compose.yml
 
-# ── .env (reference only) ────────────────────────────────────────────────────
+# ── .env (reference only) ─────────────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc "
   set -euo pipefail
   cat > /opt/docmost/.env <<EOF
@@ -434,7 +434,7 @@ EOF
   chmod 600 /opt/docmost/.env
 "
 
-# ── Auto-update timer ────────────────────────────────────────────────────────
+# ── Auto-update timer ─────────────────────────────────────────────────────────
 # Docmost official upgrade: pull latest image, then force-recreate only docmost
 pct exec "$CT_ID" -- bash -lc '
   set -euo pipefail
@@ -468,10 +468,10 @@ EOF
   systemctl enable --now docmost-update.timer
 '
 
-# ── Pull container images ────────────────────────────────────────────────────
+# ── Pull container images ─────────────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc 'cd /opt/docmost && podman-compose pull'
 
-# ── Auto-start on LXC boot (and start now) ───────────────────────────────────
+# ── Auto-start on LXC boot (and start now) ────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc '
   set -euo pipefail
   cat > /etc/systemd/system/docmost-stack.service <<EOF
@@ -522,7 +522,7 @@ else
   pct exec "$CT_ID" -- bash -lc 'cd /opt/docmost && podman-compose logs --tail=80' >&2 || true
 fi
 
-# ── Unattended upgrades (do NOT overwrite Debian defaults) ───────────────────
+# ── Unattended upgrades (do NOT overwrite Debian defaults) ────────────────────
 pct exec "$CT_ID" -- bash -lc '
   set -euo pipefail
   export DEBIAN_FRONTEND=noninteractive
@@ -557,7 +557,7 @@ EOF
   systemctl enable --now unattended-upgrades
 '
 
-# ── Sysctl hardening ─────────────────────────────────────────────────────────
+# ── Sysctl hardening ──────────────────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc '
   set -euo pipefail
   cat > /etc/sysctl.d/99-hardening.conf <<EOF
@@ -578,7 +578,7 @@ EOF
   sysctl --system >/dev/null 2>&1 || true
 '
 
-# ── Cleanup packages ─────────────────────────────────────────────────────────
+# ── Cleanup packages ──────────────────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc '
   set -euo pipefail
   export DEBIAN_FRONTEND=noninteractive
@@ -587,7 +587,7 @@ pct exec "$CT_ID" -- bash -lc '
   apt-get -y clean
 '
 
-# ── MOTD (dynamic drop-ins) ──────────────────────────────────────────────────
+# ── MOTD (dynamic drop-ins) ───────────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc "
   set -euo pipefail
   > /etc/motd
@@ -634,16 +634,16 @@ pct exec "$CT_ID" -- bash -lc '
   grep -q "^export TERM=" /root/.bashrc 2>/dev/null || echo "export TERM=xterm-256color" >> /root/.bashrc
 '
 
-# ── Proxmox UI description ───────────────────────────────────────────────────
+# ── Proxmox UI description ────────────────────────────────────────────────────
 DOCMOST_DESC="<a href='http://${CT_IP}:${APP_PORT}/' target='_blank' rel='noopener noreferrer' style='text-decoration: none; color: #00617f;'>Docmost Web UI</a>
 <details><summary>Details</summary>Docmost (Podman) on Debian ${DEBIAN_VERSION} LXC
-Created by docmost-lxc-podman.sh</details>"
+Created by docmost-podman.sh</details>"
 pct set "$CT_ID" --description "$DOCMOST_DESC"
 
-# ── Protect container ────────────────────────────────────────────────────────
+# ── Protect container ─────────────────────────────────────────────────────────
 pct set "$CT_ID" --protection 1
 
-# ── Summary ──────────────────────────────────────────────────────────────────
+# ── Summary ───────────────────────────────────────────────────────────────────
 cat <<EOF
 
   CT: $CT_ID | IP: ${CT_IP} | Web UI: http://${CT_IP}:${APP_PORT} | Login: $([ -n "$PASSWORD" ] && echo 'password set' || echo 'auto-login')
@@ -665,7 +665,7 @@ cat <<EOF
 
 EOF
 
-# ── Reboot CT so all settings take effect cleanly ────────────────────────────
+# ── Reboot CT so all settings take effect cleanly ─────────────────────────────
 echo "  Rebooting container..."
 pct reboot "$CT_ID"
 

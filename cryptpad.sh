@@ -73,7 +73,7 @@ done
 
 [[ -n "$CT_ID" ]] || { echo "  ERROR: Could not obtain next CT ID." >&2; exit 1; }
 
-# ── Show defaults & confirm ──────────────────────────────────────────────────
+# ── Show defaults & confirm ───────────────────────────────────────────────────
 AVAIL_TMPL_STORES="$(pvesh get /storage --output-format json 2>/dev/null \
   | python3 -c "import sys,json; print(', '.join(sorted(s['storage'] for s in json.load(sys.stdin) if 'vztmpl' in s.get('content',''))))" 2>/dev/null || echo "n/a")"
 AVAIL_CT_STORES="$(pvesh get /storage --output-format json 2>/dev/null \
@@ -127,7 +127,7 @@ case "$response" in
     ;;
 esac
 
-# ── Preflight — environment ──────────────────────────────────────────────────
+# ── Preflight — environment ───────────────────────────────────────────────────
 pvesm status | awk -v s="$TEMPLATE_STORAGE" '$1==s{f=1} END{exit(!f)}' \
   || { echo "  ERROR: Template storage not found: $TEMPLATE_STORAGE" >&2; exit 1; }
 pvesm status | awk -v s="$CONTAINER_STORAGE" '$1==s{f=1} END{exit(!f)}' \
@@ -135,7 +135,7 @@ pvesm status | awk -v s="$CONTAINER_STORAGE" '$1==s{f=1} END{exit(!f)}' \
 ip link show "$BRIDGE" >/dev/null 2>&1 \
   || { echo "  ERROR: Bridge not found: $BRIDGE" >&2; exit 1; }
 
-# ── Root password ────────────────────────────────────────────────────────────
+# ── Root password ─────────────────────────────────────────────────────────────
 PASSWORD=""
 while true; do
   read -r -s -p "  Set root password (blank = auto-login): " PW1; echo
@@ -152,7 +152,7 @@ if [[ -z "$PASSWORD" ]]; then
   echo ""
 fi
 
-# ── Template discovery & download ────────────────────────────────────────────
+# ── Template discovery & download ─────────────────────────────────────────────
 pveam update
 echo ""
 [[ "$DEBIAN_VERSION" =~ ^[0-9]+$ ]] || { echo "  ERROR: DEBIAN_VERSION must be numeric." >&2; exit 1; }
@@ -171,7 +171,7 @@ else
   pveam download "$TEMPLATE_STORAGE" "$TEMPLATE"
 fi
 
-# ── Create LXC ───────────────────────────────────────────────────────────────
+# ── Create LXC ────────────────────────────────────────────────────────────────
 PCT_OPTIONS=(
   -hostname "$HN"
   -cores "$CPU"
@@ -189,7 +189,7 @@ PCT_OPTIONS=(
 pct create "$CT_ID" "${TEMPLATE_STORAGE}:vztmpl/${TEMPLATE}" "${PCT_OPTIONS[@]}"
 CREATED=1
 
-# ── Start & wait for IPv4 ───────────────────────────────────────────────────
+# ── Start & wait for IPv4 ─────────────────────────────────────────────────────
 pct start "$CT_ID"
 CT_IP=""
 for i in $(seq 1 30); do
@@ -202,7 +202,7 @@ done
 [[ -n "$CT_IP" ]] || { echo "  ERROR: No IPv4 address acquired via DHCP within timeout." >&2; exit 1; }
 echo "  CT $CT_ID is up — IP: $CT_IP"
 
-# ── Auto-login (if no password) ──────────────────────────────────────────────
+# ── Auto-login (if no password) ───────────────────────────────────────────────
 if [[ -z "$PASSWORD" ]]; then
   pct exec "$CT_ID" -- bash -lc '
     set -euo pipefail
@@ -217,7 +217,7 @@ EOF
   '
 fi
 
-# ── OS update ────────────────────────────────────────────────────────────────
+# ── OS update ─────────────────────────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc '
   set -euo pipefail
   export DEBIAN_FRONTEND=noninteractive
@@ -230,7 +230,7 @@ pct exec "$CT_ID" -- bash -lc '
   apt-get -y clean
 '
 
-# ── Configure locale ─────────────────────────────────────────────────────────
+# ── Configure locale ──────────────────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc '
   set -euo pipefail
   export DEBIAN_FRONTEND=noninteractive
@@ -240,7 +240,7 @@ pct exec "$CT_ID" -- bash -lc '
   update-locale LANG=en_US.UTF-8
 '
 
-# ── Remove unnecessary services ─────────────────────────────────────────────
+# ── Remove unnecessary services ───────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc '
   set -euo pipefail
   export DEBIAN_FRONTEND=noninteractive
@@ -250,14 +250,14 @@ pct exec "$CT_ID" -- bash -lc '
   apt-get -y autoremove
 '
 
-# ── Set timezone ─────────────────────────────────────────────────────────────
+# ── Set timezone ──────────────────────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc "
   set -euo pipefail
   ln -sf /usr/share/zoneinfo/${APP_TZ} /etc/localtime
   echo '${APP_TZ}' > /etc/timezone
 "
 
-# ── Application install (Node.js + dependencies) ────────────────────────────
+# ── Application install (Node.js + dependencies) ──────────────────────────────
 pct exec "$CT_ID" -- bash -lc "
   set -euo pipefail
   export DEBIAN_FRONTEND=noninteractive
@@ -280,7 +280,7 @@ pct exec "$CT_ID" -- bash -lc "
 NODE_VER="$(pct exec "$CT_ID" -- node --version 2>/dev/null || echo "unknown")"
 echo "  Node.js installed: $NODE_VER"
 
-# ── Deploy CryptPad ─────────────────────────────────────────────────────────
+# ── Deploy CryptPad ───────────────────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc '
   set -euo pipefail
   install -d -m 0755 /opt/cryptpad
@@ -290,7 +290,7 @@ pct exec "$CT_ID" -- bash -lc '
 '
 echo "  CryptPad source deployed to /opt/cryptpad"
 
-# ── Build CryptPad ──────────────────────────────────────────────────────────
+# ── Build CryptPad ────────────────────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc '
   set -euo pipefail
   cd /opt/cryptpad
@@ -309,7 +309,7 @@ if [[ "$INSTALL_ONLYOFFICE" -eq 1 ]]; then
   echo "  OnlyOffice components installed"
 fi
 
-# ── Application configuration ───────────────────────────────────────────────
+# ── Application configuration ─────────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc "
   set -euo pipefail
   cd /opt/cryptpad
@@ -331,7 +331,7 @@ pct exec "$CT_ID" -- bash -lc "
 "
 echo "  CryptPad configured and built"
 
-# ── Systemd service ─────────────────────────────────────────────────────────
+# ── Systemd service ───────────────────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc '
   set -euo pipefail
   cat > /etc/systemd/system/cryptpad.service <<EOF
@@ -360,7 +360,7 @@ EOF
   systemctl enable --now cryptpad
 '
 
-# ── Verification ─────────────────────────────────────────────────────────────
+# ── Verification ──────────────────────────────────────────────────────────────
 sleep 3
 if pct exec "$CT_ID" -- systemctl is-active --quiet cryptpad 2>/dev/null; then
   echo "  CryptPad service is running"
@@ -385,7 +385,7 @@ else
   echo "  Check: pct exec $CT_ID -- journalctl -u cryptpad --no-pager -n 40" >&2
 fi
 
-# ── Deploy maintenance script ───────────────────────────────────────────────
+# ── Deploy maintenance script ─────────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc 'cat > /usr/local/bin/cryptpad-maint.sh <<'\''MAINT'\''
 #!/usr/bin/env bash
 set -Eeo pipefail
@@ -562,7 +562,7 @@ chmod +x /usr/local/bin/cryptpad-maint.sh'
 
 echo "  Maintenance script deployed: /usr/local/bin/cryptpad-maint.sh"
 
-# ── Auto-update timer ───────────────────────────────────────────────────────
+# ── Auto-update timer ─────────────────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc '
   set -euo pipefail
 
@@ -598,7 +598,7 @@ EOF
 '
 echo "  Auto-update timer enabled (1st + 15th of each month)"
 
-# ── Unattended upgrades ─────────────────────────────────────────────────────
+# ── Unattended upgrades ───────────────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc '
   set -euo pipefail
   export DEBIAN_FRONTEND=noninteractive
@@ -628,7 +628,7 @@ EOF
   systemctl enable --now unattended-upgrades
 '
 
-# ── Sysctl hardening ────────────────────────────────────────────────────────
+# ── Sysctl hardening ──────────────────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc '
   set -euo pipefail
   cat > /etc/sysctl.d/99-hardening.conf <<EOF
@@ -646,7 +646,7 @@ EOF
   sysctl --system >/dev/null 2>&1 || true
 '
 
-# ── Cleanup packages ─────────────────────────────────────────────────────────
+# ── Cleanup packages ──────────────────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc '
   set -euo pipefail
   export DEBIAN_FRONTEND=noninteractive
@@ -655,7 +655,7 @@ pct exec "$CT_ID" -- bash -lc '
   apt-get -y clean
 '
 
-# ── MOTD (dynamic drop-ins) ─────────────────────────────────────────────────
+# ── MOTD (dynamic drop-ins) ───────────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc "
   set -euo pipefail
   > /etc/motd
@@ -718,7 +718,7 @@ pct exec "$CT_ID" -- bash -lc '
   grep -q "^export TERM=" /root/.bashrc 2>/dev/null || echo "export TERM=xterm-256color" >> /root/.bashrc
 '
 
-# ── Proxmox UI description ──────────────────────────────────────────────────
+# ── Proxmox UI description ────────────────────────────────────────────────────
 OO_NOTE=""
 [[ "$INSTALL_ONLYOFFICE" -eq 1 ]] && OO_NOTE=" + OnlyOffice"
 DESC="<a href='http://${CT_IP}:${APP_PORT}/' target='_blank' rel='noopener noreferrer' style='text-decoration: none; color: #00617f;'>CryptPad Web UI</a>
@@ -730,10 +730,10 @@ Maintenance: cryptpad-maint.sh
 Created by cryptpad.sh</details>"
 pct set "$CT_ID" --description "$DESC"
 
-# ── Protect container ────────────────────────────────────────────────────────
+# ── Protect container ─────────────────────────────────────────────────────────
 pct set "$CT_ID" --protection 1
 
-# ── Summary ──────────────────────────────────────────────────────────────────
+# ── Summary ───────────────────────────────────────────────────────────────────
 echo ""
 echo "  CT: $CT_ID | IP: ${CT_IP} | Web UI: http://${CT_IP}:${APP_PORT}/ | Login: $([ -n "$PASSWORD" ] && echo 'password set' || echo 'auto-login')"
 echo "  Admin setup: pct exec $CT_ID -- systemctl status cryptpad  (look for the token URL to create admin account)"
@@ -741,7 +741,7 @@ echo "  Config: /opt/cryptpad/config/config.js"
 echo "  Maintenance: pct exec $CT_ID -- cryptpad-maint.sh {update|backup|restore|list-backups|restore-latest}"
 echo ""
 
-# ── Reboot ───────────────────────────────────────────────────────────────────
+# ── Reboot ────────────────────────────────────────────────────────────────────
 pct stop "$CT_ID"
 sleep 2
 pct start "$CT_ID"

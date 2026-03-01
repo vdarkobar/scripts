@@ -132,7 +132,7 @@ pvesm status | awk -v s="$CONTAINER_STORAGE" '$1==s{f=1} END{exit(!f)}' \
 ip link show "$BRIDGE" >/dev/null 2>&1 \
   || { echo "  ERROR: Bridge not found: $BRIDGE" >&2; exit 1; }
 
-# ── Root password ────────────────────────────────────────────────────────────
+# ── Root password ─────────────────────────────────────────────────────────────
 PASSWORD=""
 while true; do
   read -r -s -p "  Set root password (blank = auto-login): " PW1; echo
@@ -149,7 +149,7 @@ if [[ -z "$PASSWORD" ]]; then
   echo ""
 fi
 
-# ── Template discovery & download ────────────────────────────────────────────
+# ── Template discovery & download ─────────────────────────────────────────────
 pveam update
 echo ""
 [[ "$DEBIAN_VERSION" =~ ^[0-9]+$ ]] || { echo "  ERROR: DEBIAN_VERSION must be numeric." >&2; exit 1; }
@@ -186,7 +186,7 @@ PCT_OPTIONS=(
 pct create "$CT_ID" "${TEMPLATE_STORAGE}:vztmpl/${TEMPLATE}" "${PCT_OPTIONS[@]}"
 CREATED=1
 
-# ── Start & wait for IPv4 ────────────────────────────────────────────────────
+# ── Start & wait for IPv4 ─────────────────────────────────────────────────────
 pct start "$CT_ID"
 CT_IP=""
 for i in $(seq 1 30); do
@@ -199,7 +199,7 @@ done
 [[ -n "$CT_IP" ]] || { echo "  ERROR: No IPv4 address acquired via DHCP within timeout." >&2; exit 1; }
 echo "  CT $CT_ID is up — IP: $CT_IP"
 
-# ── Auto-login (if no password) ──────────────────────────────────────────────
+# ── Auto-login (if no password) ───────────────────────────────────────────────
 if [[ -z "$PASSWORD" ]]; then
   pct exec "$CT_ID" -- bash -lc '
     set -euo pipefail
@@ -227,7 +227,7 @@ pct exec "$CT_ID" -- bash -lc '
   apt-get -y clean
 '
 
-# ── Configure locale ─────────────────────────────────────────────────────────
+# ── Configure locale ──────────────────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc '
   set -euo pipefail
   export DEBIAN_FRONTEND=noninteractive
@@ -237,7 +237,7 @@ pct exec "$CT_ID" -- bash -lc '
   update-locale LANG=en_US.UTF-8
 '
 
-# ── Remove unnecessary services ──────────────────────────────────────────────
+# ── Remove unnecessary services ───────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc '
   set -euo pipefail
   export DEBIAN_FRONTEND=noninteractive
@@ -247,14 +247,14 @@ pct exec "$CT_ID" -- bash -lc '
   apt-get -y autoremove
 '
 
-# ── Set timezone ─────────────────────────────────────────────────────────────
+# ── Set timezone ──────────────────────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc "
   set -euo pipefail
   ln -sf /usr/share/zoneinfo/${APP_TZ} /etc/localtime
   echo '${APP_TZ}' > /etc/timezone
 "
 
-# ── Application install ──────────────────────────────────────────────────────
+# ── Application install ───────────────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc "
   set -euo pipefail
   export DEBIAN_FRONTEND=noninteractive
@@ -297,7 +297,7 @@ pct exec "$CT_ID" -- bash -lc "
   apt-get install -y postgresql-${PG_VERSION}
 "
 
-# ── Application configuration ────────────────────────────────────────────────
+# ── Application configuration ─────────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc "
   set -euo pipefail
 
@@ -347,7 +347,7 @@ pct exec "$CT_ID" -- bash -lc '
 '
 echo "  Docmost build verified"
 
-# ── Systemd service ──────────────────────────────────────────────────────────
+# ── Systemd service ───────────────────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc '
   set -euo pipefail
 
@@ -378,7 +378,7 @@ else
   echo "  WARNING: Docmost may not be running — check: pct exec $CT_ID -- journalctl -u docmost --no-pager -n 30" >&2
 fi
 
-# ── Deploy maintenance script ────────────────────────────────────────────────
+# ── Deploy maintenance script ─────────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc 'cat > /usr/local/bin/docmost-maint.sh <<'\''MAINT'\''
 #!/usr/bin/env bash
 set -Eeo pipefail
@@ -466,7 +466,7 @@ chmod +x /usr/local/bin/docmost-maint.sh'
 
 echo "  Maintenance script deployed: /usr/local/bin/docmost-maint.sh"
 
-# ── Auto-update timer ────────────────────────────────────────────────────────
+# ── Auto-update timer ─────────────────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc '
   set -euo pipefail
 
@@ -503,7 +503,7 @@ EOF
 '
 echo "  Auto-update timer enabled (1st + 15th of each month)"
 
-# ── Unattended upgrades ──────────────────────────────────────────────────────
+# ── Unattended upgrades ───────────────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc '
   set -euo pipefail
   export DEBIAN_FRONTEND=noninteractive
@@ -533,7 +533,7 @@ EOF
   systemctl enable --now unattended-upgrades
 '
 
-# ── Sysctl hardening ─────────────────────────────────────────────────────────
+# ── Sysctl hardening ──────────────────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc '
   set -euo pipefail
   cat > /etc/sysctl.d/99-hardening.conf <<EOF
@@ -551,7 +551,7 @@ EOF
   sysctl --system >/dev/null 2>&1 || true
 '
 
-# ── Cleanup packages ─────────────────────────────────────────────────────────
+# ── Cleanup packages ──────────────────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc '
   set -euo pipefail
   export DEBIAN_FRONTEND=noninteractive
@@ -560,7 +560,7 @@ pct exec "$CT_ID" -- bash -lc '
   apt-get -y clean
 '
 
-# ── MOTD (dynamic drop-ins) ──────────────────────────────────────────────────
+# ── MOTD (dynamic drop-ins) ───────────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc "
   set -euo pipefail
   > /etc/motd
@@ -619,7 +619,7 @@ pct exec "$CT_ID" -- bash -lc '
   grep -q "^export TERM=" /root/.bashrc 2>/dev/null || echo "export TERM=xterm-256color" >> /root/.bashrc
 '
 
-# ── Proxmox UI description ───────────────────────────────────────────────────
+# ── Proxmox UI description ────────────────────────────────────────────────────
 DESC="<a href='http://${CT_IP}:${APP_PORT}/' target='_blank' rel='noopener noreferrer' style='text-decoration: none; color: #00617f;'>Docmost Web UI</a>
 <details><summary>Details</summary>Docmost on Debian ${DEBIAN_VERSION} LXC
 Node.js ${NODE_VERSION} + PostgreSQL ${PG_VERSION} + Redis 8 (native)
@@ -627,7 +627,7 @@ Maintenance: docmost-maint.sh
 Created by docmost.sh</details>"
 pct set "$CT_ID" --description "$DESC"
 
-# ── Protect container ────────────────────────────────────────────────────────
+# ── Protect container ─────────────────────────────────────────────────────────
 pct set "$CT_ID" --protection 1
 
 # ── Summary ───────────────────────────────────────────────────────────────────

@@ -41,7 +41,7 @@ CLEANUP_ON_FAIL=1  # 1 = destroy CT on error, 0 = keep for debugging
 #   /etc/apt/apt.conf.d/52unattended-<hostname>.conf
 #   /etc/sysctl.d/99-hardening.conf
 
-# ── Validate config values (guard against sed injection) ─────────────────────
+# ── Validate config values (guard against sed injection) ──────────────────────
 fail=""
 [[ "$SMB_WORKGROUP"      =~ ^[A-Za-z0-9._-]+$ ]]     || fail="SMB_WORKGROUP"
 [[ "$SMB_SERVER_NAME"    =~ ^[A-Za-z0-9._-]+$ ]]     || fail="SMB_SERVER_NAME"
@@ -79,7 +79,7 @@ trap 'rc=$?;
   exit "$rc"
 ' INT TERM
 
-# ── Preflight ─────────────────────────────────────────────────────────────────
+# ── Preflight — root & commands ───────────────────────────────────────────────
 [[ "$(id -u)" -eq 0 ]] || { echo "  ERROR: Run as root on the Proxmox host." >&2; exit 1; }
 
 for cmd in pvesh pveam pct pvesm; do
@@ -88,14 +88,14 @@ done
 
 [[ -n "$CT_ID" ]] || { echo "  ERROR: Could not obtain next CT ID." >&2; exit 1; }
 
-# ── Discover available resources ─────────────────────────────────────────────
+# ── Discover available resources ──────────────────────────────────────────────
 AVAIL_BRIDGES="$(ip -o link show type bridge 2>/dev/null | awk -F': ' '{print $2}' | sort | paste -sd', ' || echo "n/a")"
 AVAIL_TMPL_STORES="$(pvesh get /storage --output-format json 2>/dev/null \
   | python3 -c "import sys,json; print(', '.join(sorted(s['storage'] for s in json.load(sys.stdin) if 'vztmpl' in s.get('content',''))))" 2>/dev/null || echo "n/a")"
 AVAIL_CT_STORES="$(pvesh get /storage --output-format json 2>/dev/null \
   | python3 -c "import sys,json; print(', '.join(sorted(s['storage'] for s in json.load(sys.stdin) if 'rootdir' in s.get('content',''))))" 2>/dev/null || echo "n/a")"
 
-# ── Show defaults & confirm ──────────────────────────────────────────────────
+# ── Show defaults & confirm ───────────────────────────────────────────────────
 cat <<EOF
 
   Samba File Server LXC Creator — Configuration
@@ -148,7 +148,7 @@ case "$response" in
     ;;
 esac
 
-# ── Validate storage & network ───────────────────────────────────────────────
+# ── Preflight — environment ───────────────────────────────────────────────────
 pvesm status | awk -v s="$TEMPLATE_STORAGE" '$1==s{f=1} END{exit(!f)}' \
   || { echo "  ERROR: Template storage not found: $TEMPLATE_STORAGE" >&2; exit 1; }
 
@@ -157,7 +157,7 @@ pvesm status | awk -v s="$CONTAINER_STORAGE" '$1==s{f=1} END{exit(!f)}' \
 
 ip link show "$BRIDGE" >/dev/null 2>&1 || { echo "  ERROR: Bridge not found: $BRIDGE" >&2; exit 1; }
 
-# ── Root password ────────────────────────────────────────────────────────────
+# ── Root password ─────────────────────────────────────────────────────────────
 PASSWORD=""
 while true; do
   read -r -s -p "  Set root password (blank = auto-login): " PW1; echo
@@ -175,7 +175,7 @@ if [[ -z "$PASSWORD" ]]; then
   echo ""
 fi
 
-# ── First Samba user ─────────────────────────────────────────────────────────
+# ── First Samba user ──────────────────────────────────────────────────────────
 SMB_USER=""
 SMB_USER_PASS=""
 while true; do
@@ -198,7 +198,7 @@ while true; do
 done
 echo ""
 
-# ── Template discovery & download ────────────────────────────────────────────
+# ── Template discovery & download ─────────────────────────────────────────────
 pveam update
 echo ""
 [[ "$DEBIAN_VERSION" =~ ^[0-9]+$ ]] || { echo "  ERROR: DEBIAN_VERSION must be numeric." >&2; exit 1; }
@@ -217,7 +217,7 @@ else
   pveam download "$TEMPLATE_STORAGE" "$TEMPLATE"
 fi
 
-# ── Create LXC ───────────────────────────────────────────────────────────────
+# ── Create LXC ────────────────────────────────────────────────────────────────
 PCT_OPTIONS=(
   -hostname "$HN"
   -cores "$CPU"
@@ -235,7 +235,7 @@ PCT_OPTIONS=(
 pct create "$CT_ID" "${TEMPLATE_STORAGE}:vztmpl/${TEMPLATE}" "${PCT_OPTIONS[@]}"
 CREATED=1
 
-# ── Start & wait for IPv4 ───────────────────────────────────────────────────
+# ── Start & wait for IPv4 ─────────────────────────────────────────────────────
 pct start "$CT_ID"
 
 CT_IP=""
@@ -250,7 +250,7 @@ for i in $(seq 1 30); do
 done
 [[ -n "$CT_IP" ]] || { echo "  ERROR: No IPv4 address acquired via DHCP within timeout." >&2; exit 1; }
 
-# ── Auto-login (if no password) ──────────────────────────────────────────────
+# ── Auto-login (if no password) ───────────────────────────────────────────────
 if [[ -z "$PASSWORD" ]]; then
   pct exec "$CT_ID" -- bash -lc '
     set -euo pipefail
@@ -265,7 +265,7 @@ EOF
   '
 fi
 
-# ── OS update ────────────────────────────────────────────────────────────────
+# ── OS update ─────────────────────────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc '
   set -euo pipefail
   export DEBIAN_FRONTEND=noninteractive
@@ -278,7 +278,7 @@ pct exec "$CT_ID" -- bash -lc '
   apt-get -y clean
 '
 
-# ── Configure locale ─────────────────────────────────────────────────────────
+# ── Configure locale ──────────────────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc '
   set -euo pipefail
   export DEBIAN_FRONTEND=noninteractive
@@ -288,7 +288,7 @@ pct exec "$CT_ID" -- bash -lc '
   update-locale LANG=en_US.UTF-8
 '
 
-# ── Remove unnecessary services ──────────────────────────────────────────────
+# ── Remove unnecessary services ───────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc '
   set -euo pipefail
   export DEBIAN_FRONTEND=noninteractive
@@ -298,14 +298,14 @@ pct exec "$CT_ID" -- bash -lc '
   apt-get -y autoremove
 '
 
-# ── Set timezone ─────────────────────────────────────────────────────────────
+# ── Set timezone ──────────────────────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc "
   set -euo pipefail
   ln -sf /usr/share/zoneinfo/${SMB_TZ} /etc/localtime
   echo '${SMB_TZ}' > /etc/timezone
 "
 
-# ── Install Samba ────────────────────────────────────────────────────────────
+# ── Install Samba ─────────────────────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc '
   set -euo pipefail
   export DEBIAN_FRONTEND=noninteractive
@@ -313,7 +313,7 @@ pct exec "$CT_ID" -- bash -lc '
   apt-get install -y samba samba-common-bin acl attr
 '
 
-# ── Create group and share directory ─────────────────────────────────────────
+# ── Create group and share directory ──────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc "
   set -euo pipefail
   
@@ -332,7 +332,7 @@ pct exec "$CT_ID" -- bash -lc "
   setfacl -d -m 'm:rwx' '${SMB_SHARE_PATH}' 2>/dev/null || true
 "
 
-# ── Write smb.conf ───────────────────────────────────────────────────────────
+# ── Write smb.conf ────────────────────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc "
   set -euo pipefail
   
@@ -419,7 +419,7 @@ pct exec "$CT_ID" -- bash -lc "
     /etc/samba/smb.conf
 "
 
-# ── Validate config ─────────────────────────────────────────────────────────
+# ── Validate config ───────────────────────────────────────────────────────────
 # Note: "Weak crypto is allowed by GnuTLS" is a cosmetic testparm message
 # reflecting system GnuTLS state, not a config problem. Safe to ignore —
 # smb.conf enforces SMB3 + mandatory encryption + ntlmv2-only.
@@ -429,7 +429,7 @@ else
   echo "  WARNING: Configuration validation had warnings (may still work)"
 fi
 
-# ── Start services ───────────────────────────────────────────────────────────
+# ── Start services ────────────────────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc '
   set -euo pipefail
   mkdir -p /var/log/samba
@@ -446,7 +446,7 @@ else
   pct exec "$CT_ID" -- journalctl -u smbd --no-pager -n 20 >&2 || true
 fi
 
-# ── Create first Samba user ──────────────────────────────────────────────────
+# ── Create first Samba user ───────────────────────────────────────────────────
 if [[ -n "$SMB_USER" ]]; then
   pct exec "$CT_ID" -- useradd -M -s /usr/sbin/nologin -G "$SMB_GROUP" "$SMB_USER"
   printf '%s\n%s\n' "$SMB_USER_PASS" "$SMB_USER_PASS" \
@@ -455,7 +455,7 @@ if [[ -n "$SMB_USER" ]]; then
   echo "  Samba user created: $SMB_USER"
 fi
 
-# ── Unattended upgrades ─────────────────────────────────────────────────────
+# ── Unattended upgrades ───────────────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc '
   set -euo pipefail
   export DEBIAN_FRONTEND=noninteractive
@@ -490,7 +490,7 @@ EOF
   systemctl enable --now unattended-upgrades
 '
 
-# ── Sysctl hardening ────────────────────────────────────────────────────────
+# ── Sysctl hardening ──────────────────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc '
   set -euo pipefail
   cat > /etc/sysctl.d/99-hardening.conf <<EOF
@@ -508,7 +508,7 @@ EOF
   sysctl --system >/dev/null 2>&1 || true
 '
 
-# ── Cleanup packages ─────────────────────────────────────────────────────────
+# ── Cleanup packages ──────────────────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc '
   set -euo pipefail
   export DEBIAN_FRONTEND=noninteractive
@@ -572,18 +572,18 @@ pct exec "$CT_ID" -- bash -lc '
   grep -q "^export TERM=" /root/.bashrc 2>/dev/null || echo "export TERM=xterm-256color" >> /root/.bashrc
 '
 
-# ── Proxmox UI description ──────────────────────────────────────────────────
+# ── Proxmox UI description ────────────────────────────────────────────────────
 SMB_DESC="Samba File Server (${CT_IP})
 <details><summary>Details</summary>Samba File Server (SMB3 encrypted) on Debian ${DEBIAN_VERSION} LXC
 Share: ${SMB_SHARE_NAME} → ${SMB_SHARE_PATH}
 Workgroup: ${SMB_WORKGROUP}
-Created by samba-lxc.sh</details>"
+Created by samba.sh</details>"
 pct set "$CT_ID" --description "$SMB_DESC"
 
-# ── Protect container ────────────────────────────────────────────────────────
+# ── Protect container ─────────────────────────────────────────────────────────
 pct set "$CT_ID" --protection 1
 
-# ── Summary ──────────────────────────────────────────────────────────────────
+# ── Summary ───────────────────────────────────────────────────────────────────
 echo ""
 echo "CT: $CT_ID | IP: ${CT_IP} | SMB: \\\\${CT_IP}\\${SMB_SHARE_NAME} | User: ${SMB_USER:-none} | Login: $([ -n "$PASSWORD" ] && echo 'password set' || echo 'auto-login')"
 echo ""
@@ -593,7 +593,7 @@ echo "    pct exec $CT_ID -- smbpasswd -a <username>"
 echo "    pct exec $CT_ID -- smbpasswd -e <username>"
 echo ""
 
-# ── Reboot CT so all settings take effect cleanly ────────────────────────────
+# ── Reboot CT so all settings take effect cleanly ─────────────────────────────
 echo "  Rebooting container..."
 pct reboot "$CT_ID"
 echo "  Done."
