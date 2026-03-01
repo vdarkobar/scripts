@@ -12,7 +12,7 @@ TEMPLATE_STORAGE="local"
 CONTAINER_STORAGE="local-lvm"
 
 # Samba
-SMB_TZ="Europe/Berlin"
+APP_TZ="Europe/Berlin"
 SMB_SHARE_NAME="Data"
 SMB_SHARE_PATH="/srv/samba/Data"
 SMB_GROUP="sambashare"
@@ -109,7 +109,7 @@ cat <<EOF
   Template Storage:  $TEMPLATE_STORAGE ($AVAIL_TMPL_STORES)
   Container Storage: $CONTAINER_STORAGE ($AVAIL_CT_STORES)
   Debian Version:    $DEBIAN_VERSION
-  Timezone:          $SMB_TZ
+  Timezone:          $APP_TZ
   Share Name:        $SMB_SHARE_NAME
   Share Path:        $SMB_SHARE_PATH
   Group:             $SMB_GROUP
@@ -301,8 +301,8 @@ pct exec "$CT_ID" -- bash -lc '
 # ── Set timezone ──────────────────────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc "
   set -euo pipefail
-  ln -sf /usr/share/zoneinfo/${SMB_TZ} /etc/localtime
-  echo '${SMB_TZ}' > /etc/timezone
+  ln -sf /usr/share/zoneinfo/${APP_TZ} /etc/localtime
+  echo '${APP_TZ}' > /etc/timezone
 "
 
 # ── Install Samba ─────────────────────────────────────────────────────────────
@@ -504,6 +504,9 @@ net.ipv4.conf.all.accept_source_route = 0
 net.ipv4.conf.default.accept_source_route = 0
 net.ipv4.icmp_echo_ignore_broadcasts = 1
 net.ipv4.icmp_ignore_bogus_error_responses = 1
+net.ipv6.conf.all.disable_ipv6 = 1
+net.ipv6.conf.default.disable_ipv6 = 1
+net.ipv6.conf.lo.disable_ipv6 = 1
 EOF
   sysctl --system >/dev/null 2>&1 || true
 '

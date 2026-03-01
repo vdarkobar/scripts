@@ -48,7 +48,7 @@ The families share the same skeleton but differ in:
 | Aspect | Native | Podman |
 |--------|--------|--------|
 | LXC features | `nesting=1` | `nesting=1,keyctl=1,fuse=1` |
-| Sysctl hardening | IPv4 only (10 lines) | IPv4 + IPv6 disable (13 lines) |
+| Sysctl hardening | IPv4 + IPv6 disable (identical) | IPv4 + IPv6 disable (identical) |
 | Reboot | Simple stop/start or `pct reboot` | `pct reboot` + stack container count verification |
 | Stack service | None (native systemd units) | `appname-stack.service` (oneshot, podman-compose up/down) |
 | Auto-update | App-specific timer (if any) | Timer pulls new images + restarts compose |
@@ -164,7 +164,7 @@ CLEANUP_ON_FAIL=1  # 1 = destroy CT on error, 0 = keep for debugging
 
 Rules: `CT_ID` auto-assigned. `DEBIAN_VERSION` numeric. `TAGS` semicolon-separated. Optional features use `0`/`1` flags. Post-install instructions as comments (samba pattern).
 
-**Timezone variable naming:** Each script uses an app-specific prefix (`DEB_TZ`, `APP_TZ`, `MATRIX_TZ`, `SMB_TZ`, `NPM_TZ`, `UB_TZ`). This is intentional — the prefix makes the Config section self-documenting. The timezone *block itself* is identical in logic across all scripts.
+**Timezone variable:** All scripts use `APP_TZ`. This makes the Set timezone block verbatim-identical across all scripts.
 
 ### 2. Custom Configs Manifest
 
@@ -701,7 +701,7 @@ Dynamic codename. Never auto-reboot. File named `52unattended-$(hostname).conf` 
 
 ### 30. Sysctl Hardening
 
-**Native family** (deblxc, cryptpad, docmost, privatebin, samba, unbound) — IPv4 only:
+Identical across all 9 scripts — IPv4 hardening + IPv6 disable (all containers use `ip6=manual` at creation, so IPv6 is unused):
 
 ```bash
 # ── Sysctl hardening ──────────────────────────────────────────────────────────
@@ -718,18 +718,12 @@ net.ipv4.conf.all.accept_source_route = 0
 net.ipv4.conf.default.accept_source_route = 0
 net.ipv4.icmp_echo_ignore_broadcasts = 1
 net.ipv4.icmp_ignore_bogus_error_responses = 1
-EOF
-  sysctl --system >/dev/null 2>&1 || true
-'
-```
-
-**Podman family** (npm-podman, matrix-podman, docmost-podman) — adds IPv6 disable:
-
-```bash
-# Same 10 IPv4 lines as above, plus:
 net.ipv6.conf.all.disable_ipv6 = 1
 net.ipv6.conf.default.disable_ipv6 = 1
 net.ipv6.conf.lo.disable_ipv6 = 1
+EOF
+  sysctl --system >/dev/null 2>&1 || true
+'
 ```
 
 ### 31. Cleanup Packages
@@ -965,7 +959,6 @@ The second form works but means actual data lives at `/opt/app/postgresdata/data
 - Requires `fuse-overlayfs` as storage driver (kernel overlay not available).
 - Requires LXC features: `nesting=1,keyctl=1,fuse=1`.
 - Nginx in unprivileged Podman can't bind ports <1024 — use high ports (e.g. 8080) and custom nginx configs.
-- IPv6 is disabled via sysctl in Podman scripts to avoid networking issues.
 
 ---
 
@@ -1075,7 +1068,7 @@ fi
 - [ ] Systemd services (stack + timer for Podman, native for apt)
 - [ ] Health checks: warnings not errors, log dump on failure
 - [ ] Unattended upgrades (52-conf with `$(hostname)`, dynamic codename, no auto-reboot)
-- [ ] Sysctl hardening (standard for native, +IPv6 disable for Podman)
+- [ ] Sysctl hardening (IPv4 + IPv6 disable, identical across all scripts)
 - [ ] Cleanup packages (man-db, manpages)
 - [ ] MOTD drop-ins (POSIX sh, printf, no indent, inline style, `\n` escaping, TERM in .bashrc)
 - [ ] Optional feature MOTD + tag updates

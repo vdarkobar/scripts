@@ -12,7 +12,7 @@ TEMPLATE_STORAGE="local"
 CONTAINER_STORAGE="local-lvm"
 
 # Unbound
-UB_TZ="Europe/Berlin"
+APP_TZ="Europe/Berlin"
 UB_DOMAIN=""                # auto-detect from CT resolv.conf, or set manually
 TAGS="unbound;dns;lxc"
 DEBIAN_VERSION=13
@@ -90,7 +90,7 @@ cat <<EOF
   Template Storage:  $TEMPLATE_STORAGE ($AVAIL_TMPL_STORES)
   Container Storage: $CONTAINER_STORAGE ($AVAIL_CT_STORES)
   Debian Version:    $DEBIAN_VERSION
-  Timezone:          $UB_TZ
+  Timezone:          $APP_TZ
   Domain:            ${UB_DOMAIN:-"(auto-detect)"}
   Tags:              $TAGS
   Cleanup on fail:   $CLEANUP_ON_FAIL
@@ -252,8 +252,8 @@ pct exec "$CT_ID" -- bash -lc '
 # ── Set timezone ──────────────────────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc "
   set -euo pipefail
-  ln -sf /usr/share/zoneinfo/${UB_TZ} /etc/localtime
-  echo '${UB_TZ}' > /etc/timezone
+  ln -sf /usr/share/zoneinfo/${APP_TZ} /etc/localtime
+  echo '${APP_TZ}' > /etc/timezone
 "
 
 # ── Detect domain name (inside CT) ────────────────────────────────────────────
@@ -737,6 +737,9 @@ net.ipv4.conf.all.accept_source_route = 0
 net.ipv4.conf.default.accept_source_route = 0
 net.ipv4.icmp_echo_ignore_broadcasts = 1
 net.ipv4.icmp_ignore_bogus_error_responses = 1
+net.ipv6.conf.all.disable_ipv6 = 1
+net.ipv6.conf.default.disable_ipv6 = 1
+net.ipv6.conf.lo.disable_ipv6 = 1
 EOF
   sysctl --system >/dev/null 2>&1 || true
 '
