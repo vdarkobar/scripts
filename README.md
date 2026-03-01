@@ -1,52 +1,54 @@
 ## Proxmox Scripts
 #### *container creation, configuration and app install*  
+
+<br/>
   
-Debian LXC
+#### *Debian LXC*
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/deblxc.sh)
 ```
   
-NPM on Podman, optional Cloudflared
+#### *NPM on Podman, optional Cloudflared*
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/npm-podman.sh)
 ```
   
-Unbound DNS
+#### *Unbound DNS*
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/unbound.sh)
 ```
   
-Samba File server
+#### *Samba File server*
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/samba.sh)
 ```
   
-Matrix, decentralised communication <a href="https://github.com/vdarkobar/scripts/blob/main/misc/matrix-how-to.md">*how-to*</a>
+#### *Matrix, decentralised communication <a href="https://github.com/vdarkobar/scripts/blob/main/misc/matrix-how-to.md">how-to</a>*
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/matrix-podman.sh)
 ```
   
-Docmost
+#### *Docmost*
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/docmost.sh)
 ```
   
-Docmost on Podman
+#### *Docmost on Podman*
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/docmost-podman.sh)
 ```
   
-Privatebin <a href="https://github.com/vdarkobar/scripts/blob/main/misc/matrix-how-to.md">*how-to*</a>
+#### *Privatebin*
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/privatebin.sh)
 ```
   
-Cryptpad <a href="https://github.com/vdarkobar/scripts/blob/main/misc/matrix-how-to.md">*how-to*</a>
+#### *Cryptpad*
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/cryptpad.sh)
 ```
   
-LXC updater
+#### *LXC updater*
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/updatelxc.sh)
 ```
