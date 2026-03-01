@@ -90,7 +90,6 @@ cat <<EOF
 
 EOF
 
-# New:
 SCRIPT_URL="https://raw.githubusercontent.com/vdarkobar/scripts/main/deblxc.sh"
 SCRIPT_LOCAL="/root/deblxc.sh"
 
