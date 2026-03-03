@@ -38,6 +38,11 @@ bash <(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/docmo
 bash <(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/docmost-podman.sh)
 ```
   
+#### *Immich on Podman*
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/immich-podman.sh)
+```
+  
 #### *Privatebin*
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/privatebin.sh)
