@@ -10,6 +10,7 @@ DISK=32  # rootfs only — mount host storage for /photos in production
 BRIDGE="vmbr0"
 TEMPLATE_STORAGE="local"
 CONTAINER_STORAGE="local-lvm"
+PHOTO_STORAGE="rootfs"    # rootfs | <zfs-pool-name> (e.g. rpool) | /host/path
 
 # Immich / Podman
 APP_PORT=2283
@@ -72,11 +73,12 @@ done
 [[ -n "$CT_ID" ]] || { echo "  ERROR: Could not obtain next CT ID." >&2; exit 1; }
 
 # ── Discover available resources ──────────────────────────────────────────────
-AVAIL_BRIDGES="$(ip -o link show type bridge 2>/dev/null | awk -F': ' '{print $2}' | sort | paste -sd', ' || echo "n/a")"
+AVAIL_BRIDGES="$(ip -o link show type bridge 2>/dev/null | awk -F': ' '{print $2}' | sort | paste -sd',' | sed 's/,/, /g' || echo "n/a")"
 AVAIL_TMPL_STORES="$(pvesh get /storage --output-format json 2>/dev/null \
   | python3 -c "import sys,json; print(', '.join(sorted(s['storage'] for s in json.load(sys.stdin) if 'vztmpl' in s.get('content',''))))" 2>/dev/null || echo "n/a")"
 AVAIL_CT_STORES="$(pvesh get /storage --output-format json 2>/dev/null \
   | python3 -c "import sys,json; print(', '.join(sorted(s['storage'] for s in json.load(sys.stdin) if 'rootdir' in s.get('content',''))))" 2>/dev/null || echo "n/a")"
+AVAIL_ZFS_POOLS="$(zpool list -H -o name 2>/dev/null | sort | paste -sd',' | sed 's/,/, /g' || echo "n/a")"
 
 # ── Show defaults & confirm ───────────────────────────────────────────────────
 cat <<EOF
@@ -99,6 +101,7 @@ cat <<EOF
   Postgres Image:     $POSTGRES_IMAGE
   Redis/Valkey Image: $REDIS_IMAGE
   Cleanup on fail:    $CLEANUP_ON_FAIL
+  Photo Storage:      $PHOTO_STORAGE  (available ZFS pools: $AVAIL_ZFS_POOLS)
   ────────────────────────────────────────
   To change defaults, press Enter and
   edit the Config section at the top of
@@ -192,6 +195,73 @@ pct create "$CT_ID" "${TEMPLATE_STORAGE}:vztmpl/${TEMPLATE}" "${PCT_OPTIONS[@]}"
 CREATED=1
 
 echo "lxc.apparmor.profile: unconfined" >> "/etc/pve/lxc/${CT_ID}.conf"
+
+# ── Photos storage — ZFS dataset + LXC mount point ───────────────────────────
+if [[ "$PHOTO_STORAGE" == "rootfs" ]]; then
+  echo "  WARNING: No photos storage configured — uploads will use rootfs (${DISK} GB)." >&2
+  pct mount "$CT_ID"
+  mkdir -p "/var/lib/lxc/${CT_ID}/rootfs/opt/immich"
+  chown 100000:100000 "/var/lib/lxc/${CT_ID}/rootfs/opt/immich"
+  mkdir -p \
+    "/var/lib/lxc/${CT_ID}/rootfs/opt/immich/postgresdata" \
+    "/var/lib/lxc/${CT_ID}/rootfs/opt/immich/redis" \
+    "/var/lib/lxc/${CT_ID}/rootfs/opt/immich/library" \
+    "/var/lib/lxc/${CT_ID}/rootfs/opt/immich/config"
+  chown 100070:100070 "/var/lib/lxc/${CT_ID}/rootfs/opt/immich/postgresdata"
+  chmod 700          "/var/lib/lxc/${CT_ID}/rootfs/opt/immich/postgresdata"
+  chown 100999:101000 "/var/lib/lxc/${CT_ID}/rootfs/opt/immich/redis"
+  chown 101000:101000 "/var/lib/lxc/${CT_ID}/rootfs/opt/immich/library"
+  chown 101000:101000 "/var/lib/lxc/${CT_ID}/rootfs/opt/immich/config"
+  pct unmount "$CT_ID"
+elif [[ "$PHOTO_STORAGE" == /* ]]; then
+  # Plain host path
+  mkdir -p "$PHOTO_STORAGE"
+  chown 101000:101000 "$PHOTO_STORAGE"
+  pct mount "$CT_ID"
+  mkdir -p "/var/lib/lxc/${CT_ID}/rootfs/opt/immich"
+  chown 100000:100000 "/var/lib/lxc/${CT_ID}/rootfs/opt/immich"
+  mkdir -p \
+    "/var/lib/lxc/${CT_ID}/rootfs/opt/immich/postgresdata" \
+    "/var/lib/lxc/${CT_ID}/rootfs/opt/immich/redis" \
+    "/var/lib/lxc/${CT_ID}/rootfs/opt/immich/library" \
+    "/var/lib/lxc/${CT_ID}/rootfs/opt/immich/config"
+  chown 100070:100070 "/var/lib/lxc/${CT_ID}/rootfs/opt/immich/postgresdata"
+  chmod 700          "/var/lib/lxc/${CT_ID}/rootfs/opt/immich/postgresdata"
+  chown 100999:101000 "/var/lib/lxc/${CT_ID}/rootfs/opt/immich/redis"
+  chown 101000:101000 "/var/lib/lxc/${CT_ID}/rootfs/opt/immich/library"
+  chown 101000:101000 "/var/lib/lxc/${CT_ID}/rootfs/opt/immich/config"
+  pct unmount "$CT_ID"
+  pct set "$CT_ID" --mp0 "${PHOTO_STORAGE},mp=/opt/immich/library"
+  echo "  Photos mount: ${PHOTO_STORAGE} -> /opt/immich/library (CT ${CT_ID})"
+else
+  # ZFS pool name
+  PHOTOS_DATASET="${PHOTO_STORAGE}/immich-photos"
+  PHOTOS_HOST_PATH="$(zfs get -H -o value mountpoint "${PHOTOS_DATASET}" 2>/dev/null || true)"
+  if [[ -z "$PHOTOS_HOST_PATH" || "$PHOTOS_HOST_PATH" == "-" ]]; then
+    echo "  Creating ZFS dataset: ${PHOTOS_DATASET}"
+    zfs create -o compression=lz4 "${PHOTOS_DATASET}"
+    PHOTOS_HOST_PATH="$(zfs get -H -o value mountpoint "${PHOTOS_DATASET}")"
+  else
+    echo "  ZFS dataset already exists: ${PHOTOS_DATASET} -> ${PHOTOS_HOST_PATH}"
+  fi
+  chown 101000:101000 "$PHOTOS_HOST_PATH"
+  pct mount "$CT_ID"
+  mkdir -p "/var/lib/lxc/${CT_ID}/rootfs/opt/immich"
+  chown 100000:100000 "/var/lib/lxc/${CT_ID}/rootfs/opt/immich"
+  mkdir -p \
+    "/var/lib/lxc/${CT_ID}/rootfs/opt/immich/postgresdata" \
+    "/var/lib/lxc/${CT_ID}/rootfs/opt/immich/redis" \
+    "/var/lib/lxc/${CT_ID}/rootfs/opt/immich/library" \
+    "/var/lib/lxc/${CT_ID}/rootfs/opt/immich/config"
+  chown 100070:100070 "/var/lib/lxc/${CT_ID}/rootfs/opt/immich/postgresdata"
+  chmod 700          "/var/lib/lxc/${CT_ID}/rootfs/opt/immich/postgresdata"
+  chown 100999:101000 "/var/lib/lxc/${CT_ID}/rootfs/opt/immich/redis"
+  chown 101000:101000 "/var/lib/lxc/${CT_ID}/rootfs/opt/immich/library"
+  chown 101000:101000 "/var/lib/lxc/${CT_ID}/rootfs/opt/immich/config"
+  pct unmount "$CT_ID"
+  pct set "$CT_ID" --mp0 "${PHOTOS_HOST_PATH},mp=/opt/immich/library"
+  echo "  Photos mount: ${PHOTOS_HOST_PATH} -> /opt/immich/library (CT ${CT_ID})"
+fi
 
 # ── Start & wait for IPv4 ─────────────────────────────────────────────────────
 pct start "$CT_ID"
@@ -324,20 +394,13 @@ DB_PASSWORD="$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 35 || true)"
 [[ ${#DB_PASSWORD} -eq 35 ]] || { echo "  ERROR: Failed to generate secrets." >&2; exit 1; }
 
 # ── Prepare persistent volumes (absolute paths) ───────────────────────────────
-# Verified UIDs: immich-app/postgres=70, valkey:8=999:1000, imagegenius/immich=1000:1000
-echo "  Preparing persistent volumes with correct UIDs..."
+# Dirs and UIDs pre-set on host during pct mount phase (offset +100000):
+#   postgres=100070, valkey=100999:101000, immich=101000:101000
+echo "  Verifying persistent volume ownership..."
 pct exec "$CT_ID" -- bash -lc '
   set -euo pipefail
-  mkdir -p /opt/immich/postgresdata /opt/immich/redis /opt/immich/library /opt/immich/config
-
-  chown -R 70:70 /opt/immich/postgresdata
-  chmod 700 /opt/immich/postgresdata
-
-  chown -R 999:1000 /opt/immich/redis
-
-  chown -R 1000:1000 /opt/immich/library /opt/immich/config
-
-  echo "  Volumes pre-created (postgres=70, valkey=999:1000, immich=1000:1000)"
+  ls -ld /opt/immich/postgresdata /opt/immich/redis /opt/immich/library /opt/immich/config
+  echo "  Volumes OK"
 '
 
 # ── Compose file ──────────────────────────────────────────────────────────────
@@ -660,6 +723,14 @@ pct set "$CT_ID" --protection 1
 # ── Summary ───────────────────────────────────────────────────────────────────
 echo ""
 echo "CT: $CT_ID | IP: ${CT_IP} | Web UI: http://${CT_IP}:${APP_PORT} | Login: $([ -n "$PASSWORD" ] && echo 'password set' || echo 'auto-login')"
+echo ""
+if [[ "$PHOTO_STORAGE" == "rootfs" ]]; then
+  echo "  Photos:   rootfs (${DISK} GB) — consider external storage for production"
+elif [[ "$PHOTO_STORAGE" == /* ]]; then
+  echo "  Photos:   ${PHOTO_STORAGE} (host path) -> /opt/immich/library"
+else
+  echo "  Photos:   ${PHOTOS_HOST_PATH} (${PHOTO_STORAGE}/immich-photos) -> /opt/immich/library"
+fi
 echo ""
 echo "  Post-setup:"
 echo "    1. Open http://${CT_IP}:${APP_PORT} — first registered user becomes admin"
