@@ -676,7 +676,7 @@ timer_next=\$(systemctl list-timers cryptpad-update.timer --no-pager 2>/dev/null
 printf '    Auto-update:   %s\n' \"\${timer_next:-enabled}\"
 printf '    Web UI (local):  http://%s:${APP_PORT}/\n' \"\$ip\"
 [ -n '${DOMAIN_NAME}' ] && printf '    Main  (public):    https://cryptpad.${DOMAIN_NAME}/\n' || true
-[ -n '${DOMAIN_NAME}' ] && printf '    Sandbox(public):   https://sandbox.cryptpad.${DOMAIN_NAME}/\n' || true
+[ -n '${DOMAIN_NAME}' ] && printf '    Sandbox(public):   https://<sandbox-subdomain>.${DOMAIN_NAME}/\n' || true
 printf '\n'
 printf '  Maintenance:\n'
 printf '    cryptpad-maint.sh update\n'
@@ -738,14 +738,12 @@ echo "  Config: /opt/cryptpad/config/config.js"
 echo ""
 if [[ -n "$DOMAIN_NAME" ]]; then
   echo "  Reverse proxy (NPM + Cloudflared):"
-  echo "    Two tunnel hostnames -> http://localhost:80 -> NPM -> CryptPad ports"
+  echo "    Two tunnel hostnames -> http://localhost:80 -> NPM -> CryptPad"
   echo ""
   echo "    NPM proxy host 1 — main interface:"
   echo "      cryptpad.${DOMAIN_NAME} -> http://${CT_IP}:${APP_PORT}"
   echo "      WebSockets enabled in NPM."
-  echo ""
   echo "      Add to cryptpad.${DOMAIN_NAME} NPM host - Custom Nginx config:"
-  echo ""
   echo "        location /cryptpad_websocket {"
   echo "            proxy_pass http://${CT_IP}:${WS_PORT};"
   echo "            proxy_http_version 1.1;"
@@ -754,15 +752,19 @@ if [[ -n "$DOMAIN_NAME" ]]; then
   echo "        }"
   echo ""
   echo "    NPM proxy host 2 — sandbox iframe (XSS isolation):"
-  echo "      sandbox.cryptpad.${DOMAIN_NAME} -> http://${CT_IP}:${APP_PORT}"
+  echo "      <your-sandbox-subdomain>.${DOMAIN_NAME} -> http://${CT_IP}:${APP_PORT}"
+  echo "      WebSockets enabled in NPM."
+  echo "      Add to <your-sandbox-subdomain>.${DOMAIN_NAME} NPM host - Custom Nginx config:"
+  echo "        location /cryptpad_websocket {"
+  echo "            proxy_pass http://${CT_IP}:${WS_PORT};"
+  echo "            proxy_http_version 1.1;"
+  echo "            proxy_set_header Upgrade \$http_upgrade;"
+  echo "            proxy_set_header Connection \"upgrade\";"
+  echo "        }"
   echo ""
-  echo "      Plain proxy — no WebSocket proxying needed."
-  echo "      (Both origins are served from port ${APP_PORT}; hostname separation is done by NPM.)"
-  echo ""
-  echo "  After NPM is configured, run:"
-  echo ""
+  echo "  After NPM is configured, run (replace <your-sandbox-subdomain>):"
   echo "    pct exec ${CT_ID} -- sed -i \"s|httpUnsafeOrigin: '.*'|httpUnsafeOrigin: 'https://cryptpad.${DOMAIN_NAME}'|\" /opt/cryptpad/config/config.js"
-  echo "    pct exec ${CT_ID} -- sed -i \"s|httpSafeOrigin: '.*'|httpSafeOrigin: 'https://sandbox.cryptpad.${DOMAIN_NAME}'|\" /opt/cryptpad/config/config.js"
+  echo "    pct exec ${CT_ID} -- sed -i \"s|httpSafeOrigin: '.*'|httpSafeOrigin: 'https://<your-sandbox-subdomain>.${DOMAIN_NAME}'|\" /opt/cryptpad/config/config.js"
   echo "    pct exec ${CT_ID} -- systemctl restart cryptpad"
   echo ""
 fi
