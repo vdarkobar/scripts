@@ -7,7 +7,7 @@ description: Write Bash deployment scripts that create and provision Proxmox VE 
 
 Write production-grade Bash scripts that create and fully provision Proxmox VE LXC containers with applications, or batch-operate on existing containers. Every provisioning script follows an identical skeleton so that any container in the lab is built, hardened, and documented the same way. Batch utility scripts follow their own pattern documented separately.
 
-## Critical Rule
+## Critical Rules - PAY ATTENTION!!!
 
 **ALWAYS extract patterns from the user's existing working scripts first.** Never invent new abstractions, helper functions, or "improvements" unless explicitly asked. The scripts are battle-tested — match their style exactly.  
 **NEVER** perform script edits without explicit user confirmation. Always describe the planned changes first and wait for approval before using any edit tools.
