@@ -740,8 +740,11 @@ pct set "$CT_ID" --protection 1
 # ── Summary ───────────────────────────────────────────────────────────────────
 echo ""
 echo "  CT: $CT_ID | IP: ${CT_IP} | Web UI: http://${CT_IP}:${APP_PORT}/ | Login: $([ -n "$PASSWORD" ] && echo 'password set' || echo 'auto-login')"
+echo ""
 echo "  Admin setup: pct exec $CT_ID -- systemctl status cryptpad  (look for the token URL to create admin account)"
+echo ""
 echo "  Config: /opt/cryptpad/config/config.js"
+echo ""
 echo "  Maintenance: pct exec $CT_ID -- cryptpad-maint.sh {update|backup|restore|list-backups|restore-latest}"
 echo ""
 
