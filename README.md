@@ -55,5 +55,10 @@ bash <(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/crypt
   
 #### *LXC updater*
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/updatelxc.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/lxc-update.sh)
+```
+
+#### *LXC delete*
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/lxc-delete.sh)
 ```
