@@ -14,8 +14,10 @@ CONTAINER_STORAGE="local-lvm"
 # Application-specific
 NODE_VERSION=22
 APP_PORT=3000
+WS_PORT=3003
 APP_TZ="Europe/Berlin"
 TAGS="cryptpad;lxc"
+DOMAIN_NAME="example.com"  # if empty, only local IP access is possible
 
 # Optional features
 INSTALL_ONLYOFFICE=0  # 1 = OnlyOffice components, 0 = CKEditor (default)
@@ -28,7 +30,6 @@ CLEANUP_ON_FAIL=1  # 1 = destroy CT on error, 0 = keep for debugging
 # ── Custom configs created by this script ─────────────────────────────────────
 #   /opt/cryptpad/                             (application root)
 #   /opt/cryptpad/config/config.js             (application config)
-#   /opt/cryptpad-backups/                     (backup directory)
 #   /usr/local/bin/cryptpad-maint.sh           (maintenance script)
 #   /etc/systemd/system/cryptpad.service
 #   /etc/systemd/system/cryptpad-update.service
@@ -94,7 +95,9 @@ cat <<EOF
   Container storage: $CONTAINER_STORAGE ($AVAIL_CT_STORES)
   Node.js version:   $NODE_VERSION
   App port:          $APP_PORT
+  WebSocket port:    $WS_PORT
   OnlyOffice:        $([ "$INSTALL_ONLYOFFICE" -eq 1 ] && echo "yes" || echo "no")
+  Domain:            ${DOMAIN_NAME:-"(not set — local IP only)"}
   Timezone:          $APP_TZ
   Debian:            $DEBIAN_VERSION
   Tags:              $TAGS
@@ -318,19 +321,34 @@ pct exec "$CT_ID" -- bash -lc "
   # Create config from example
   cp config/config.example.js config/config.js
 
-  # Set httpUnsafeOrigin to this container's IP
+  # Set httpUnsafeOrigin (main tab — user account data lives here)
   sed -i \"s|httpUnsafeOrigin: '.*'|httpUnsafeOrigin: 'http://${CT_IP}:${APP_PORT}'|\" config/config.js
+
+  # Set httpSafeOrigin (sandbox iframe — different origin isolates collaborative interface)
+  # If an XSS vulnerability is exploited, the attacker can only reach the sandbox origin;
+  # user account data at httpUnsafeOrigin remains protected by the browser's same-origin policy.
+  # Note: httpSafePort is only used when httpSafeOrigin is NOT set (local dev without two domains).
+  # In production both origins are served from port 3000; the reverse proxy separates them by hostname.
+  if grep -q '//.*httpSafeOrigin' config/config.js; then
+    sed -i \"s|// *httpSafeOrigin:.*|httpSafeOrigin: 'http://${CT_IP}:${APP_PORT}',|\" config/config.js
+  elif grep -q 'httpSafeOrigin' config/config.js; then
+    sed -i \"s|httpSafeOrigin:.*|httpSafeOrigin: 'http://${CT_IP}:${APP_PORT}',|\" config/config.js
+  fi
+
+  # Set websocketPort (used by the /cryptpad_websocket NPM location block)
+  if grep -q '//.*websocketPort' config/config.js; then
+    sed -i \"s|// *websocketPort:.*|websocketPort: ${WS_PORT},|\" config/config.js
+  elif grep -q 'websocketPort' config/config.js; then
+    sed -i \"s|websocketPort:.*|websocketPort: ${WS_PORT},|\" config/config.js
+  fi
 
   # Bind to all interfaces
   sed -i \"s|//httpAddress: 'localhost'|httpAddress: '0.0.0.0'|\" config/config.js
 
-  # Backup directory
-  install -d -m 0755 /opt/cryptpad-backups
-
   # Build
   npm run build
 "
-echo "  CryptPad configured and built"
+echo "  CryptPad configured and built (main port: ${APP_PORT}, websocket port: ${WS_PORT})"
 
 # ── Systemd service ───────────────────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc '
@@ -369,7 +387,7 @@ else
   echo "  WARNING: CryptPad may not be running — check: pct exec $CT_ID -- journalctl -u cryptpad --no-pager -n 20" >&2
 fi
 
-# HTTP health check (CryptPad takes a moment to start)
+# HTTP health check — main port
 HEALTHY=0
 for i in $(seq 1 30); do
   HTTP_CODE="$(pct exec "$CT_ID" -- sh -lc "curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:${APP_PORT}/ 2>/dev/null" 2>/dev/null || echo "000")"
@@ -380,10 +398,32 @@ for i in $(seq 1 30); do
   sleep 2
 done
 if [[ "$HEALTHY" -eq 1 ]]; then
-  echo "  CryptPad HTTP health check passed (HTTP $HTTP_CODE)"
+  echo "  CryptPad HTTP health check passed (main port ${APP_PORT} — HTTP $HTTP_CODE)"
 else
   echo "  WARNING: CryptPad not responding on port ${APP_PORT} yet — may still be initializing" >&2
   echo "  Check: pct exec $CT_ID -- journalctl -u cryptpad --no-pager -n 40" >&2
+fi
+
+# TCP port check — websocket port
+if pct exec "$CT_ID" -- sh -lc "ss -tlnp 2>/dev/null | grep -q ':${WS_PORT} '" 2>/dev/null; then
+  echo "  CryptPad websocket port ${WS_PORT} is listening"
+else
+  echo "  WARNING: Websocket not listening on port ${WS_PORT} — check config.js websocketPort" >&2
+fi
+
+# ── Extract admin token URL ────────────────────────────────────────────────────
+ADMIN_TOKEN_URL=""
+for i in $(seq 1 10); do
+  ADMIN_TOKEN_URL="$(pct exec "$CT_ID" -- journalctl -u cryptpad --no-pager -n 100 2>/dev/null \
+    | grep -o 'http[^[:space:]]*/install/#[^[:space:]]*' | head -n1 || true)"
+  [[ -n "$ADMIN_TOKEN_URL" ]] && break
+  sleep 2
+done
+if [[ -n "$ADMIN_TOKEN_URL" ]]; then
+  echo "  Admin setup URL found: $ADMIN_TOKEN_URL"
+else
+  echo "  WARNING: Admin token URL not found in journal yet — check after reboot:" >&2
+  echo "  pct exec $CT_ID -- journalctl -u cryptpad --no-pager -n 50 | grep install" >&2
 fi
 
 # ── Deploy maintenance script ─────────────────────────────────────────────────
@@ -393,7 +433,6 @@ set -Eeo pipefail
 
 # ── Config ────────────────────────────────────────────────────────────────────
 APP_DIR="${APP_DIR:-/opt/cryptpad}"
-BACKUP_DIR="${BACKUP_DIR:-/opt/cryptpad-backups}"
 SERVICE="cryptpad"
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -405,64 +444,11 @@ usage() {
   CryptPad Maintenance
   ──────────────────────
   Usage:
-    $0 update            Download latest + preserve config/data
-    $0 backup            Create timestamped backup
-    $0 list-backups      Show available backups
-    $0 restore <file>    Restore from backup archive
-    $0 restore-latest    Restore most recent backup
+    $0 update    Download latest + preserve config/data
 
   Env overrides:
     APP_DIR=$APP_DIR
-    BACKUP_DIR=$BACKUP_DIR
 EOF
-}
-
-latest_backup() {
-  ls -1t "$BACKUP_DIR"/cryptpad-*.tgz 2>/dev/null | head -n 1 || true
-}
-
-do_backup() {
-  mkdir -p "$BACKUP_DIR"
-  [[ -d "$APP_DIR" ]] || die "APP_DIR not found: $APP_DIR"
-
-  local ts backup
-  ts="$(date +%Y%m%d-%H%M%S)"
-  backup="$BACKUP_DIR/cryptpad-${ts}.tgz"
-
-  echo "  Creating backup: $backup"
-  tar -C "$(dirname "$APP_DIR")" -czf "$backup" "$(basename "$APP_DIR")"
-  echo "  OK: $backup"
-}
-
-do_list_backups() {
-  mkdir -p "$BACKUP_DIR"
-  ls -lh "$BACKUP_DIR"/cryptpad-*.tgz 2>/dev/null || echo "  No backups in $BACKUP_DIR"
-}
-
-do_restore() {
-  local tgz="${1:-}"
-  [[ -n "$tgz" ]] || die "Missing backup file. Use: restore <backup.tgz>"
-  [[ -f "$tgz" ]] || die "Backup not found: $tgz"
-
-  local base
-  base="$(basename "$APP_DIR")"
-  if ! tar -tzf "$tgz" | head -n 1 | grep -q "^${base}/"; then
-    die "Backup does not contain '${base}/' at top-level: $tgz"
-  fi
-
-  echo "  Restoring from: $tgz"
-  systemctl stop "$SERVICE" || true
-
-  if [[ -d "$APP_DIR" ]]; then
-    local keep="${APP_DIR}.pre-restore.$(date +%Y%m%d-%H%M%S)"
-    echo "  Keeping current as: $keep"
-    mv "$APP_DIR" "$keep"
-  fi
-
-  tar -C "$(dirname "$APP_DIR")" -xzf "$tgz"
-
-  systemctl start "$SERVICE"
-  echo "  OK: Restored to $APP_DIR"
 }
 
 do_update() {
@@ -484,8 +470,6 @@ do_update() {
     fi
   }
   trap 'rollback' ERR
-
-  do_backup
 
   mkdir -p "$new_dir"
 
@@ -550,13 +534,9 @@ cmd="${1:-}"
 shift || true
 
 case "$cmd" in
-  update)          do_update ;;
-  backup)          do_backup ;;
-  list-backups)    do_list_backups ;;
-  restore)         do_restore "${1:-}" ;;
-  restore-latest)  b="$(latest_backup)"; [[ -n "$b" ]] || die "No backups found in $BACKUP_DIR"; do_restore "$b" ;;
-  ""|-h|--help)    usage ;;
-  *)               usage; die "Unknown command: $cmd" ;;
+  update)       do_update ;;
+  ""|-h|--help) usage ;;
+  *)            usage; die "Unknown command: $cmd" ;;
 esac
 MAINT
 chmod +x /usr/local/bin/cryptpad-maint.sh'
@@ -569,7 +549,7 @@ pct exec "$CT_ID" -- bash -lc '
 
   cat > /etc/systemd/system/cryptpad-update.service <<EOF
 [Unit]
-Description=CryptPad auto-update (backup + download + rebuild)
+Description=CryptPad auto-update (download + rebuild)
 After=network-online.target
 Wants=network-online.target
 
@@ -685,6 +665,7 @@ MOTD
 #!/bin/sh
 node_ver=\$(node --version 2>/dev/null || echo 'n/a')
 service_active=\$(systemctl is-active cryptpad 2>/dev/null || echo 'unknown')
+ip=\$(ip -4 -o addr show scope global 2>/dev/null | awk '{print \$4}' | cut -d/ -f1 | head -n1)
 printf '\n'
 printf '  CryptPad:\n'
 printf '    App dir:       /opt/cryptpad\n'
@@ -693,14 +674,12 @@ printf '    Node.js:       %s\n' \"\$node_ver\"
 printf '    Service:       %s\n' \"\$service_active\"
 timer_next=\$(systemctl list-timers cryptpad-update.timer --no-pager 2>/dev/null | awk 'NR==2{for(i=1;i<=NF;i++) if(\$i ~ /^[0-9]{4}-/) {printf \"%s %s\", \$i, \$(i+1); break}}' || echo 'n/a')
 printf '    Auto-update:   %s\n' \"\${timer_next:-enabled}\"
-printf '    Web UI:        http://%s:${APP_PORT}/\n' \"\$(ip -4 -o addr show scope global 2>/dev/null | awk '{print \$4}' | cut -d/ -f1 | head -n1)\"
+printf '    Web UI (local):  http://%s:${APP_PORT}/\n' \"\$ip\"
+[ -n '${DOMAIN_NAME}' ] && printf '    Main  (public):    https://cryptpad.${DOMAIN_NAME}/\n' || true
+[ -n '${DOMAIN_NAME}' ] && printf '    Sandbox(public):   https://sandbox.cryptpad.${DOMAIN_NAME}/\n' || true
 printf '\n'
 printf '  Maintenance:\n'
 printf '    cryptpad-maint.sh update\n'
-printf '    cryptpad-maint.sh backup\n'
-printf '    cryptpad-maint.sh list-backups\n'
-printf '    cryptpad-maint.sh restore <file>\n'
-printf '    cryptpad-maint.sh restore-latest\n'
 printf '\n'
 printf '  Admin setup:\n'
 printf '    systemctl status cryptpad\n'
@@ -728,9 +707,6 @@ OO_NOTE=""
 DESC="<a href='http://${CT_IP}:${APP_PORT}/' target='_blank' rel='noopener noreferrer' style='text-decoration: none; color: #00617f;'>CryptPad Web UI</a>
 <details><summary>Details</summary>CryptPad on Debian ${DEBIAN_VERSION} LXC
 Node.js ${NODE_VERSION} (native)${OO_NOTE}
-Admin setup: systemctl status cryptpad (token URL)
-Config: /opt/cryptpad/config/config.js
-Maintenance: cryptpad-maint.sh
 Created by cryptpad.sh</details>"
 pct set "$CT_ID" --description "$DESC"
 
@@ -739,17 +715,60 @@ pct set "$CT_ID" --protection 1
 
 # ── Summary ───────────────────────────────────────────────────────────────────
 echo ""
-echo "  CT: $CT_ID | IP: ${CT_IP} | Web UI: http://${CT_IP}:${APP_PORT}/ | Login: $([ -n "$PASSWORD" ] && echo 'password set' || echo 'auto-login')"
+echo "  CT: $CT_ID | IP: ${CT_IP} | Login: $([ -n "$PASSWORD" ] && echo 'password set' || echo 'auto-login')"
 echo ""
-echo "  Admin setup: pct exec $CT_ID -- systemctl status cryptpad  (look for the token URL to create admin account)"
+if [[ -n "$DOMAIN_NAME" ]]; then
+  echo "  Access (local):  http://${CT_IP}:${APP_PORT}/"
+  echo ""
+  echo "  Access (public):"
+  echo "    Main:    https://cryptpad.${DOMAIN_NAME}/"
+  echo "    Sandbox: https://sandbox.cryptpad.${DOMAIN_NAME}/"
+else
+  echo "  Access (local):  http://${CT_IP}:${APP_PORT}/"
+fi
+echo ""
+if [[ -n "$ADMIN_TOKEN_URL" ]]; then
+  ADMIN_TOKEN_HASH="${ADMIN_TOKEN_URL##*#}"
+  echo "  Admin setup URL: http://${CT_IP}:${APP_PORT}/install/#${ADMIN_TOKEN_HASH}"
+else
+  echo "  Admin setup: pct exec $CT_ID -- journalctl -u cryptpad --no-pager -n 50 | grep install"
+fi
 echo ""
 echo "  Config: /opt/cryptpad/config/config.js"
 echo ""
-echo "  Maintenance: pct exec $CT_ID -- cryptpad-maint.sh {update|backup|restore|list-backups|restore-latest}"
+if [[ -n "$DOMAIN_NAME" ]]; then
+  echo "  Reverse proxy (NPM + Cloudflared):"
+  echo "    Two tunnel hostnames -> http://localhost:80 -> NPM -> CryptPad ports"
+  echo ""
+  echo "    NPM proxy host 1 — main interface:"
+  echo "      cryptpad.${DOMAIN_NAME} -> http://${CT_IP}:${APP_PORT}"
+  echo "      WebSockets enabled in NPM."
+  echo ""
+  echo "      Add to cryptpad.${DOMAIN_NAME} NPM host - Custom Nginx config:"
+  echo ""
+  echo "        location /cryptpad_websocket {"
+  echo "            proxy_pass http://${CT_IP}:${WS_PORT};"
+  echo "            proxy_http_version 1.1;"
+  echo "            proxy_set_header Upgrade \$http_upgrade;"
+  echo "            proxy_set_header Connection \"upgrade\";"
+  echo "        }"
+  echo ""
+  echo "    NPM proxy host 2 — sandbox iframe (XSS isolation):"
+  echo "      sandbox.cryptpad.${DOMAIN_NAME} -> http://${CT_IP}:${APP_PORT}"
+  echo ""
+  echo "      Plain proxy — no WebSocket proxying needed."
+  echo "      (Both origins are served from port ${APP_PORT}; hostname separation is done by NPM.)"
+  echo ""
+  echo "  After NPM is configured, run:"
+  echo ""
+  echo "    pct exec ${CT_ID} -- sed -i \"s|httpUnsafeOrigin: '.*'|httpUnsafeOrigin: 'https://cryptpad.${DOMAIN_NAME}'|\" /opt/cryptpad/config/config.js"
+  echo "    pct exec ${CT_ID} -- sed -i \"s|httpSafeOrigin: '.*'|httpSafeOrigin: 'https://sandbox.cryptpad.${DOMAIN_NAME}'|\" /opt/cryptpad/config/config.js"
+  echo "    pct exec ${CT_ID} -- systemctl restart cryptpad"
+  echo ""
+fi
+echo "  Maintenance: pct exec $CT_ID -- cryptpad-maint.sh update"
 echo ""
 
 # ── Reboot ────────────────────────────────────────────────────────────────────
-pct stop "$CT_ID"
-sleep 2
-pct start "$CT_ID"
+pct reboot "$CT_ID"
 echo "  Done."
