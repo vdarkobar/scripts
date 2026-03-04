@@ -9,7 +9,7 @@ Write production-grade Bash scripts that create and fully provision Proxmox VE L
 
 ## Critical Rule
 
-**ALWAYS extract patterns from the user's existing working scripts first.** Never invent new abstractions, helper functions, or "improvements" unless explicitly asked. The scripts are battle-tested — match their style exactly.
+**ALWAYS extract patterns from the user's existing working scripts first.** Never invent new abstractions, helper functions, or "improvements" unless explicitly asked. The scripts are battle-tested — match their style exactly.  
 **NEVER** perform script edits without explicit user confirmation. Always describe the planned changes first and wait for approval before using any edit tools.
 
 ---
