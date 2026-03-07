@@ -25,7 +25,8 @@ REDIS_IMAGE="docker.io/library/redis:8"
 DEBIAN_VERSION=13
 
 # Optional features
-ENABLE_AUTO_UPDATE=0                 # 1 = enable timer that reapplies the currently configured image
+AUTO_UPDATE=0                        # 1 = enable timer-driven maintenance/update runs
+TRACK_LATEST=0                     # 1 = auto-update follows docker.io/docmost/docmost:latest
 ALLOW_CONSOLE_AUTOLOGIN_IF_BLANK=0   # 1 = enable root console autologin when password blank
 KEEP_BACKUPS=7
 
@@ -63,6 +64,9 @@ APP_URL=""
 [[ "$APP_PORT" =~ ^[0-9]+$ ]] || { echo "  ERROR: APP_PORT must be numeric." >&2; exit 1; }
 (( APP_PORT >= 1 && APP_PORT <= 65535 )) || { echo "  ERROR: APP_PORT must be between 1 and 65535." >&2; exit 1; }
 [[ "$KEEP_BACKUPS" =~ ^[0-9]+$ ]] || { echo "  ERROR: KEEP_BACKUPS must be numeric." >&2; exit 1; }
+[[ "$AUTO_UPDATE" =~ ^[01]$ ]] || { echo "  ERROR: AUTO_UPDATE must be 0 or 1." >&2; exit 1; }
+[[ "$TRACK_LATEST" =~ ^[01]$ ]] || { echo "  ERROR: TRACK_LATEST must be 0 or 1." >&2; exit 1; }
+[[ "$ALLOW_CONSOLE_AUTOLOGIN_IF_BLANK" =~ ^[01]$ ]] || { echo "  ERROR: ALLOW_CONSOLE_AUTOLOGIN_IF_BLANK must be 0 or 1." >&2; exit 1; }
 [[ "$DOCMOST_TAG" == "latest" || "$DOCMOST_TAG" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9._-]+)?$ ]] || {
   echo "  ERROR: DOCMOST_TAG must look like 0.25.2 or latest." >&2
   exit 1
@@ -128,7 +132,8 @@ cat <<EOF2
   Public FQDN:       ${PUBLIC_FQDN:-"(not set — local IP mode)"}
   Timezone:          $APP_TZ
   Tags:              $TAGS
-  Auto-update:       $([ "$ENABLE_AUTO_UPDATE" -eq 1 ] && echo "enabled" || echo "disabled")
+  Auto-update:       $([ "$AUTO_UPDATE" -eq 1 ] && echo "enabled" || echo "disabled")
+  Track latest:      $([ "$TRACK_LATEST" -eq 1 ] && echo "enabled" || echo "disabled")
   Console autologin: $([ "$ALLOW_CONSOLE_AUTOLOGIN_IF_BLANK" -eq 1 ] && echo "allowed if password blank" || echo "disabled")
   Keep backups:      $KEEP_BACKUPS
   Cleanup on fail:   $CLEANUP_ON_FAIL
@@ -437,6 +442,8 @@ DB_PASSWORD=${DB_PASSWORD}
 DATABASE_URL=postgresql://docmost:${DB_PASSWORD}@db:5432/docmost
 REDIS_URL=redis://redis:6379
 KEEP_BACKUPS=${KEEP_BACKUPS}
+AUTO_UPDATE=${AUTO_UPDATE}
+TRACK_LATEST=${TRACK_LATEST}
 EOF2
   chmod 0600 '${APP_DIR}/.env' '${APP_DIR}/docker-compose.yml'
 "
@@ -464,12 +471,14 @@ usage() {
     $0 backup
     $0 list
     $0 restore <backup.tar.gz>
-    $0 update <docmost-tag>
+    $0 update <docmost-tag|latest>
+    $0 auto-update
     $0 version
 
   Notes:
     - backup stops the stack for a consistent snapshot, then starts it again
     - update backs up first, then changes only the Docmost image tag
+    - auto-update obeys AUTO_UPDATE and TRACK_LATEST from ${ENV_FILE}
     - PostgreSQL and Redis image changes are intentionally manual
 EOF2
 }
@@ -491,6 +500,28 @@ current_tag() {
   local img
   img="$(current_image)"
   echo "${img##*:}"
+}
+
+env_flag() {
+  local key="$1" raw
+  raw="$(awk -F= -v key="$key" '$1==key{print $2}' "$ENV_FILE" | tail -n1 | tr -d '[:space:]')"
+  [[ "$raw" =~ ^[01]$ ]] && printf '%s' "$raw" || printf '0'
+}
+
+auto_update_enabled() {
+  [[ "$(env_flag AUTO_UPDATE)" == "1" ]]
+}
+
+track_latest_enabled() {
+  [[ "$(env_flag TRACK_LATEST)" == "1" ]]
+}
+
+resolve_auto_tag() {
+  if track_latest_enabled; then
+    printf '%s\n' latest
+  else
+    current_tag
+  fi
 }
 
 backup_stack() {
@@ -548,7 +579,7 @@ restore_stack() {
 update_docmost() {
   local new_tag="$1"
   local old_image new_image tmp_env health old_tag
-  [[ -n "$new_tag" ]] || die "Usage: docmost-maint.sh update <docmost-tag>"
+  [[ -n "$new_tag" ]] || die "Usage: docmost-maint.sh update <docmost-tag|latest>"
   [[ "$new_tag" == "latest" || "$new_tag" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9._-]+)?$ ]] || die "Invalid Docmost tag: $new_tag"
 
   old_image="$(current_image)"
@@ -600,6 +631,24 @@ update_docmost() {
   echo "  OK: Docmost updated to $new_tag"
 }
 
+auto_update_docmost() {
+  local target_tag
+
+  if ! auto_update_enabled; then
+    echo "  Auto-update disabled in ${ENV_FILE}; nothing to do."
+    return 0
+  fi
+
+  target_tag="$(resolve_auto_tag)"
+  if track_latest_enabled; then
+    echo "  Auto-update policy: TRACK_LATEST=1 -> following latest"
+  else
+    echo "  Auto-update policy: TRACK_LATEST=0 -> reapplying configured tag $(current_tag)"
+  fi
+
+  update_docmost "$target_tag"
+}
+
 need_root
 cmd="${1:-}"
 case "$cmd" in
@@ -607,7 +656,12 @@ case "$cmd" in
   list) ls -1t "$BACKUP_DIR"/docmost-backup-*.tar.gz 2>/dev/null || true ;;
   restore) shift; restore_stack "${1:-}" ;;
   update) shift; update_docmost "${1:-}" ;;
-  version) echo "Configured Docmost image: $(current_image)" ;;
+  auto-update) auto_update_docmost ;;
+  version)
+    echo "Configured Docmost image: $(current_image)"
+    echo "AUTO_UPDATE=$(env_flag AUTO_UPDATE)"
+    echo "TRACK_LATEST=$(env_flag TRACK_LATEST)"
+    ;;
   ""|-h|--help) usage ;;
   *) usage; die "Unknown command: $cmd" ;;
 esac
@@ -673,24 +727,23 @@ else
   echo "  Check: pct exec $CT_ID -- bash -lc 'cd /opt/docmost && podman-compose logs --tail=80'" >&2
 fi
 
-# ── Auto-update timer (optional) ──────────────────────────────────────────────
-if [[ "$ENABLE_AUTO_UPDATE" -eq 1 ]]; then
-  pct exec "$CT_ID" -- bash -lc '
-    set -euo pipefail
-    cat > /etc/systemd/system/docmost-update.service <<EOF2
+# ── Auto-update timer (policy-driven) ──────────────────────────────────────────
+pct exec "$CT_ID" -- bash -lc '
+  set -euo pipefail
+  cat > /etc/systemd/system/docmost-update.service <<EOF2
 [Unit]
-Description=Reapply configured Docmost image
+Description=Docmost auto-update maintenance run
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart=/bin/bash -lc "tag=\$(awk -F= '\''/^DOCMOST_TAG=/{print \$2}'\'' /opt/docmost/.env | tail -n1); /usr/local/bin/docmost-maint.sh update \$tag"
+ExecStart=/usr/local/bin/docmost-maint.sh auto-update
 EOF2
 
-    cat > /etc/systemd/system/docmost-update.timer <<EOF2
+  cat > /etc/systemd/system/docmost-update.timer <<EOF2
 [Unit]
-Description=Docmost auto-update timer (configured tag)
+Description=Docmost auto-update timer
 
 [Timer]
 OnCalendar=*-*-01 05:30:00
@@ -702,12 +755,14 @@ RandomizedDelaySec=300
 WantedBy=timers.target
 EOF2
 
-    systemctl daemon-reload
-    systemctl enable --now docmost-update.timer
-  '
+  systemctl daemon-reload
+'
+if [[ "$AUTO_UPDATE" -eq 1 ]]; then
+  pct exec "$CT_ID" -- bash -lc 'systemctl enable --now docmost-update.timer'
   echo "  Auto-update timer enabled"
 else
-  echo "  Auto-update timer not enabled"
+  pct exec "$CT_ID" -- bash -lc 'systemctl disable --now docmost-update.timer >/dev/null 2>&1 || true'
+  echo "  Auto-update timer installed but disabled"
 fi
 
 # ── Unattended upgrades ───────────────────────────────────────────────────────
@@ -800,7 +855,7 @@ printf '  Service:   %s\n' \"\$service_active\"
 printf '  Image:     %s\n' \"\${configured_image:-n/a}\"
 printf '  Backup:    /opt/docmost-backups\n'
 printf '  Compose:   cd /opt/docmost && podman-compose [up -d|down|logs|ps]\n'
-printf '  Maintain:  docmost-maint.sh [backup|list|restore|update|version]\n'
+printf '  Maintain:  docmost-maint.sh [backup|list|restore|update|auto-update|version]\n'
 printf '  Web UI:    http://%s:${APP_PORT}\n' \"\${ip:-n/a}\"
 printf '  Health:    http://%s:${APP_PORT}/api/health\n' \"\${ip:-n/a}\"
 [ -n '${PUBLIC_FQDN}' ] && printf '  Public:    https://${PUBLIC_FQDN}\n' || true
@@ -859,10 +914,12 @@ echo "    ${APP_DIR}/redis"
 echo "    ${APP_DIR}/storage"
 echo ""
 echo "  Maintenance:"
+echo "    Policy: AUTO_UPDATE=${AUTO_UPDATE} TRACK_LATEST=${TRACK_LATEST}"
 echo "    pct exec $CT_ID -- docmost-maint.sh backup"
 echo "    pct exec $CT_ID -- docmost-maint.sh list"
-echo "    pct exec $CT_ID -- docmost-maint.sh update <docmost-tag>"
+echo "    pct exec $CT_ID -- docmost-maint.sh update <docmost-tag|latest>"
 echo "    pct exec $CT_ID -- docmost-maint.sh restore /opt/docmost-backups/<backup.tar.gz>"
+echo "    pct exec $CT_ID -- docmost-maint.sh auto-update"
 echo ""
 if [[ -n "$PUBLIC_FQDN" ]]; then
   echo "  Reverse proxy (NPM):"
