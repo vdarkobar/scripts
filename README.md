@@ -52,6 +52,11 @@ bash <(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/priva
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/cryptpad.sh)
 ```
+
+#### *SearXNG*
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/searxng.sh)
+```
   
 #### *LXC updater*
 ```bash
