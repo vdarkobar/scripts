@@ -1159,6 +1159,7 @@ pct exec "$CT_ID" -- bash -lc '
   set -euo pipefail
   touch /root/.bashrc
   grep -q "^export TERM=" /root/.bashrc 2>/dev/null || echo "export TERM=xterm-256color" >> /root/.bashrc
+  grep -q "/usr/local/bin" /root/.bashrc 2>/dev/null || echo "export PATH=\"/usr/local/bin:\$PATH\"" >> /root/.bashrc
 '
 
 # ── Proxmox UI description ────────────────────────────────────────────────────
