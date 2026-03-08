@@ -23,7 +23,9 @@ DEBIAN_VERSION=13
 # Then reload: pct exec <CT_ID> -- systemctl reload unbound
 
 # Behavior
-CLEANUP_ON_FAIL=1  # 1 = destroy CT on error, 0 = keep for debugging
+CLEANUP_ON_FAIL=1                    # 1 = destroy CT on error, 0 = keep for debugging
+ALLOW_CONSOLE_AUTOLOGIN_IF_BLANK=0   # 1 = enable root auto-login if no password set
+DISABLE_IPV6=1                       # 1 = disable IPv6 in sysctl (CT uses ip6=manual + do-ip6: no)
 
 # ── Custom configs created by this script ─────────────────────────────────────
 #   /etc/update-motd.d/00-header
@@ -38,7 +40,8 @@ CLEANUP_ON_FAIL=1  # 1 = destroy CT on error, 0 = keep for debugging
 #   /etc/dhcp/dhclient.conf
 
 # ── Trap cleanup ──────────────────────────────────────────────────────────────
-trap 'trap - ERR; rc=$?;
+trap 'rc=$?;
+  trap - ERR
   echo "  ERROR: failed (rc=$rc) near line ${BASH_LINENO[0]:-?}" >&2
   echo "  Command: $BASH_COMMAND" >&2
   if [[ "${CLEANUP_ON_FAIL:-0}" -eq 1 && "${CREATED:-0}" -eq 1 ]]; then
@@ -60,14 +63,39 @@ trap 'rc=$?;
   exit "$rc"
 ' INT TERM
 
+# ── Config validation ─────────────────────────────────────────────────────────
+[[ "$ALLOW_CONSOLE_AUTOLOGIN_IF_BLANK" =~ ^[01]$ ]] \
+  || { echo "  ERROR: ALLOW_CONSOLE_AUTOLOGIN_IF_BLANK must be 0 or 1." >&2; exit 1; }
+[[ "$DISABLE_IPV6" =~ ^[01]$ ]] \
+  || { echo "  ERROR: DISABLE_IPV6 must be 0 or 1." >&2; exit 1; }
+[[ "$CPU" =~ ^[1-9][0-9]*$ ]] \
+  || { echo "  ERROR: CPU must be a positive integer." >&2; exit 1; }
+[[ "$DEBIAN_VERSION" =~ ^[0-9]+$ ]] \
+  || { echo "  ERROR: DEBIAN_VERSION must be numeric." >&2; exit 1; }
+[[ -e "/usr/share/zoneinfo/${APP_TZ}" ]] \
+  || { echo "  ERROR: APP_TZ not found in /usr/share/zoneinfo: $APP_TZ" >&2; exit 1; }
+if [[ -n "$UB_DOMAIN" ]]; then
+  [[ "$UB_DOMAIN" =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)*$ ]] \
+    || { echo "  ERROR: UB_DOMAIN is invalid: $UB_DOMAIN" >&2; exit 1; }
+fi
+
 # ── Preflight — root & commands ───────────────────────────────────────────────
 [[ "$(id -u)" -eq 0 ]] || { echo "  ERROR: Run as root on the Proxmox host." >&2; exit 1; }
 
-for cmd in pvesh pveam pct pvesm; do
+for cmd in pvesh pveam pct pvesm curl python3 ip awk sort paste; do
   command -v "$cmd" >/dev/null 2>&1 || { echo "  ERROR: Missing required command: $cmd" >&2; exit 1; }
 done
 
 [[ -n "$CT_ID" ]] || { echo "  ERROR: Could not obtain next CT ID." >&2; exit 1; }
+
+if [[ "$DEBIAN_VERSION" -ge 13 ]]; then
+  PVC_VER="$(dpkg-query -W -f='${Version}' pve-container 2>/dev/null | cut -d. -f1-2 || echo "0.0")"
+  if dpkg --compare-versions "$PVC_VER" lt "5.3"; then
+    echo "  ERROR: pve-container $PVC_VER is too old for Debian 13 templates." >&2
+    echo "  Fix:   apt install --only-upgrade pve-container" >&2
+    exit 1
+  fi
+fi
 
 # ── Discover available resources ──────────────────────────────────────────────
 AVAIL_BRIDGES="$(ip -o link show type bridge 2>/dev/null | awk -F': ' '{print $2}' | sort | paste -sd', ' || echo "n/a")"
@@ -134,7 +162,7 @@ ip link show "$BRIDGE" >/dev/null 2>&1 || { echo "  ERROR: Bridge not found: $BR
 # ── Root password ─────────────────────────────────────────────────────────────
 PASSWORD=""
 while true; do
-  read -r -s -p "  Set root password (blank = auto-login): " PW1; echo
+  read -r -s -p "  Set root password (blank allowed): " PW1; echo
   [[ -z "$PW1" ]] && break
   if [[ "$PW1" == *" "* ]]; then echo "  Password cannot contain spaces."; continue; fi
   if [[ ${#PW1} -lt 5 ]]; then echo "  Password must be at least 5 characters."; continue; fi
@@ -145,15 +173,16 @@ done
 echo ""
 
 if [[ -z "$PASSWORD" ]]; then
-  echo "  WARNING: Blank password enables root auto-login on the Proxmox console."
+  echo "  WARNING: No root password was set."
+  if [[ "${ALLOW_CONSOLE_AUTOLOGIN_IF_BLANK:-0}" -eq 1 ]]; then
+    echo "  WARNING: Console auto-login is enabled by configuration."
+  fi
   echo ""
 fi
 
 # ── Template discovery & download ─────────────────────────────────────────────
 pveam update
 echo ""
-[[ "$DEBIAN_VERSION" =~ ^[0-9]+$ ]] || { echo "  ERROR: DEBIAN_VERSION must be numeric." >&2; exit 1; }
-
 TEMPLATE="$(pveam available -section system | awk -v p="debian-${DEBIAN_VERSION}" '$2 ~ ("^" p) {print $2}' | sort -V | tail -n1)"
 if [[ -z "$TEMPLATE" ]]; then
   echo "  WARNING: No Debian ${DEBIAN_VERSION} template found, trying any Debian..." >&2
@@ -202,7 +231,7 @@ done
 [[ -n "$CT_IP" ]] || { echo "  ERROR: No IPv4 address acquired via DHCP within timeout." >&2; exit 1; }
 
 # ── Auto-login (if no password) ───────────────────────────────────────────────
-if [[ -z "$PASSWORD" ]]; then
+if [[ -z "$PASSWORD" && "${ALLOW_CONSOLE_AUTOLOGIN_IF_BLANK:-0}" -eq 1 ]]; then
   pct exec "$CT_ID" -- bash -lc '
     set -euo pipefail
     mkdir -p /etc/systemd/system/container-getty@1.service.d
@@ -271,6 +300,8 @@ if [[ -z "$UB_DOMAIN" ]]; then
   read -r -p "  Could not detect domain. Enter local domain (e.g. home.local): " UB_DOMAIN
   [[ -n "$UB_DOMAIN" ]] || { echo "  ERROR: Domain name is required." >&2; exit 1; }
 fi
+[[ "$UB_DOMAIN" =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)*$ ]] \
+  || { echo "  ERROR: Invalid domain name: $UB_DOMAIN" >&2; exit 1; }
 echo "  Domain: $UB_DOMAIN"
 
 # ── Install Unbound ───────────────────────────────────────────────────────────
@@ -504,7 +535,7 @@ server:
     # Unbound Performance Tuning and Tweak
     # =========================================================================
 
-    num-threads: 4
+    num-threads: __CPU__
     msg-cache-slabs: 8
     rrset-cache-slabs: 8
     infra-cache-slabs: 8
@@ -553,8 +584,9 @@ forward-zone:
 UNBOUND_CONF
 "
 
-# Replace domain placeholder
+# Replace placeholders
 pct exec "$CT_ID" -- sed -i "s/__DOMAIN__/${UB_DOMAIN}/g" /etc/unbound/unbound.conf
+pct exec "$CT_ID" -- sed -i "s/__CPU__/${CPU}/g"         /etc/unbound/unbound.conf
 
 # ── Create drop-in: vlans.conf ────────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc '
@@ -624,12 +656,18 @@ HOSTS
 if pct exec "$CT_ID" -- unbound-checkconf /etc/unbound/unbound.conf >/dev/null 2>&1; then
   echo "  Configuration validation passed"
 else
-  echo "  WARNING: Configuration validation had warnings (may still work)"
+  echo "  ERROR: Unbound configuration validation failed." >&2
+  pct exec "$CT_ID" -- unbound-checkconf /etc/unbound/unbound.conf >&2 || true
+  exit 1
 fi
 
 # ── Cron: quarterly root hints update (atomic) ────────────────────────────────
 pct exec "$CT_ID" -- bash -lc '
   set -euo pipefail
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -qq
+  apt-get install -y cron
+  systemctl enable --now cron
   ( crontab -l 2>/dev/null || true
     echo ""
     echo "# Update root hints and reload unbound (quarterly)"
@@ -670,7 +708,7 @@ supersede domain-search \"${UB_DOMAIN}\";
 EOF
 "
 
-# Health check — verify Unbound answers queries
+# ── Health check ─────────────────────────────────────────────────────────────
 UB_HEALTHY=0
 for i in $(seq 1 15); do
   if pct exec "$CT_ID" -- dig @127.0.0.1 google.com +short +time=2 +tries=1 >/dev/null 2>&1; then
@@ -737,12 +775,21 @@ net.ipv4.conf.all.accept_source_route = 0
 net.ipv4.conf.default.accept_source_route = 0
 net.ipv4.icmp_echo_ignore_broadcasts = 1
 net.ipv4.icmp_ignore_bogus_error_responses = 1
+EOF
+  sysctl --system >/dev/null 2>&1 || true
+'
+
+if [[ "${DISABLE_IPV6:-1}" -eq 1 ]]; then
+  pct exec "$CT_ID" -- bash -lc '
+    set -euo pipefail
+    cat >> /etc/sysctl.d/99-hardening.conf <<EOF
 net.ipv6.conf.all.disable_ipv6 = 1
 net.ipv6.conf.default.disable_ipv6 = 1
 net.ipv6.conf.lo.disable_ipv6 = 1
 EOF
-  sysctl --system >/dev/null 2>&1 || true
-'
+    sysctl --system >/dev/null 2>&1 || true
+  '
+fi
 
 # ── Cleanup packages ──────────────────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc '
@@ -783,10 +830,13 @@ else
   printf '  Unbound:   stopped\n'
 fi
 printf '  Config:    /etc/unbound/unbound.conf\n'
+printf '  Requires post-install editing:\n'
 printf '  VLANs:     /etc/unbound/unbound.conf.d/vlans.conf\n'
 printf '  Hosts:     /etc/unbound/unbound.conf.d/30-static-hosts.conf\n'
 printf '  Reload:    systemctl reload unbound\n'
 printf '  Test:      dig google.com\n'
+printf '  Updates:   unattended-upgrades (automatic)\n'
+printf '  Hints:     quarterly cron (internic.net)\n'
 MOTD
 
   cat > /etc/update-motd.d/99-footer <<'MOTD'
@@ -814,12 +864,34 @@ pct set "$CT_ID" --description "$UB_DESC"
 pct set "$CT_ID" --protection 1
 
 # ── Summary ───────────────────────────────────────────────────────────────────
+LOGIN_STATE="$(
+  if [[ -n "$PASSWORD" ]]; then
+    echo 'password set'
+  elif [[ "${ALLOW_CONSOLE_AUTOLOGIN_IF_BLANK:-0}" -eq 1 ]]; then
+    echo 'blank password + console autologin'
+  else
+    echo 'blank password'
+  fi
+)"
 echo ""
-echo "CT: $CT_ID | IP: ${CT_IP} | DNS: ${CT_IP}:53 | Domain: ${UB_DOMAIN} | Login: $([ -n "$PASSWORD" ] && echo 'password set' || echo 'auto-login')"
+echo "  CT: $CT_ID | IP: ${CT_IP} | Login: ${LOGIN_STATE}"
 echo ""
-
-# ── Reboot CT so all DNS settings take effect cleanly ─────────────────────────
-echo "  Rebooting container..."
-pct reboot "$CT_ID"
+echo "  Access:"
+echo "    DNS:    ${CT_IP}:53"
+echo ""
+echo "  Domain:   ${UB_DOMAIN}"
+echo ""
+echo "  Config files:"
+echo "    /etc/unbound/unbound.conf"
+echo "    /etc/unbound/unbound.conf.d/vlans.conf           # requires post-install editing"
+echo "    /etc/unbound/unbound.conf.d/30-static-hosts.conf # requires post-install editing"
+echo ""
+echo "  Reload after edits:"
+echo "    pct exec $CT_ID -- systemctl reload unbound"
+echo ""
+echo "  Updates:"
+echo "    Package:  unattended-upgrades (automatic)"
+echo "    Hints:    quarterly cron — /usr/share/dns/root.hints"
+echo ""
 echo "  Done."
 echo ""
