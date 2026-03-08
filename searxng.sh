@@ -81,7 +81,9 @@ done
 # ── Discover available resources ──────────────────────────────────────────────
 AVAIL_TMPL_STORES="$(pvesh get /storage --output-format json 2>/dev/null | python3 -c "import sys,json; print(', '.join(sorted(s['storage'] for s in json.load(sys.stdin) if 'vztmpl' in s.get('content',''))))" 2>/dev/null || echo "n/a")"
 AVAIL_CT_STORES="$(pvesh get /storage --output-format json 2>/dev/null | python3 -c "import sys,json; print(', '.join(sorted(s['storage'] for s in json.load(sys.stdin) if 'rootdir' in s.get('content','') or 'images' in s.get('content',''))))" 2>/dev/null || echo "n/a")"
-AVAIL_BRIDGES="$(ip -o link show type bridge 2>/dev/null | awk -F': ' '{print $2}' | sort | paste -sd',' | sed 's/,/, /g' || echo "n/a")"
+#AVAIL_BRIDGES="$(ip -o link show type bridge 2>/dev/null | awk -F': ' '{print $2}' | sort | paste -sd',' | sed 's/,/, /g' || echo "n/a")"
+AVAIL_BRIDGES="$(ip -o link show 2>/dev/null | awk -F': ' '$2 ~ /^vmbr[[:alnum:]_.-]*$/ {print $2}' | sort -u | awk 'BEGIN{first=1} {if (!first) printf ", "; printf "%s",$0; first=0} END{if (first) printf "n/a"; printf "\n"}')"
+AVAIL_BRIDGES="${AVAIL_BRIDGES//$'\n'/}"
 
 # ── Show defaults & confirm ───────────────────────────────────────────────────
 cat <<EOF2
