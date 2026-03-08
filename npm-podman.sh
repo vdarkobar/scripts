@@ -17,10 +17,10 @@ APP_TZ="Europe/Berlin"
 TAGS="npm;podman;lxc"
 
 # Images / versions
+NPM_IMAGE_REPO="docker.io/jc21/nginx-proxy-manager"
 NPM_TAG="2.14.0"
-NPM_IMAGE="docker.io/jc21/nginx-proxy-manager:${NPM_TAG}"
+DB_IMAGE_REPO="docker.io/jc21/mariadb-aria"
 DB_TAG="10.11.5"
-DB_IMAGE="docker.io/jc21/mariadb-aria:${DB_TAG}"
 DEBIAN_VERSION=13
 
 # Optional features / policy
@@ -37,6 +37,8 @@ CLEANUP_ON_FAIL=1
 # Derived
 APP_DIR="/opt/npm"
 BACKUP_DIR="/opt/npm-backups"
+NPM_IMAGE="${NPM_IMAGE_REPO}:${NPM_TAG}"
+DB_IMAGE="${DB_IMAGE_REPO}:${DB_TAG}"
 
 # ── Custom configs created by this script ─────────────────────────────────────
 #   /opt/npm/docker-compose.yml              (Podman compose stack)
@@ -412,9 +414,9 @@ services:
       DB_MYSQL_NAME: npm_db
       DISABLE_IPV6: \${DISABLE_IPV6_ENV}
     volumes:
-      - /opt/npm/data:/data:Z
-      - /opt/npm/letsencrypt:/etc/letsencrypt:Z
-      - /opt/npm/.secrets/mysql_pwd.secret:/run/secrets/mysql_pwd:ro,Z
+      - ${APP_DIR}/data:/data:Z
+      - ${APP_DIR}/letsencrypt:/etc/letsencrypt:Z
+      - ${APP_DIR}/.secrets/mysql_pwd.secret:/run/secrets/mysql_pwd:ro,Z
     depends_on:
       db:
         condition: service_healthy
@@ -437,9 +439,9 @@ services:
       retries: 15
       start_period: 40s
     volumes:
-      - /opt/npm/mysql:/var/lib/mysql:Z
-      - /opt/npm/.secrets/db_root_pwd.secret:/run/secrets/db_root_pwd:ro,Z
-      - /opt/npm/.secrets/mysql_pwd.secret:/run/secrets/mysql_pwd:ro,Z
+      - ${APP_DIR}/mysql:/var/lib/mysql:Z
+      - ${APP_DIR}/.secrets/db_root_pwd.secret:/run/secrets/db_root_pwd:ro,Z
+      - ${APP_DIR}/.secrets/mysql_pwd.secret:/run/secrets/mysql_pwd:ro,Z
 EOF2"
 
 DISABLE_IPV6_ENV=""
@@ -449,8 +451,10 @@ pct exec "$CT_ID" -- bash -lc "
   set -euo pipefail
   cat > '${APP_DIR}/.env' <<EOF2
 COMPOSE_PROJECT_NAME=npm
+NPM_IMAGE_REPO=${NPM_IMAGE_REPO}
 NPM_TAG=${NPM_TAG}
 NPM_IMAGE=${NPM_IMAGE}
+DB_IMAGE_REPO=${DB_IMAGE_REPO}
 DB_TAG=${DB_TAG}
 DB_IMAGE=${DB_IMAGE}
 NPM_ADMIN_PORT=${NPM_ADMIN_PORT}
@@ -492,7 +496,9 @@ usage() {
     $0 version
 
   Notes:
-    - backup stops the stack for a consistent operational app-state backup, then starts it again
+    - backup stops the stack for a consistent snapshot, then restarts it
+    - backup scope: .env, docker-compose.yml, .secrets/, data/, letsencrypt/, mysql/
+      (PBS handles CT-level backup; this helper makes restore self-contained)
     - update backs up first, then changes only the NPM app image tag
     - auto-update obeys AUTO_UPDATE and TRACK_LATEST from ${ENV_FILE}
     - DB image changes are intentionally manual
@@ -511,6 +517,10 @@ fi
 
 current_image() {
   awk -F= '/^NPM_IMAGE=/{print $2}' "$ENV_FILE" | tail -n1
+}
+
+current_repo() {
+  awk -F= '/^NPM_IMAGE_REPO=/{print $2}' "$ENV_FILE" | tail -n1
 }
 
 current_tag() {
@@ -576,13 +586,14 @@ backup_stack() {
   trap 'if [[ $started -eq 1 ]]; then systemctl start "$SERVICE" || true; fi' RETURN
 
   echo "  Creating backup: $out"
+  app_rel="${APP_DIR#/}"
   tar -C / -czf "$out" \
-    opt/npm/.env \
-    opt/npm/docker-compose.yml \
-    opt/npm/.secrets \
-    opt/npm/data \
-    opt/npm/letsencrypt \
-    opt/npm/mysql
+    "${app_rel}/.env" \
+    "${app_rel}/docker-compose.yml" \
+    "${app_rel}/.secrets" \
+    "${app_rel}/data" \
+    "${app_rel}/letsencrypt" \
+    "${app_rel}/mysql"
 
   if [[ "$KEEP_BACKUPS" =~ ^[0-9]+$ ]] && (( KEEP_BACKUPS > 0 )); then
     ls -1t "$BACKUP_DIR"/npm-backup-*.tar.gz 2>/dev/null | awk -v keep="$KEEP_BACKUPS" 'NR>keep' | xargs -r rm -f --
@@ -629,8 +640,10 @@ update_npm() {
 
   old_image="$(current_image)"
   old_tag="$(current_tag)"
+  repo="$(current_repo)"
   [[ -n "$old_image" ]] || die "Could not read current NPM_IMAGE from .env"
-  new_image="docker.io/jc21/nginx-proxy-manager:$new_tag"
+  [[ -n "$repo" ]] || die "Could not read NPM_IMAGE_REPO from .env"
+  new_image="${repo}:${new_tag}"
   tmp_env="$(mktemp)"
 
   echo "  Current NPM tag: $old_tag"
@@ -732,6 +745,45 @@ EOF2
   systemctl enable --now npm-stack.service
 '
 
+# ── Cloudflare Tunnel (optional) ──────────────────────────────────────────────
+if [[ "$INSTALL_CLOUDFLARED" -eq 1 && -n "$TUNNEL_TOKEN" ]]; then
+  echo "  Installing Cloudflare Tunnel ..."
+
+  pct exec "$CT_ID" -- bash -lc '
+    set -euo pipefail
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get install -y curl gnupg ca-certificates
+
+    mkdir -p --mode=0755 /usr/share/keyrings
+    curl -fsSL https://pkg.cloudflare.com/cloudflare-public-v2.gpg \
+      | tee /usr/share/keyrings/cloudflare-public-v2.gpg >/dev/null
+
+    echo "deb [signed-by=/usr/share/keyrings/cloudflare-public-v2.gpg] https://pkg.cloudflare.com/cloudflared any main" \
+      > /etc/apt/sources.list.d/cloudflared.list
+
+    apt-get update -qq
+    apt-get install -y cloudflared
+    cloudflared --version
+  '
+
+  pct exec "$CT_ID" -- bash -lc "cloudflared service install '${TUNNEL_TOKEN}'"
+  pct exec "$CT_ID" -- bash -lc '
+    set -euo pipefail
+    systemctl daemon-reload
+    systemctl enable cloudflared
+    systemctl start cloudflared
+  '
+
+  sleep 3
+  if pct exec "$CT_ID" -- systemctl is-active --quiet cloudflared 2>/dev/null; then
+    echo "  Cloudflared service is running"
+  else
+    echo "  WARNING: Cloudflared service may not be running — check: pct exec $CT_ID -- journalctl -u cloudflared" >&2
+  fi
+
+  pct set "$CT_ID" --tags "${TAGS};cloudflared"
+fi
+
 # ── Verification ──────────────────────────────────────────────────────────────
 sleep 3
 if pct exec "$CT_ID" -- systemctl is-active --quiet npm-stack.service 2>/dev/null; then
@@ -820,8 +872,7 @@ Unattended-Upgrade::Origins-Pattern {
         "origin=Debian,codename=${distro_codename},label=Debian";
         "origin=Debian,codename=${distro_codename}-updates,label=Debian";
 };
-Unattended-Upgrade::Package-Blacklist {
-};
+Unattended-Upgrade::Package-Blacklist {};
 Unattended-Upgrade::AutoFixInterruptedDpkg "true";
 Unattended-Upgrade::MinimalSteps "true";
 Unattended-Upgrade::InstallOnShutdown "false";
@@ -856,45 +907,6 @@ net.ipv4.icmp_ignore_bogus_error_responses = 1
 EOF2
   sysctl --system >/dev/null 2>&1 || true
 '
-
-# ── Cloudflare Tunnel (optional) ──────────────────────────────────────────────
-if [[ "$INSTALL_CLOUDFLARED" -eq 1 && -n "$TUNNEL_TOKEN" ]]; then
-  echo "  Installing Cloudflare Tunnel ..."
-
-  pct exec "$CT_ID" -- bash -lc '
-    set -euo pipefail
-    export DEBIAN_FRONTEND=noninteractive
-    apt-get install -y curl gnupg ca-certificates
-
-    mkdir -p --mode=0755 /usr/share/keyrings
-    curl -fsSL https://pkg.cloudflare.com/cloudflare-public-v2.gpg \
-      | tee /usr/share/keyrings/cloudflare-public-v2.gpg >/dev/null
-
-    echo "deb [signed-by=/usr/share/keyrings/cloudflare-public-v2.gpg] https://pkg.cloudflare.com/cloudflared any main" \
-      > /etc/apt/sources.list.d/cloudflared.list
-
-    apt-get update -qq
-    apt-get install -y cloudflared
-    cloudflared --version
-  '
-
-  pct exec "$CT_ID" -- bash -lc "cloudflared service install '${TUNNEL_TOKEN}'"
-  pct exec "$CT_ID" -- bash -lc '
-    set -euo pipefail
-    systemctl daemon-reload
-    systemctl enable cloudflared
-    systemctl start cloudflared
-  '
-
-  sleep 3
-  if pct exec "$CT_ID" -- systemctl is-active --quiet cloudflared 2>/dev/null; then
-    echo "  Cloudflared service is running"
-  else
-    echo "  WARNING: Cloudflared service may not be running — check: pct exec $CT_ID -- journalctl -u cloudflared" >&2
-  fi
-
-  pct set "$CT_ID" --tags "${TAGS};cloudflared"
-fi
 
 # ── Cleanup packages ──────────────────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc '
