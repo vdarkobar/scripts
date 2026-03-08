@@ -20,7 +20,10 @@ TAGS="privatebin;lxc"
 DEBIAN_VERSION=13
 
 # Behavior
-CLEANUP_ON_FAIL=1  # 1 = destroy CT on error, 0 = keep for debugging
+CLEANUP_ON_FAIL=1                 # 1 = destroy CT on error, 0 = keep for debugging
+ALLOW_CONSOLE_AUTOLOGIN_IF_BLANK=0  # 1 = if PASSWORD is blank, enable root auto-login on Proxmox console
+ENABLE_AUTO_UPDATE=0                # 1 = enable privatebin-update.timer, 0 = install but leave disabled
+DISABLE_IPV6=1                      # 1 = disable IPv6 inside CT, 0 = leave IPv6 sysctls untouched
 
 # ── Custom configs created by this script ─────────────────────────────────────
 #   /opt/privatebin/                         (application root)
@@ -100,6 +103,9 @@ cat <<EOF
   Debian:            $DEBIAN_VERSION
   Tags:              $TAGS
   Cleanup on fail:   $CLEANUP_ON_FAIL
+  Auto-login blank:  $ALLOW_CONSOLE_AUTOLOGIN_IF_BLANK
+  Auto-update:       $ENABLE_AUTO_UPDATE
+  Disable IPv6:      $DISABLE_IPV6
   ────────────────────────────────────────
   To change defaults, press Enter and
   edit the Config section at the top of
@@ -139,7 +145,7 @@ ip link show "$BRIDGE" >/dev/null 2>&1 \
 # ── Root password ─────────────────────────────────────────────────────────────
 PASSWORD=""
 while true; do
-  read -r -s -p "  Set root password (blank = auto-login): " PW1; echo
+  read -r -s -p "  Set root password (blank = no password): " PW1; echo
   [[ -z "$PW1" ]] && break
   if [[ "$PW1" == *" "* ]]; then echo "  Password cannot contain spaces."; continue; fi
   if [[ ${#PW1} -lt 5 ]]; then echo "  Password must be at least 5 characters."; continue; fi
@@ -149,7 +155,11 @@ while true; do
 done
 echo ""
 if [[ -z "$PASSWORD" ]]; then
-  echo "  WARNING: Blank password enables root auto-login on the Proxmox console."
+  if [[ "$ALLOW_CONSOLE_AUTOLOGIN_IF_BLANK" -eq 1 ]]; then
+    echo "  WARNING: Blank password will enable root auto-login on the Proxmox console."
+  else
+    echo "  WARNING: Blank password selected. Console root auto-login remains disabled."
+  fi
   echo ""
 fi
 
@@ -203,8 +213,8 @@ done
 [[ -n "$CT_IP" ]] || { echo "  ERROR: No IPv4 address acquired via DHCP within timeout." >&2; exit 1; }
 echo "  CT $CT_ID is up — IP: $CT_IP"
 
-# ── Auto-login (if no password) ───────────────────────────────────────────────
-if [[ -z "$PASSWORD" ]]; then
+# ── Auto-login (explicit opt-in if no password) ──────────────────────────────
+if [[ -z "$PASSWORD" && "$ALLOW_CONSOLE_AUTOLOGIN_IF_BLANK" -eq 1 ]]; then
   pct exec "$CT_ID" -- bash -lc '
     set -euo pipefail
     mkdir -p /etc/systemd/system/container-getty@1.service.d
@@ -415,9 +425,9 @@ usage() {
   ──────────────────────
   Usage:
     $0 update            Download latest + preserve config/data
-    $0 backup            Create timestamped backup
+    $0 backup            Create full /opt/privatebin backup archive
     $0 list-backups      Show available backups
-    $0 restore <file>    Restore from backup archive
+    $0 restore <file>    Restore from full app backup archive
     $0 restore-latest    Restore most recent backup
     $0 purge             Remove expired pastes + empty dirs
     $0 stats             Show paste statistics
@@ -441,7 +451,7 @@ do_backup() {
   ts="$(date +%Y%m%d-%H%M%S)"
   backup="$BACKUP_DIR/privatebin-${ts}.tgz"
 
-  echo "  Creating backup: $backup"
+  echo "  Creating full app backup archive: $backup"
   tar -C "$(dirname "$APP_DIR")" -czf "$backup" "$(basename "$APP_DIR")"
   echo "  OK: $backup"
 }
@@ -480,7 +490,7 @@ do_restore() {
   systemctl start "$FPM_SERVICE"
   systemctl start nginx
 
-  echo "  OK: Restored to $APP_DIR"
+  echo "  OK: Restored full app backup to $APP_DIR"
 }
 
 do_update() {
@@ -615,9 +625,17 @@ WantedBy=timers.target
 EOF
 
   systemctl daemon-reload
-  systemctl enable --now privatebin-update.timer
 '
-echo "  Auto-update timer enabled (1st + 15th of each month)"
+if [[ "$ENABLE_AUTO_UPDATE" -eq 1 ]]; then
+  pct exec "$CT_ID" -- bash -lc 'set -euo pipefail; systemctl enable --now privatebin-update.timer'
+  echo "  Auto-update timer enabled (1st + 15th of each month)"
+else
+  pct exec "$CT_ID" -- bash -lc '
+    set -euo pipefail
+    systemctl disable --now privatebin-update.timer 2>/dev/null || true
+  '
+  echo "  Auto-update timer installed but disabled (set ENABLE_AUTO_UPDATE=1 to enable)"
+fi
 
 # ── Purge timer (daily cleanup of expired pastes) ─────────────────────────────
 pct exec "$CT_ID" -- bash -lc '
@@ -697,10 +715,20 @@ net.ipv4.conf.all.accept_source_route = 0
 net.ipv4.conf.default.accept_source_route = 0
 net.ipv4.icmp_echo_ignore_broadcasts = 1
 net.ipv4.icmp_ignore_bogus_error_responses = 1
+EOF
+'
+if [[ "$DISABLE_IPV6" -eq 1 ]]; then
+  pct exec "$CT_ID" -- bash -lc '
+    set -euo pipefail
+    cat >> /etc/sysctl.d/99-hardening.conf <<EOF
 net.ipv6.conf.all.disable_ipv6 = 1
 net.ipv6.conf.default.disable_ipv6 = 1
 net.ipv6.conf.lo.disable_ipv6 = 1
 EOF
+  '
+fi
+pct exec "$CT_ID" -- bash -lc '
+  set -euo pipefail
   sysctl --system >/dev/null 2>&1 || true
 '
 
@@ -746,8 +774,12 @@ printf '    App dir:       /opt/privatebin\n'
 printf '    PHP:           %s\n' \"\$php_ver\"
 printf '    Nginx:         %s\n' \"\$nginx_active\"
 printf '    PHP-FPM:       %s\n' \"\$fpm_active\"
-timer_next=\$(systemctl list-timers privatebin-update.timer --no-pager 2>/dev/null | awk 'NR==2{for(i=1;i<=NF;i++) if(\$i ~ /^[0-9]{4}-/) {printf \"%s %s\", \$i, \$(i+1); break}}' || echo 'n/a')
-printf '    Auto-update:   %s\n' \"\${timer_next:-enabled}\"
+if systemctl is-enabled privatebin-update.timer >/dev/null 2>&1; then
+  timer_next=\$(systemctl list-timers --all privatebin-update.timer --no-pager 2>/dev/null | awk 'NR==2{for(i=1;i<=NF;i++) if(\$i ~ /^[0-9]{4}-/) {printf \"%s %s\", \$i, \$(i+1); break}}')
+  printf '    Auto-update:   %s\n' \"\${timer_next:-enabled}\"
+else
+  printf '    Auto-update:   disabled\n'
+fi
 purge_active=\$(systemctl is-active privatebin-purge.timer 2>/dev/null || echo 'unknown')
 printf '    Purge timer:   %s (daily)\n' \"\$purge_active\"
 printf '    Web UI:        https://%s/\n' \"\$(ip -4 -o addr show scope global 2>/dev/null | awk '{print \$4}' | cut -d/ -f1 | head -n1)\"
@@ -781,7 +813,7 @@ pct exec "$CT_ID" -- bash -lc '
 DESC="<a href='https://${CT_IP}/' target='_blank' rel='noopener noreferrer' style='text-decoration: none; color: #00617f;'>PrivateBin Web UI</a>
 <details><summary>Details</summary>PrivateBin on Debian ${DEBIAN_VERSION} LXC
 PHP ${PHP_VERSION} + Nginx (native, self-signed TLS)
-Maintenance: privatebin-maint.sh
+Maintenance: pct exec ${CT_ID} -- bash -lc 'privatebin-maint.sh {command}'
 Created by privatebin.sh</details>"
 pct set "$CT_ID" --description "$DESC"
 
@@ -790,12 +822,14 @@ pct set "$CT_ID" --protection 1
 
 # ── Summary ───────────────────────────────────────────────────────────────────
 echo ""
-echo "  CT: $CT_ID | IP: ${CT_IP} | Web UI: https://${CT_IP}/ | Login: $([ -n "$PASSWORD" ] && echo 'password set' || echo 'auto-login')"
-echo "  Maintenance: pct exec $CT_ID -- privatebin-maint.sh {update|backup|restore|list-backups|restore-latest}"
+if [[ -n "$PASSWORD" ]]; then
+  LOGIN_STATE="password set"
+elif [[ "$ALLOW_CONSOLE_AUTOLOGIN_IF_BLANK" -eq 1 ]]; then
+  LOGIN_STATE="console auto-login"
+else
+  LOGIN_STATE="no password"
+fi
+echo "  CT: $CT_ID | IP: ${CT_IP} | Web UI: https://${CT_IP}/ | Login: ${LOGIN_STATE}"
+echo "  Maintenance: pct exec $CT_ID -- bash -lc 'privatebin-maint.sh {update|backup|restore|list-backups|restore-latest}'"
 echo ""
-
-# ── Reboot ────────────────────────────────────────────────────────────────────
-pct stop "$CT_ID"
-sleep 2
-pct start "$CT_ID"
 echo "  Done."
