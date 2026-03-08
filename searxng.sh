@@ -23,7 +23,8 @@ SEARXNG_SETTINGS_PATH="/etc/searxng/settings.yml"
 ENABLE_AUTO_UPDATE=0
 ALLOW_CONSOLE_AUTOLOGIN_IF_BLANK=0
 
-DEBIAN_VERSION=13
+DEBIAN_VERSION=13        # Trixie required — valkey is not in Bookworm main
+DEBIAN_CODENAME="trixie" # must match DEBIAN_VERSION
 
 # Behavior
 CLEANUP_ON_FAIL=1
@@ -43,6 +44,7 @@ CLEANUP_ON_FAIL=1
 # ── Config validation ─────────────────────────────────────────────────────────
 [[ -n "$CT_ID" ]] || { echo "  ERROR: Could not obtain next CT ID." >&2; exit 1; }
 [[ "$DEBIAN_VERSION" =~ ^[0-9]+$ ]] || { echo "  ERROR: DEBIAN_VERSION must be numeric." >&2; exit 1; }
+[[ -n "$DEBIAN_CODENAME" ]] || { echo "  ERROR: DEBIAN_CODENAME must not be empty." >&2; exit 1; }
 [[ "$APP_PORT" =~ ^[0-9]+$ ]] || { echo "  ERROR: APP_PORT must be numeric." >&2; exit 1; }
 (( APP_PORT >= 1 && APP_PORT <= 65535 )) || { echo "  ERROR: APP_PORT must be between 1 and 65535." >&2; exit 1; }
 [[ "$ENABLE_AUTO_UPDATE" =~ ^[01]$ ]] || { echo "  ERROR: ENABLE_AUTO_UPDATE must be 0 or 1." >&2; exit 1; }
@@ -281,10 +283,10 @@ PY
 pct exec "$CT_ID" -- bash -lc "
   set -euo pipefail
 
-  cat > /etc/apt/sources.list.d/backports.sources <<'EOF2'
+  cat > /etc/apt/sources.list.d/backports.sources <<EOF2
 Types: deb
 URIs: http://deb.debian.org/debian
-Suites: trixie-backports
+Suites: ${DEBIAN_CODENAME}-backports
 Components: main
 EOF2
 
@@ -687,23 +689,23 @@ printf '  Uptime:    %s\n' "$(uptime -p 2>/dev/null || uptime)"
 printf '  Disk:      %s\n' "$(df -h / | awk 'NR==2{printf "%s/%s (%s used)", $3, $2, $5}')"
 MOTD
 
-pct exec "$CT_ID" -- bash -lc 'cat > /etc/update-motd.d/30-app && chmod 0755 /etc/update-motd.d/30-app' <<'MOTD'
+pct exec "$CT_ID" -- bash -lc 'cat > /etc/update-motd.d/30-app && chmod 0755 /etc/update-motd.d/30-app' <<MOTD
 #!/bin/sh
-service_active=$(systemctl is-active searxng 2>/dev/null || echo 'unknown')
-valkey_active=$(systemctl is-active valkey-server 2>/dev/null || echo 'unknown')
-ip=$(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -n1)
-timer_next=$(systemctl list-timers searxng-update.timer --no-pager 2>/dev/null | awk 'NR==2{for(i=1;i<=NF;i++) if($i ~ /^[0-9]{4}-/) {printf "%s %s", $i, $(i+1); break}}')
-[ -n "$timer_next" ] || timer_next='disabled'
+service_active=\$(systemctl is-active searxng 2>/dev/null || echo 'unknown')
+valkey_active=\$(systemctl is-active valkey-server 2>/dev/null || echo 'unknown')
+ip=\$(ip -4 -o addr show scope global 2>/dev/null | awk '{print \$4}' | cut -d/ -f1 | head -n1)
+timer_next=\$(systemctl list-timers searxng-update.timer --no-pager 2>/dev/null | awk 'NR==2{for(i=1;i<=NF;i++) if(\$i ~ /^[0-9]{4}-/) {printf "%s %s", \$i, \$(i+1); break}}')
+[ -n "\$timer_next" ] || timer_next='disabled'
 printf '\n'
 printf '  SearXNG:\n'
 printf '    App dir:         /usr/local/searxng\n'
 printf '    Source:          /usr/local/searxng/searxng-src\n'
 printf '    Venv:            /usr/local/searxng/searx-pyenv\n'
 printf '    Settings:        /etc/searxng/settings.yml\n'
-printf '    Service:         %s\n' "$service_active"
-printf '    Valkey:          %s\n' "$valkey_active"
-printf '    Auto-update:     %s\n' "${timer_next}"
-printf '    Web UI (local):  http://%s:8888/\n' "${ip:-n/a}"
+printf '    Service:         %s\n' "\$service_active"
+printf '    Valkey:          %s\n' "\$valkey_active"
+printf '    Auto-update:     %s\n' "\${timer_next}"
+printf '    Web UI (local):  http://%s:${APP_PORT}/\n' "\${ip:-n/a}"
 printf '\n'
 printf '  Maintenance:\n'
 printf '    /usr/local/bin/searxng-maint.sh [backup|list|restore|update|version]\n'
