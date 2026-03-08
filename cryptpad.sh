@@ -21,8 +21,8 @@ APP_TZ="Europe/Berlin"
 TAGS="cryptpad;lxc"
 
 # Domains
-DOMAIN_NAME="example.com"              # empty = local IP only mode
-SANDBOX_DOMAIN="sandbox-cryptpad"      # subdomain prefix for XSS isolation sandbox
+DOMAIN_NAME=""                         # base domain only — cryptpad. prefix added automatically; empty = local IP only mode
+SANDBOX_DOMAIN="sandbox-cryptpad"      # sandbox subdomain prefix — FQDN = ${SANDBOX_DOMAIN}.${DOMAIN_NAME}
 
 # Optional features
 INSTALL_ONLYOFFICE=0                   # 1 = install OnlyOffice components
@@ -62,13 +62,7 @@ trap 'rc=$?;
   exit "$rc"
 ' INT TERM
 
-# ── Preflight — root & commands ───────────────────────────────────────────────
-[[ "$(id -u)" -eq 0 ]] || { echo "  ERROR: Run as root on the Proxmox host." >&2; exit 1; }
-
-for cmd in pvesh pveam pct pvesm curl python3 ip awk sort paste; do
-  command -v "$cmd" >/dev/null 2>&1 || { echo "  ERROR: Missing required command: $cmd" >&2; exit 1; }
-done
-
+# ── Config validation ─────────────────────────────────────────────────────────
 [[ -n "$CT_ID" ]] || { echo "  ERROR: Could not obtain next CT ID." >&2; exit 1; }
 [[ "$DEBIAN_VERSION" =~ ^[0-9]+$ ]] || { echo "  ERROR: DEBIAN_VERSION must be numeric." >&2; exit 1; }
 [[ "$NODE_VERSION" =~ ^[0-9]+$ ]] || { echo "  ERROR: NODE_VERSION must be numeric." >&2; exit 1; }
@@ -77,13 +71,21 @@ done
   exit 1
 }
 
-# ── Show defaults & confirm ───────────────────────────────────────────────────
+# ── Preflight — root & commands ───────────────────────────────────────────────
+[[ "$(id -u)" -eq 0 ]] || { echo "  ERROR: Run as root on the Proxmox host." >&2; exit 1; }
+
+for cmd in pvesh pveam pct pvesm curl python3 ip awk sort paste; do
+  command -v "$cmd" >/dev/null 2>&1 || { echo "  ERROR: Missing required command: $cmd" >&2; exit 1; }
+done
+
+# ── Discover available resources ──────────────────────────────────────────────
 AVAIL_TMPL_STORES="$(pvesh get /storage --output-format json 2>/dev/null \
   | python3 -c "import sys,json; print(', '.join(sorted(s['storage'] for s in json.load(sys.stdin) if 'vztmpl' in s.get('content',''))))" 2>/dev/null || echo "n/a")"
 AVAIL_CT_STORES="$(pvesh get /storage --output-format json 2>/dev/null \
   | python3 -c "import sys,json; print(', '.join(sorted(s['storage'] for s in json.load(sys.stdin) if 'rootdir' in s.get('content','') or 'images' in s.get('content',''))))" 2>/dev/null || echo "n/a")"
 AVAIL_BRIDGES="$(ip -o link show type bridge 2>/dev/null | awk -F': ' '{print $2}' | sort | paste -sd', ' || echo "n/a")"
 
+# ── Show defaults & confirm ───────────────────────────────────────────────────
 cat <<EOF
 
   CryptPad LXC Creator — Configuration
@@ -104,8 +106,8 @@ cat <<EOF
   WebSocket port:    $WS_PORT
   OnlyOffice:        $([ "$INSTALL_ONLYOFFICE" -eq 1 ] && echo "yes" || echo "no")
   Auto-update:       $([ "$ENABLE_AUTO_UPDATE" -eq 1 ] && echo "enabled" || echo "disabled")
-  Domain:            ${DOMAIN_NAME:-"(not set — local IP only mode)"}
-  Sandbox domain:    ${SANDBOX_FQDN:-"(not set — local safe port mode)"}
+  Domain (main):     ${MAIN_FQDN:-"(not set — local IP only mode)"}
+  Domain (sandbox):  ${SANDBOX_FQDN:-"(not set — local safe port mode)"}
   Timezone:          $APP_TZ
   Tags:              $TAGS
   Cleanup on fail:   $CLEANUP_ON_FAIL
@@ -293,7 +295,6 @@ pct exec "$CT_ID" -- bash -lc "
   rm -rf /opt/cryptpad.new
   git clone -b '${CRYPTPAD_TAG}' --depth 1 https://github.com/cryptpad/cryptpad.git /opt/cryptpad.new
   cd /opt/cryptpad.new
-  git checkout '${CRYPTPAD_TAG}'
 
   install -d -o cryptpad -g cryptpad -m 0750 /opt/cryptpad
   cp -a /opt/cryptpad.new/. /opt/cryptpad/
@@ -349,7 +350,7 @@ if '//httpAddress: \\'localhost\\',' in text:
     text = text.replace(\"//httpAddress: 'localhost',\", \"httpAddress: '0.0.0.0',\", 1)
 if '//httpPort: 3000,' in text:
     text = text.replace('//httpPort: 3000,', 'httpPort: ${APP_PORT},', 1)
-if '//httpSafePort: 3001,' in text:
+if not '${SANDBOX_FQDN}' and '//httpSafePort: 3001,' in text:
     text = text.replace('//httpSafePort: 3001,', 'httpSafePort: ${SAFE_PORT},', 1)
 if '// websocketPort: 3003,' in text:
     text = text.replace('// websocketPort: 3003,', 'websocketPort: ${WS_PORT},', 1)
@@ -541,10 +542,8 @@ do_update() {
   echo \"  Downloading CryptPad tag \$CRYPTPAD_TAG ...\"
   git clone -b \"\$CRYPTPAD_TAG\" --depth 1 https://github.com/cryptpad/cryptpad.git \"\$new_dir\"
   cd \"\$new_dir\"
-  git checkout \"\$CRYPTPAD_TAG\"
 
   echo '  Restoring persistent paths'
-  install -d \"\$new_dir/config\" \"\$new_dir/customize\" \"\$new_dir/data\" \"\$new_dir/datastore\" \"\$new_dir/blob\" \"\$new_dir/block\"
   rm -rf \"\$new_dir/config\" \"\$new_dir/customize\" \"\$new_dir/data\" \"\$new_dir/datastore\" \"\$new_dir/blob\" \"\$new_dir/block\"
   cp -a \"\$APP_DIR/config\" \"\$new_dir/config\"
   cp -a \"\$APP_DIR/customize\" \"\$new_dir/customize\"
@@ -848,6 +847,10 @@ fi
 
 echo "  Maintenance:"
 echo "    pct exec $CT_ID -- cryptpad-maint.sh update"
+echo ""
+echo "  NOTE: npm build steps require more RAM than normal operation."
+echo "    If update OOMs at ${RAM} MiB, bump CT memory before running:"
+echo "    pct set $CT_ID --memory 4096  # then restore after update"
 echo ""
 echo "  Known issue (OnlyOffice Document editor):"
 echo "    Some installs may freeze after typing if inner.js still uses"
