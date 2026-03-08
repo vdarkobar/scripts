@@ -29,20 +29,27 @@ DEBIAN_VERSION=13
 #   pct exec <CT_ID> -- smbpasswd -a <username>
 #   pct exec <CT_ID> -- smbpasswd -e <username>
 
+# Optional features
+ALLOW_CONSOLE_AUTOLOGIN_IF_BLANK=0
+DISABLE_IPV6=0
+
 # Behavior
 CLEANUP_ON_FAIL=1  # 1 = destroy CT on error, 0 = keep for debugging
 
 # ── Custom configs created by this script ─────────────────────────────────────
+#   /etc/samba/smb.conf
 #   /etc/update-motd.d/00-header
 #   /etc/update-motd.d/10-sysinfo
 #   /etc/update-motd.d/30-app
 #   /etc/update-motd.d/99-footer
-#   /etc/systemd/system/container-getty@1.service.d/override.conf
+#   /etc/systemd/system/container-getty@1.service.d/override.conf  (optional: blank pw + ALLOW_CONSOLE_AUTOLOGIN_IF_BLANK=1)
 #   /etc/apt/apt.conf.d/52unattended-<hostname>.conf
+#   /etc/apt/apt.conf.d/20auto-upgrades
 #   /etc/sysctl.d/99-hardening.conf
 
 # ── Validate config values (guard against sed injection) ──────────────────────
 fail=""
+[[ "$APP_TZ"             =~ ^[A-Za-z0-9._+-]+(/[A-Za-z0-9._+-]+)+$ ]] || fail="APP_TZ"
 [[ "$SMB_WORKGROUP"      =~ ^[A-Za-z0-9._-]+$ ]]     || fail="SMB_WORKGROUP"
 [[ "$SMB_SERVER_NAME"    =~ ^[A-Za-z0-9._-]+$ ]]     || fail="SMB_SERVER_NAME"
 [[ "$SMB_SHARE_NAME"     =~ ^[A-Za-z0-9_-]+$ ]]      || fail="SMB_SHARE_NAME"
@@ -82,11 +89,12 @@ trap 'rc=$?;
 # ── Preflight — root & commands ───────────────────────────────────────────────
 [[ "$(id -u)" -eq 0 ]] || { echo "  ERROR: Run as root on the Proxmox host." >&2; exit 1; }
 
-for cmd in pvesh pveam pct pvesm; do
+for cmd in pvesh pveam pct pvesm curl python3 ip awk sort paste; do
   command -v "$cmd" >/dev/null 2>&1 || { echo "  ERROR: Missing required command: $cmd" >&2; exit 1; }
 done
 
 [[ -n "$CT_ID" ]] || { echo "  ERROR: Could not obtain next CT ID." >&2; exit 1; }
+[[ "$DEBIAN_VERSION" =~ ^[0-9]+$ ]] || { echo "  ERROR: DEBIAN_VERSION must be numeric." >&2; exit 1; }
 
 # ── Discover available resources ──────────────────────────────────────────────
 AVAIL_BRIDGES="$(ip -o link show type bridge 2>/dev/null | awk -F': ' '{print $2}' | sort | paste -sd', ' || echo "n/a")"
@@ -160,7 +168,7 @@ ip link show "$BRIDGE" >/dev/null 2>&1 || { echo "  ERROR: Bridge not found: $BR
 # ── Root password ─────────────────────────────────────────────────────────────
 PASSWORD=""
 while true; do
-  read -r -s -p "  Set root password (blank = auto-login): " PW1; echo
+  read -r -s -p "  Set root password (blank allowed): " PW1; echo
   [[ -z "$PW1" ]] && break
   if [[ "$PW1" == *" "* ]]; then echo "  Password cannot contain spaces."; continue; fi
   if [[ ${#PW1} -lt 5 ]]; then echo "  Password must be at least 5 characters."; continue; fi
@@ -171,7 +179,8 @@ done
 echo ""
 
 if [[ -z "$PASSWORD" ]]; then
-  echo "  WARNING: Blank password enables root auto-login on the Proxmox console."
+  echo "  WARNING: No root password was set."
+  [[ "$ALLOW_CONSOLE_AUTOLOGIN_IF_BLANK" -eq 1 ]] && echo "  WARNING: Console auto-login is enabled by configuration."
   echo ""
 fi
 
@@ -201,7 +210,6 @@ echo ""
 # ── Template discovery & download ─────────────────────────────────────────────
 pveam update
 echo ""
-[[ "$DEBIAN_VERSION" =~ ^[0-9]+$ ]] || { echo "  ERROR: DEBIAN_VERSION must be numeric." >&2; exit 1; }
 
 TEMPLATE="$(pveam available -section system | awk -v p="debian-${DEBIAN_VERSION}" '$2 ~ ("^" p) {print $2}' | sort -V | tail -n1)"
 if [[ -z "$TEMPLATE" ]]; then
@@ -251,7 +259,7 @@ done
 [[ -n "$CT_IP" ]] || { echo "  ERROR: No IPv4 address acquired via DHCP within timeout." >&2; exit 1; }
 
 # ── Auto-login (if no password) ───────────────────────────────────────────────
-if [[ -z "$PASSWORD" ]]; then
+if [[ -z "$PASSWORD" && "${ALLOW_CONSOLE_AUTOLOGIN_IF_BLANK}" -eq 1 ]]; then
   pct exec "$CT_ID" -- bash -lc '
     set -euo pipefail
     mkdir -p /etc/systemd/system/container-getty@1.service.d
@@ -426,7 +434,9 @@ pct exec "$CT_ID" -- bash -lc "
 if pct exec "$CT_ID" -- testparm -s /etc/samba/smb.conf >/dev/null 2>&1; then
   echo "  Configuration validation passed"
 else
-  echo "  WARNING: Configuration validation had warnings (may still work)"
+  echo "  ERROR: smb.conf validation failed" >&2
+  pct exec "$CT_ID" -- testparm -s /etc/samba/smb.conf >&2 || true
+  exit 1
 fi
 
 # ── Start services ────────────────────────────────────────────────────────────
@@ -443,6 +453,13 @@ if pct exec "$CT_ID" -- systemctl is-active --quiet smbd 2>/dev/null; then
   echo "  Samba service is running"
 else
   echo "  WARNING: Samba service may not have started." >&2
+  pct exec "$CT_ID" -- journalctl -u smbd --no-pager -n 20 >&2 || true
+fi
+
+if pct exec "$CT_ID" -- sh -lc "ss -ltn 2>/dev/null | grep -q ':445 '" 2>/dev/null; then
+  echo "  SMB port 445 is listening"
+else
+  echo "  WARNING: SMB port 445 is not listening." >&2
   pct exec "$CT_ID" -- journalctl -u smbd --no-pager -n 20 >&2 || true
 fi
 
@@ -491,9 +508,10 @@ EOF
 '
 
 # ── Sysctl hardening ──────────────────────────────────────────────────────────
-pct exec "$CT_ID" -- bash -lc '
+pct exec "$CT_ID" -- bash -lc "
   set -euo pipefail
-  cat > /etc/sysctl.d/99-hardening.conf <<EOF
+  {
+    cat <<'EOF'
 net.ipv4.conf.all.rp_filter = 1
 net.ipv4.conf.default.rp_filter = 1
 net.ipv4.conf.all.accept_redirects = 0
@@ -504,12 +522,17 @@ net.ipv4.conf.all.accept_source_route = 0
 net.ipv4.conf.default.accept_source_route = 0
 net.ipv4.icmp_echo_ignore_broadcasts = 1
 net.ipv4.icmp_ignore_bogus_error_responses = 1
+EOF
+    if [[ '${DISABLE_IPV6}' -eq 1 ]]; then
+      cat <<'EOF'
 net.ipv6.conf.all.disable_ipv6 = 1
 net.ipv6.conf.default.disable_ipv6 = 1
 net.ipv6.conf.lo.disable_ipv6 = 1
 EOF
+    fi
+  } > /etc/sysctl.d/99-hardening.conf
   sysctl --system >/dev/null 2>&1 || true
-'
+"
 
 # ── Cleanup packages ──────────────────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc '
@@ -588,16 +611,10 @@ pct set "$CT_ID" --protection 1
 
 # ── Summary ───────────────────────────────────────────────────────────────────
 echo ""
-echo "CT: $CT_ID | IP: ${CT_IP} | SMB: \\\\${CT_IP}\\${SMB_SHARE_NAME} | User: ${SMB_USER:-none} | Login: $([ -n "$PASSWORD" ] && echo 'password set' || echo 'auto-login')"
+echo "CT: $CT_ID | IP: ${CT_IP} | SMB: \\\\${CT_IP}\\${SMB_SHARE_NAME} | User: ${SMB_USER:-none} | Login: $([ -n "$PASSWORD" ] && echo 'password set' || { [ "${ALLOW_CONSOLE_AUTOLOGIN_IF_BLANK}" -eq 1 ] && echo 'no password + console autologin' || echo 'no password set'; })"
 echo ""
 echo "  Add more Samba users:"
 echo "    pct exec $CT_ID -- useradd -M -s /usr/sbin/nologin -G $SMB_GROUP <username>"
 echo "    pct exec $CT_ID -- smbpasswd -a <username>"
 echo "    pct exec $CT_ID -- smbpasswd -e <username>"
-echo ""
-
-# ── Reboot CT so all settings take effect cleanly ─────────────────────────────
-echo "  Rebooting container..."
-pct reboot "$CT_ID"
-echo "  Done."
 echo ""
