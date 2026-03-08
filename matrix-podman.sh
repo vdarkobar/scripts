@@ -18,32 +18,74 @@ SYNAPSE_PORT=8008
 ELEMENT_PORT=8080
 TAGS="matrix;podman;lxc"
 
-# Images (pin here if you want)
-SYNAPSE_IMAGE="ghcr.io/element-hq/synapse:latest"
+# Images / versions
+SYNAPSE_IMAGE_REPO="ghcr.io/element-hq/synapse"
+SYNAPSE_TAG="v1.148.0"
+SYNAPSE_IMAGE="${SYNAPSE_IMAGE_REPO}:${SYNAPSE_TAG}"
 POSTGRES_IMAGE="docker.io/library/postgres:18-alpine"
-ELEMENT_IMAGE="docker.io/vectorim/element-web:latest"
+ELEMENT_IMAGE_REPO="docker.io/vectorim/element-web"
+ELEMENT_TAG="v1.12.11"
+ELEMENT_IMAGE="${ELEMENT_IMAGE_REPO}:${ELEMENT_TAG}"
 REDIS_IMAGE="docker.io/library/redis:8-alpine"
 DEBIAN_VERSION=13
 
+# Optional features
+AUTO_UPDATE=0                        # 1 = enable timer-driven maintenance/update runs
+TRACK_LATEST=0                       # 1 = auto-update follows :latest for Synapse + Element
+ALLOW_CONSOLE_AUTOLOGIN_IF_BLANK=0   # 1 = enable root console autologin when password blank
+KEEP_BACKUPS=7
+
 # Behavior
-CLEANUP_ON_FAIL=1  # 1 = destroy CT on error, 0 = keep for debugging
+CLEANUP_ON_FAIL=1
+
+# Derived
+APP_DIR="/opt/matrix"
+BACKUP_DIR="/opt/matrix-backups"
+SYNAPSE_FQDN="matrix.${MATRIX_DOMAIN}"
+ELEMENT_FQDN="chat.${MATRIX_DOMAIN}"
 
 # ── Custom configs created by this script ─────────────────────────────────────
-#   /opt/matrix/docker-compose.yml
-#   /opt/matrix/.env
+#   /opt/matrix/docker-compose.yml         (Podman compose stack)
+#   /opt/matrix/.env                       (runtime configuration)
 #   /opt/matrix/element-config.json
 #   /opt/matrix/element-nginx.conf
-#   /opt/matrix/synapse/homeserver.yaml        (generated + patched)
+#   /opt/matrix/synapse/homeserver.yaml    (generated + patched)
+#   /opt/matrix-backups/                   (scoped operational backups)
+#   /usr/local/bin/matrix-maint.sh         (maintenance helper)
 #   /etc/update-motd.d/00-header
 #   /etc/update-motd.d/10-sysinfo
 #   /etc/update-motd.d/30-app
 #   /etc/update-motd.d/99-footer
-#   /etc/systemd/system/container-getty@1.service.d/override.conf
+#   /etc/systemd/system/container-getty@1.service.d/override.conf  (optional)
 #   /etc/systemd/system/matrix-stack.service
 #   /etc/systemd/system/matrix-update.service
 #   /etc/systemd/system/matrix-update.timer
 #   /etc/apt/apt.conf.d/52unattended-<hostname>.conf
 #   /etc/sysctl.d/99-hardening.conf
+
+# ── Config validation ─────────────────────────────────────────────────────────
+[[ -n "$CT_ID" ]] || { echo "  ERROR: Could not obtain next CT ID." >&2; exit 1; }
+[[ "$DEBIAN_VERSION" =~ ^[0-9]+$ ]] || { echo "  ERROR: DEBIAN_VERSION must be numeric." >&2; exit 1; }
+[[ "$SYNAPSE_PORT" =~ ^[0-9]+$ ]] || { echo "  ERROR: SYNAPSE_PORT must be numeric." >&2; exit 1; }
+(( SYNAPSE_PORT >= 1 && SYNAPSE_PORT <= 65535 )) || { echo "  ERROR: SYNAPSE_PORT must be between 1 and 65535." >&2; exit 1; }
+[[ "$ELEMENT_PORT" =~ ^[0-9]+$ ]] || { echo "  ERROR: ELEMENT_PORT must be numeric." >&2; exit 1; }
+(( ELEMENT_PORT >= 1 && ELEMENT_PORT <= 65535 )) || { echo "  ERROR: ELEMENT_PORT must be between 1 and 65535." >&2; exit 1; }
+[[ "$KEEP_BACKUPS" =~ ^[0-9]+$ ]] || { echo "  ERROR: KEEP_BACKUPS must be numeric." >&2; exit 1; }
+[[ "$AUTO_UPDATE" =~ ^[01]$ ]] || { echo "  ERROR: AUTO_UPDATE must be 0 or 1." >&2; exit 1; }
+[[ "$TRACK_LATEST" =~ ^[01]$ ]] || { echo "  ERROR: TRACK_LATEST must be 0 or 1." >&2; exit 1; }
+[[ "$ALLOW_CONSOLE_AUTOLOGIN_IF_BLANK" =~ ^[01]$ ]] || { echo "  ERROR: ALLOW_CONSOLE_AUTOLOGIN_IF_BLANK must be 0 or 1." >&2; exit 1; }
+[[ "$SYNAPSE_TAG" == "latest" || "$SYNAPSE_TAG" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9._-]+)?$ ]] || {
+  echo "  ERROR: SYNAPSE_TAG must look like v1.148.0 or latest." >&2
+  exit 1
+}
+[[ "$ELEMENT_TAG" == "latest" || "$ELEMENT_TAG" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9._-]+)?$ ]] || {
+  echo "  ERROR: ELEMENT_TAG must look like v1.12.11 or latest." >&2
+  exit 1
+}
+if [[ ! "$MATRIX_DOMAIN" =~ ^[A-Za-z0-9.-]+$ ]]; then
+  echo "  ERROR: MATRIX_DOMAIN contains invalid characters: $MATRIX_DOMAIN" >&2
+  exit 1
+fi
 
 # ── Trap cleanup ──────────────────────────────────────────────────────────────
 trap 'trap - ERR; rc=$?;
@@ -71,43 +113,46 @@ trap 'rc=$?;
 # ── Preflight — root & commands ───────────────────────────────────────────────
 [[ "$(id -u)" -eq 0 ]] || { echo "  ERROR: Run as root on the Proxmox host." >&2; exit 1; }
 
-for cmd in pvesh pveam pct pvesm; do
+for cmd in pvesh pveam pct pvesm curl python3 ip awk sort paste; do
   command -v "$cmd" >/dev/null 2>&1 || { echo "  ERROR: Missing required command: $cmd" >&2; exit 1; }
 done
 
-[[ -n "$CT_ID" ]] || { echo "  ERROR: Could not obtain next CT ID." >&2; exit 1; }
-
-# ── Show defaults & confirm ───────────────────────────────────────────────────
+# ── Discover available resources ──────────────────────────────────────────────
 AVAIL_TMPL_STORES="$(pvesh get /storage --output-format json 2>/dev/null \
   | python3 -c "import sys,json; print(', '.join(sorted(s['storage'] for s in json.load(sys.stdin) if 'vztmpl' in s.get('content',''))))" 2>/dev/null || echo "n/a")"
 AVAIL_CT_STORES="$(pvesh get /storage --output-format json 2>/dev/null \
-  | python3 -c "import sys,json; print(', '.join(sorted(s['storage'] for s in json.load(sys.stdin) if 'rootdir' in s.get('content',''))))" 2>/dev/null || echo "n/a")"
+  | python3 -c "import sys,json; print(', '.join(sorted(s['storage'] for s in json.load(sys.stdin) if 'rootdir' in s.get('content','') or 'images' in s.get('content',''))))" 2>/dev/null || echo "n/a")"
 AVAIL_BRIDGES="$(ip -o link show type bridge 2>/dev/null | awk -F': ' '{print $2}' | sort | paste -sd', ' || echo "n/a")"
 
+# ── Show defaults & confirm ───────────────────────────────────────────────────
 cat <<EOF
 
   Matrix-Podman LXC Creator — Configuration
   ────────────────────────────────────────
   CT ID:             $CT_ID
   Hostname:          $HN
-  CPU:               $CPU core(s)
-  RAM:               $RAM MiB
-  Disk:              $DISK GB
+  CPU cores:         $CPU
+  RAM (MB):          $RAM
+  Disk (GB):         $DISK
   Bridge:            $BRIDGE ($AVAIL_BRIDGES)
-  Template Storage:  $TEMPLATE_STORAGE ($AVAIL_TMPL_STORES)
-  Container Storage: $CONTAINER_STORAGE ($AVAIL_CT_STORES)
+  Template storage:  $TEMPLATE_STORAGE ($AVAIL_TMPL_STORES)
+  Container storage: $CONTAINER_STORAGE ($AVAIL_CT_STORES)
+  Debian:            $DEBIAN_VERSION
   Domain:            $MATRIX_DOMAIN
-  Synapse URL:       matrix.${MATRIX_DOMAIN}
-  Element URL:       chat.${MATRIX_DOMAIN}
-  Synapse Port:      $SYNAPSE_PORT
-  Element Port:      $ELEMENT_PORT
-  Debian Version:    $DEBIAN_VERSION
+  Synapse FQDN:      $SYNAPSE_FQDN
+  Element FQDN:      $ELEMENT_FQDN
+  Synapse port:      $SYNAPSE_PORT
+  Element port:      $ELEMENT_PORT
   Timezone:          $APP_TZ
   Tags:              $TAGS
-  Synapse Image:     $SYNAPSE_IMAGE
-  Postgres Image:    $POSTGRES_IMAGE
-  Element Image:     $ELEMENT_IMAGE
-  Redis Image:       $REDIS_IMAGE
+  Synapse tag:       $SYNAPSE_TAG
+  Element tag:       $ELEMENT_TAG
+  Postgres image:    $POSTGRES_IMAGE
+  Redis image:       $REDIS_IMAGE
+  Auto-update:       $([ "$AUTO_UPDATE" -eq 1 ] && echo "enabled" || echo "disabled")
+  Track latest:      $([ "$TRACK_LATEST" -eq 1 ] && echo "enabled" || echo "disabled")
+  Console autologin: $([ "$ALLOW_CONSOLE_AUTOLOGIN_IF_BLANK" -eq 1 ] && echo "allowed if password blank" || echo "disabled")
+  Keep backups:      $KEEP_BACKUPS
   Cleanup on fail:   $CLEANUP_ON_FAIL
   ────────────────────────────────────────
   To change defaults, press Enter and
@@ -118,20 +163,27 @@ EOF
 
 SCRIPT_URL="https://raw.githubusercontent.com/vdarkobar/scripts/main/matrix-podman.sh"
 SCRIPT_LOCAL="/root/matrix-podman.sh"
+SCRIPT_SELF="$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")"
 
 read -r -p "  Continue with these settings? [y/N]: " response
 case "$response" in
   [yY][eE][sS]|[yY]) ;;
   *)
     echo ""
-    echo "  Downloading script to ${SCRIPT_LOCAL} for editing..."
-    if curl -fsSL "$SCRIPT_URL" -o "$SCRIPT_LOCAL"; then
+    echo "  Saving current script to ${SCRIPT_LOCAL} for editing..."
+    if [[ -f "$SCRIPT_SELF" ]] && cp -f -- "$SCRIPT_SELF" "$SCRIPT_LOCAL"; then
       chmod +x "$SCRIPT_LOCAL"
       echo "  Edit:  nano ${SCRIPT_LOCAL}"
       echo "  Run:   bash ${SCRIPT_LOCAL}"
       echo ""
+    elif curl -fsSL "$SCRIPT_URL" -o "$SCRIPT_LOCAL"; then
+      chmod +x "$SCRIPT_LOCAL"
+      echo "  WARNING: Could not copy the running script; downloaded fallback from GitHub instead."
+      echo "  Edit:  nano ${SCRIPT_LOCAL}"
+      echo "  Run:   bash ${SCRIPT_LOCAL}"
+      echo ""
     else
-      echo "  ERROR: Failed to download script." >&2
+      echo "  ERROR: Failed to save a local editable copy of the script." >&2
     fi
     exit 0
     ;;
@@ -149,25 +201,26 @@ ip link show "$BRIDGE" >/dev/null 2>&1 || { echo "  ERROR: Bridge not found: $BR
 # ── Root password ─────────────────────────────────────────────────────────────
 PASSWORD=""
 while true; do
-  read -r -s -p "  Set root password (blank = auto-login): " PW1; echo
+  read -r -s -p "  Set root password (blank allowed): " PW1; echo
   [[ -z "$PW1" ]] && break
   if [[ "$PW1" == *" "* ]]; then echo "  Password cannot contain spaces."; continue; fi
-  if [[ ${#PW1} -lt 5 ]]; then echo "  Password must be at least 5 characters."; continue; fi
+  if [[ ${#PW1} -lt 8 ]]; then echo "  Password must be at least 8 characters."; continue; fi
   read -r -s -p "  Verify root password: " PW2; echo
   if [[ "$PW1" == "$PW2" ]]; then PASSWORD="$PW1"; break; fi
   echo "  Passwords do not match. Try again."
 done
 echo ""
-
 if [[ -z "$PASSWORD" ]]; then
-  echo "  WARNING: Blank password enables root auto-login on the Proxmox console."
+  echo "  WARNING: No root password was set."
+  if [[ "$ALLOW_CONSOLE_AUTOLOGIN_IF_BLANK" -eq 1 ]]; then
+    echo "  WARNING: Console auto-login is enabled by configuration."
+  fi
   echo ""
 fi
 
 # ── Template discovery & download ─────────────────────────────────────────────
 pveam update
 echo ""
-[[ "$DEBIAN_VERSION" =~ ^[0-9]+$ ]] || { echo "  ERROR: DEBIAN_VERSION must be numeric." >&2; exit 1; }
 
 TEMPLATE="$(pveam available -section system | awk -v p="debian-${DEBIAN_VERSION}" '$2 ~ ("^" p) {print $2}' | sort -V | tail -n1)"
 if [[ -z "$TEMPLATE" ]]; then
@@ -215,9 +268,10 @@ for i in $(seq 1 30); do
   sleep 1
 done
 [[ -n "$CT_IP" ]] || { echo "  ERROR: No IPv4 address acquired via DHCP within timeout." >&2; exit 1; }
+echo "  CT $CT_ID is up — IP: $CT_IP"
 
-# ── Auto-login (if no password) ───────────────────────────────────────────────
-if [[ -z "$PASSWORD" ]]; then
+# ── Auto-login (optional, blank password only) ────────────────────────────────
+if [[ -z "$PASSWORD" && "$ALLOW_CONSOLE_AUTOLOGIN_IF_BLANK" -eq 1 ]]; then
   pct exec "$CT_ID" -- bash -lc '
     set -euo pipefail
     mkdir -p /etc/systemd/system/container-getty@1.service.d
@@ -365,7 +419,7 @@ server {
 EOF'
 
 # ── Compose file ──────────────────────────────────────────────────────────────
-pct exec "$CT_ID" -- bash -lc 'cat > /opt/matrix/docker-compose.yml <<YAML
+pct exec "$CT_ID" -- bash -lc 'cat > /opt/matrix/docker-compose.yml' <<'YAML'
 networks:
   matrix:
     driver: bridge
@@ -373,7 +427,7 @@ networks:
 services:
 
   postgres_db:
-    image: __POSTGRES_IMAGE__
+    image: ${POSTGRES_IMAGE}
     container_name: postgres_db
     restart: unless-stopped
     shm_size: 512mb
@@ -382,9 +436,9 @@ services:
     environment:
       - POSTGRES_DB=synapse
       - POSTGRES_USER=synapse
-      - POSTGRES_PASSWORD=__DB_PASSWORD__
+      - POSTGRES_PASSWORD=${DB_PASSWORD}
       - POSTGRES_INITDB_ARGS=--encoding=UTF8 --lc-collate=C --lc-ctype=C
-      - TZ=__TZ__
+      - TZ=${APP_TZ}
     volumes:
       - /opt/matrix/postgresdata:/var/lib/postgresql:Z
     healthcheck:
@@ -395,7 +449,7 @@ services:
       start_period: 30s
 
   redis:
-    image: __REDIS_IMAGE__
+    image: ${REDIS_IMAGE}
     container_name: redis
     restart: unless-stopped
     command: >
@@ -403,14 +457,14 @@ services:
       --appendonly yes
       --maxmemory 256mb
       --maxmemory-policy allkeys-lru
-      --requirepass __REDIS_PASSWORD__
+      --requirepass ${REDIS_PASSWORD}
     networks:
       - matrix
     volumes:
       - /opt/matrix/redis:/data:Z
     environment:
-      - TZ=__TZ__
-      - REDIS_PASSWORD=__REDIS_PASSWORD__
+      - TZ=${APP_TZ}
+      - REDIS_PASSWORD=${REDIS_PASSWORD}
     healthcheck:
       test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" ping"]
       interval: 30s
@@ -422,16 +476,16 @@ services:
         condition: service_healthy
 
   synapse:
-    image: __SYNAPSE_IMAGE__
+    image: ${SYNAPSE_IMAGE}
     container_name: synapse
     restart: unless-stopped
     networks:
       - matrix
     ports:
-      - "__SYNAPSE_PORT__:8008"
+      - "${SYNAPSE_PORT}:8008"
     environment:
       - SYNAPSE_CONFIG_PATH=/data/homeserver.yaml
-      - TZ=__TZ__
+      - TZ=${APP_TZ}
     volumes:
       - /opt/matrix/synapse:/data:Z
     healthcheck:
@@ -451,13 +505,13 @@ services:
         condition: service_healthy
 
   element:
-    image: __ELEMENT_IMAGE__
+    image: ${ELEMENT_IMAGE}
     container_name: element-web
     restart: unless-stopped
     networks:
       - matrix
     ports:
-      - "__ELEMENT_PORT__:8080"
+      - "${ELEMENT_PORT}:8080"
     volumes:
       - /opt/matrix/element-config.json:/app/config.json:ro,Z
       - /opt/matrix/element-nginx.conf:/etc/nginx/templates/default.conf.template:ro,Z
@@ -465,19 +519,6 @@ services:
       synapse:
         condition: service_healthy
 YAML
-'
-
-pct exec "$CT_ID" -- sed -i \
-  -e "s|__SYNAPSE_IMAGE__|${SYNAPSE_IMAGE}|g" \
-  -e "s|__POSTGRES_IMAGE__|${POSTGRES_IMAGE}|g" \
-  -e "s|__ELEMENT_IMAGE__|${ELEMENT_IMAGE}|g" \
-  -e "s|__REDIS_IMAGE__|${REDIS_IMAGE}|g" \
-  -e "s|__SYNAPSE_PORT__|${SYNAPSE_PORT}|g" \
-  -e "s|__ELEMENT_PORT__|${ELEMENT_PORT}|g" \
-  -e "s|__TZ__|${APP_TZ}|g" \
-  -e "s|__DB_PASSWORD__|${DB_PASSWORD}|g" \
-  -e "s|__REDIS_PASSWORD__|${REDIS_PASSWORD}|g" \
-  /opt/matrix/docker-compose.yml
 
 pct exec "$CT_ID" -- chmod 600 /opt/matrix/docker-compose.yml
 
@@ -515,19 +556,32 @@ pct exec "$CT_ID" -- bash -lc "cat > /opt/matrix/element-config.json <<EOF
 }
 EOF"
 
-# ── .env (reference only) ─────────────────────────────────────────────────────
+# ── .env (runtime configuration) ──────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc "
   set -euo pipefail
   cat > /opt/matrix/.env <<EOF
-# Reference only — values are baked into docker-compose.yml at creation time.
-# To change, edit docker-compose.yml directly and run: podman-compose up -d
 COMPOSE_PROJECT_NAME=matrix
 APP_TZ=${APP_TZ}
 MATRIX_DOMAIN=${MATRIX_DOMAIN}
+SYNAPSE_FQDN=${SYNAPSE_FQDN}
+ELEMENT_FQDN=${ELEMENT_FQDN}
 SYNAPSE_PORT=${SYNAPSE_PORT}
 ELEMENT_PORT=${ELEMENT_PORT}
+SYNAPSE_IMAGE_REPO=${SYNAPSE_IMAGE_REPO}
+SYNAPSE_TAG=${SYNAPSE_TAG}
+SYNAPSE_IMAGE=${SYNAPSE_IMAGE}
+ELEMENT_IMAGE_REPO=${ELEMENT_IMAGE_REPO}
+ELEMENT_TAG=${ELEMENT_TAG}
+ELEMENT_IMAGE=${ELEMENT_IMAGE}
+POSTGRES_IMAGE=${POSTGRES_IMAGE}
+REDIS_IMAGE=${REDIS_IMAGE}
+DB_PASSWORD=${DB_PASSWORD}
+REDIS_PASSWORD=${REDIS_PASSWORD}
+AUTO_UPDATE=${AUTO_UPDATE}
+TRACK_LATEST=${TRACK_LATEST}
+KEEP_BACKUPS=${KEEP_BACKUPS}
 EOF
-  chmod 600 /opt/matrix/.env
+  chmod 600 /opt/matrix/.env /opt/matrix/docker-compose.yml
 "
 
 # ── Generate Synapse homeserver.yaml ──────────────────────────────────────────
@@ -640,24 +694,264 @@ pct exec "$CT_ID" -- bash -lc '
   echo "  homeserver.yaml validated"
 '
 
+# ── Maintenance script ────────────────────────────────────────────────────────
+pct exec "$CT_ID" -- bash -lc 'cat > /usr/local/bin/matrix-maint.sh && chmod 0755 /usr/local/bin/matrix-maint.sh' <<'MAINT'
+#!/usr/bin/env bash
+set -Eeo pipefail
+
+APP_DIR="${APP_DIR:-/opt/matrix}"
+BACKUP_DIR="${BACKUP_DIR:-/opt/matrix-backups}"
+SERVICE="matrix-stack.service"
+ENV_FILE="${APP_DIR}/.env"
+COMPOSE_FILE="${APP_DIR}/docker-compose.yml"
+KEEP_BACKUPS="${KEEP_BACKUPS:-7}"
+
+need_root() { [[ $EUID -eq 0 ]] || { echo "  ERROR: Run as root." >&2; exit 1; }; }
+die() { echo "  ERROR: $*" >&2; exit 1; }
+
+usage() {
+  cat <<EOF2
+  Matrix Maintenance
+  ──────────────────
+  Usage:
+    $0 backup
+    $0 list
+    $0 restore <backup.tar.gz>
+    $0 update [synapse-tag] [element-tag]
+    $0 auto-update
+    $0 version
+
+  Notes:
+    - backup is a scoped operational backup of .env, compose, Element config, and homeserver.yaml
+    - backup does not replace PBS CT backup
+    - PostgreSQL/Redis data and larger Matrix state remain on persistent bind mounts and are not re-archived here
+    - update follows AUTO_UPDATE/TRACK_LATEST policy from ${ENV_FILE} when run as auto-update
+EOF2
+}
+
+[[ -d "$APP_DIR" ]] || die "APP_DIR not found: $APP_DIR"
+[[ -f "$ENV_FILE" ]] || die "Missing env file: $ENV_FILE"
+[[ -f "$COMPOSE_FILE" ]] || die "Missing compose file: $COMPOSE_FILE"
+[[ -f "$APP_DIR/element-config.json" ]] || die "Missing Element config: $APP_DIR/element-config.json"
+[[ -f "$APP_DIR/element-nginx.conf" ]] || die "Missing Element nginx config: $APP_DIR/element-nginx.conf"
+[[ -f "$APP_DIR/synapse/homeserver.yaml" ]] || die "Missing Synapse config: $APP_DIR/synapse/homeserver.yaml"
+
+env_value() {
+  awk -F= -v key="$1" '$1==key{print $2}' "$ENV_FILE" | tail -n1
+}
+
+env_flag() {
+  local raw
+  raw="$(env_value "$1" | tr -d '[:space:]')"
+  [[ "$raw" =~ ^[01]$ ]] && printf '%s' "$raw" || printf '0'
+}
+
+valid_tag() {
+  [[ "$1" == "latest" || "$1" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9._-]+)?$ ]]
+}
+
+set_env() {
+  python3 - "$ENV_FILE" "$1" "$2" <<'PY'
+from pathlib import Path
+import sys
+path = Path(sys.argv[1])
+key = sys.argv[2]
+value = sys.argv[3]
+lines = path.read_text().splitlines()
+for i, line in enumerate(lines):
+    if line.startswith(key + '='):
+        lines[i] = f'{key}={value}'
+        break
+else:
+    lines.append(f'{key}={value}')
+path.write_text('\n'.join(lines) + '\n')
+PY
+}
+
+create_backup() {
+  local ts out
+  ts="$(date +%Y%m%d-%H%M%S)"
+  out="$BACKUP_DIR/matrix-backup-$ts.tar.gz"
+
+  mkdir -p "$BACKUP_DIR"
+
+  echo "  Creating scoped backup: $out" >&2
+  tar -C / -czf "$out" \
+    opt/matrix/.env \
+    opt/matrix/docker-compose.yml \
+    opt/matrix/element-config.json \
+    opt/matrix/element-nginx.conf \
+    opt/matrix/synapse/homeserver.yaml
+
+  if [[ "$KEEP_BACKUPS" =~ ^[0-9]+$ ]] && (( KEEP_BACKUPS > 0 )); then
+    ls -1t "$BACKUP_DIR"/matrix-backup-*.tar.gz 2>/dev/null \
+      | awk -v keep="$KEEP_BACKUPS" 'NR>keep' \
+      | xargs -r rm -f --
+  fi
+
+  printf '%s\n' "$out"
+}
+
+backup_cmd() {
+  local out
+  out="$(create_backup)"
+  echo "  OK: $out"
+}
+
+list_cmd() {
+  ls -1t "$BACKUP_DIR"/matrix-backup-*.tar.gz 2>/dev/null || true
+}
+
+restore_cmd() {
+  local backup="$1"
+  [[ -n "$backup" ]] || die "Usage: matrix-maint.sh restore <backup.tar.gz>"
+  [[ -f "$backup" ]] || die "Backup not found: $backup"
+
+  echo "  Restoring scoped backup: $backup"
+  systemctl stop "$SERVICE" 2>/dev/null || true
+  tar -C / -xzf "$backup"
+  systemctl start "$SERVICE"
+  echo "  OK: restore completed."
+}
+
+update_cmd() {
+  local synapse_repo element_repo current_synapse_tag current_element_tag \
+        target_synapse_tag target_element_tag tmp_env synapse_port element_port health
+
+  synapse_repo="$(env_value SYNAPSE_IMAGE_REPO)"
+  element_repo="$(env_value ELEMENT_IMAGE_REPO)"
+  current_synapse_tag="$(env_value SYNAPSE_TAG)"
+  current_element_tag="$(env_value ELEMENT_TAG)"
+  synapse_port="$(env_value SYNAPSE_PORT)"
+  element_port="$(env_value ELEMENT_PORT)"
+
+  [[ -n "$synapse_repo" && -n "$element_repo" ]] || die "Could not read image repositories from .env"
+  [[ -n "$current_synapse_tag" && -n "$current_element_tag" ]] || die "Could not read current tags from .env"
+
+  target_synapse_tag="${1:-$current_synapse_tag}"
+  target_element_tag="${2:-$current_element_tag}"
+
+  if [[ -z "${1:-}" && -z "${2:-}" && "$(env_flag TRACK_LATEST)" == "1" ]]; then
+    target_synapse_tag="latest"
+    target_element_tag="latest"
+  fi
+
+  valid_tag "$target_synapse_tag" || die "Invalid Synapse tag: $target_synapse_tag"
+  valid_tag "$target_element_tag" || die "Invalid Element tag: $target_element_tag"
+
+  echo "  Current Synapse tag: $current_synapse_tag"
+  echo "  Current Element tag: $current_element_tag"
+  echo "  Target  Synapse tag: $target_synapse_tag"
+  echo "  Target  Element tag: $target_element_tag"
+
+  create_backup >/dev/null
+  tmp_env="$(mktemp)"
+  cp -a "$ENV_FILE" "$tmp_env"
+
+  rollback() {
+    echo "  !! Update failed — rolling back .env and app containers ..." >&2
+    cp -a "$tmp_env" "$ENV_FILE"
+    cd "$APP_DIR"
+    /usr/bin/podman-compose up -d --force-recreate synapse element || true
+  }
+  trap rollback ERR
+
+  set_env SYNAPSE_TAG "$target_synapse_tag"
+  set_env SYNAPSE_IMAGE "${synapse_repo}:$target_synapse_tag"
+  set_env ELEMENT_TAG "$target_element_tag"
+  set_env ELEMENT_IMAGE "${element_repo}:$target_element_tag"
+
+  echo "  Pulling target images ..."
+  cd "$APP_DIR"
+  /usr/bin/podman-compose pull synapse element
+
+  echo "  Recreating Synapse and Element ..."
+  /usr/bin/podman-compose up -d --force-recreate synapse element
+
+  echo "  Waiting for Synapse health endpoint ..."
+  health=0
+  for i in $(seq 1 45); do
+    if curl -fsS -o /dev/null --max-time 3 "http://127.0.0.1:${synapse_port}/health"; then
+      health=1
+      break
+    fi
+    sleep 2
+  done
+  [[ "$health" -eq 1 ]] || die "Synapse health endpoint did not return 200 after update."
+
+  echo "  Waiting for Element ..."
+  health=0
+  for i in $(seq 1 30); do
+    if curl -fsS -o /dev/null --max-time 3 "http://127.0.0.1:${element_port}/"; then
+      health=1
+      break
+    fi
+    sleep 2
+  done
+  [[ "$health" -eq 1 ]] || die "Element did not respond after update."
+
+  trap - ERR
+  rm -f "$tmp_env"
+  echo "  OK: Matrix images updated."
+}
+
+auto_update_cmd() {
+  if [[ "$(env_flag AUTO_UPDATE)" != "1" ]]; then
+    echo "  Auto-update disabled in ${ENV_FILE}; nothing to do."
+    return 0
+  fi
+
+  if [[ "$(env_flag TRACK_LATEST)" == "1" ]]; then
+    echo "  Auto-update policy: TRACK_LATEST=1 -> following latest"
+  else
+    echo "  Auto-update policy: TRACK_LATEST=0 -> staying on pinned tags"
+  fi
+
+  update_cmd
+}
+
+version_cmd() {
+  echo "SYNAPSE_IMAGE=$(env_value SYNAPSE_IMAGE)"
+  echo "ELEMENT_IMAGE=$(env_value ELEMENT_IMAGE)"
+  echo "POSTGRES_IMAGE=$(env_value POSTGRES_IMAGE)"
+  echo "REDIS_IMAGE=$(env_value REDIS_IMAGE)"
+  echo "AUTO_UPDATE=$(env_flag AUTO_UPDATE)"
+  echo "TRACK_LATEST=$(env_flag TRACK_LATEST)"
+  echo "BACKUP_DIR=$BACKUP_DIR"
+}
+
+need_root
+cmd="${1:-}"
+case "$cmd" in
+  backup) backup_cmd ;;
+  list) list_cmd ;;
+  restore) shift; restore_cmd "${1:-}" ;;
+  update) shift; update_cmd "${1:-}" "${2:-}" ;;
+  auto-update) auto_update_cmd ;;
+  version) version_cmd ;;
+  ""|-h|--help) usage ;;
+  *) usage; die "Unknown command: $cmd" ;;
+esac
+MAINT
+echo "  Maintenance script deployed: /usr/local/bin/matrix-maint.sh"
+
 # ── Auto-update timer ─────────────────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc '
   set -euo pipefail
   cat > /etc/systemd/system/matrix-update.service <<EOF
 [Unit]
-Description=Pull and update Matrix Podman containers
+Description=Matrix auto-update maintenance run
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=oneshot
-WorkingDirectory=/opt/matrix
-ExecStart=/bin/bash -c "/usr/bin/podman-compose pull && /usr/bin/podman-compose up -d"
+ExecStart=/usr/local/bin/matrix-maint.sh auto-update
 EOF
 
   cat > /etc/systemd/system/matrix-update.timer <<EOF
 [Unit]
-Description=Auto-update Matrix containers biweekly
+Description=Matrix auto-update timer
 
 [Timer]
 OnCalendar=*-*-01 05:30:00
@@ -670,8 +964,14 @@ WantedBy=timers.target
 EOF
 
   systemctl daemon-reload
-  systemctl enable --now matrix-update.timer
 '
+if [[ "$AUTO_UPDATE" -eq 1 ]]; then
+  pct exec "$CT_ID" -- bash -lc 'systemctl enable --now matrix-update.timer'
+  echo "  Auto-update timer enabled"
+else
+  pct exec "$CT_ID" -- bash -lc 'systemctl disable --now matrix-update.timer >/dev/null 2>&1 || true'
+  echo "  Auto-update timer installed but disabled"
+fi
 
 # ── Pull container images ─────────────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc 'cd /opt/matrix && podman-compose pull'
@@ -792,9 +1092,6 @@ net.ipv4.conf.all.accept_source_route = 0
 net.ipv4.conf.default.accept_source_route = 0
 net.ipv4.icmp_echo_ignore_broadcasts = 1
 net.ipv4.icmp_ignore_bogus_error_responses = 1
-net.ipv6.conf.all.disable_ipv6 = 1
-net.ipv6.conf.default.disable_ipv6 = 1
-net.ipv6.conf.lo.disable_ipv6 = 1
 EOF
   sysctl --system >/dev/null 2>&1 || true
 '
@@ -809,46 +1106,54 @@ pct exec "$CT_ID" -- bash -lc '
 '
 
 # ── MOTD (dynamic drop-ins) ───────────────────────────────────────────────────
-pct exec "$CT_ID" -- bash -lc "
+pct exec "$CT_ID" -- bash -lc '
   set -euo pipefail
   > /etc/motd
   chmod -x /etc/update-motd.d/* 2>/dev/null || true
   rm -f /etc/update-motd.d/*
+'
 
-  cat > /etc/update-motd.d/00-header <<'MOTD'
+pct exec "$CT_ID" -- bash -lc 'cat > /etc/update-motd.d/00-header && chmod 0755 /etc/update-motd.d/00-header' <<'MOTD'
 #!/bin/sh
-printf '\n  Matrix Synapse (Podman)\n'
-printf '  ────────────────────────────────────\n'
+printf '
+  Matrix Synapse (Podman)
+'
+printf '  ────────────────────────────────────
+'
 MOTD
 
-  cat > /etc/update-motd.d/10-sysinfo <<'MOTD'
+pct exec "$CT_ID" -- bash -lc 'cat > /etc/update-motd.d/10-sysinfo && chmod 0755 /etc/update-motd.d/10-sysinfo' <<'MOTD'
 #!/bin/sh
-ip=\$(ip -4 -o addr show scope global 2>/dev/null | awk '{print \$4}' | cut -d/ -f1 | head -n1)
-printf '  Hostname:  %s\n' \"\$(hostname)\"
-printf '  IP:        %s\n' \"\${ip:-n/a}\"
-printf '  Uptime:    %s\n' \"\$(uptime -p 2>/dev/null || uptime)\"
-printf '  Disk:      %s\n' \"\$(df -h / | awk 'NR==2{printf \"%s/%s (%s used)\", \$3, \$2, \$5}')\"
+ip=$(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -n1)
+printf '  Hostname:  %s\n' "$(hostname)"
+printf '  IP:        %s\n' "${ip:-n/a}"
+printf '  Uptime:    %s\n' "$(uptime -p 2>/dev/null || uptime)"
+printf '  Disk:      %s\n' "$(df -h / | awk 'NR==2{printf "%s/%s (%s used)", $3, $2, $5}')"
 MOTD
 
-  cat > /etc/update-motd.d/30-app <<'MOTD'
+pct exec "$CT_ID" -- bash -lc 'cat > /etc/update-motd.d/30-app && chmod 0755 /etc/update-motd.d/30-app' <<'MOTD'
 #!/bin/sh
-running=\$(podman ps --format '{{.Names}}' 2>/dev/null | wc -l)
-printf '  Stack:     /opt/matrix (%s containers running)\n' \"\$running\"
-printf '  Domain:    matrix.${MATRIX_DOMAIN}\n'
+running=$(podman ps --format '{{.Names}}' 2>/dev/null | wc -l)
+service_active=$(systemctl is-active matrix-stack.service 2>/dev/null || echo 'unknown')
+synapse_image=$(awk -F= '/^SYNAPSE_IMAGE=/{print $2}' /opt/matrix/.env 2>/dev/null | tail -n1)
+element_image=$(awk -F= '/^ELEMENT_IMAGE=/{print $2}' /opt/matrix/.env 2>/dev/null | tail -n1)
+ip=$(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -n1)
+printf '  Stack:     /opt/matrix (%s containers running)\n' "$running"
+printf '  Service:   %s\n' "$service_active"
+printf '  Synapse:   %s\n' "${synapse_image:-n/a}"
+printf '  Element:   %s\n' "${element_image:-n/a}"
+printf '  Backup:    /opt/matrix-backups (scoped operational backups)\n'
 printf '  Compose:   cd /opt/matrix && podman-compose [up -d|down|logs|ps]\n'
+printf '  Maintain:  matrix-maint.sh [backup|list|restore|update|auto-update|version]\n'
 printf '  Updates:   systemctl status matrix-update.timer\n'
-ip=\$(ip -4 -o addr show scope global 2>/dev/null | awk '{print \$4}' | cut -d/ -f1 | head -n1)
-printf '  Synapse:   http://%s:${SYNAPSE_PORT}\n' \"\${ip:-n/a}\"
-printf '  Element:   http://%s:${ELEMENT_PORT}\n' \"\${ip:-n/a}\"
+printf '  Synapse:   http://%s:8008\n' "${ip:-n/a}"
+printf '  Element:   http://%s:8080\n' "${ip:-n/a}"
 MOTD
 
-  cat > /etc/update-motd.d/99-footer <<'MOTD'
+pct exec "$CT_ID" -- bash -lc 'cat > /etc/update-motd.d/99-footer && chmod 0755 /etc/update-motd.d/99-footer' <<'MOTD'
 #!/bin/sh
 printf '  ────────────────────────────────────\n\n'
 MOTD
-
-  chmod +x /etc/update-motd.d/*
-"
 
 pct exec "$CT_ID" -- bash -lc '
   set -euo pipefail
@@ -869,9 +1174,17 @@ pct set "$CT_ID" --protection 1
 # ── Summary ───────────────────────────────────────────────────────────────────
 cat <<EOF
 
-  CT: $CT_ID | IP: ${CT_IP} | Login: $([ -n "$PASSWORD" ] && echo 'password set' || echo 'auto-login')
+  CT: $CT_ID | IP: ${CT_IP} | Login: $([ -n "$PASSWORD" ] && echo 'password set' || echo 'no password set')
   Synapse: http://${CT_IP}:${SYNAPSE_PORT}
   Element: http://${CT_IP}:${ELEMENT_PORT}
+
+  Maintenance:
+    matrix-maint.sh [backup|list|restore|update|auto-update|version]
+    Scoped backups: ${BACKUP_DIR}
+
+  Runtime config:
+    ${APP_DIR}/.env
+    ${APP_DIR}/synapse/homeserver.yaml
 
   NPM proxy hosts:
     matrix.${MATRIX_DOMAIN} -> http://${CT_IP}:${SYNAPSE_PORT}
@@ -901,7 +1214,7 @@ location /.well-known/matrix/client {
       SSL tab: enable SSL, Force SSL
 
   Create admin user:
-    pct exec $CT_ID -- podman exec -it synapse register_new_matrix_user \\
+    pct exec $CT_ID -- podman exec -it synapse register_new_matrix_user \
       http://localhost:8008 -c /data/homeserver.yaml
 
   Federation test:
@@ -909,19 +1222,4 @@ location /.well-known/matrix/client {
 
 EOF
 
-# ── Reboot CT so all settings take effect cleanly ─────────────────────────────
-echo "  Rebooting container..."
-pct reboot "$CT_ID"
-
-# Wait for stack to come back (4 containers: postgres, redis, synapse, element)
-RUNNING=0
-for i in $(seq 1 90); do
-  RUNNING="$(pct exec "$CT_ID" -- sh -lc 'podman ps --format "{{.Names}}" 2>/dev/null | wc -l' 2>/dev/null || echo 0)"
-  [[ "$RUNNING" -ge 4 ]] && break
-  sleep 2
-done
-[[ "$RUNNING" -ge 4 ]] && echo "  Stack came up after reboot" \
-  || echo "  WARNING: Stack not fully up after reboot — check matrix-stack.service" >&2
-
-echo "  Done."
 echo ""
