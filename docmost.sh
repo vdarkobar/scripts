@@ -35,7 +35,6 @@ CLEANUP_ON_FAIL=1  # 1 = destroy CT on error, 0 = keep for debugging
 #   /etc/update-motd.d/10-sysinfo
 #   /etc/update-motd.d/30-app
 #   /etc/update-motd.d/99-footer
-#   /etc/systemd/system/container-getty@1.service.d/override.conf
 #   /etc/apt/apt.conf.d/52unattended-<hostname>.conf
 #   /etc/sysctl.d/99-hardening.conf
 
@@ -136,8 +135,8 @@ ip link show "$BRIDGE" >/dev/null 2>&1 \
 # ── Root password ─────────────────────────────────────────────────────────────
 PASSWORD=""
 while true; do
-  read -r -s -p "  Set root password (blank = auto-login): " PW1; echo
-  [[ -z "$PW1" ]] && break
+  read -r -s -p "  Set root password: " PW1; echo
+  if [[ -z "$PW1" ]]; then echo "  Password cannot be blank."; continue; fi
   if [[ "$PW1" == *" "* ]]; then echo "  Password cannot contain spaces."; continue; fi
   if [[ ${#PW1} -lt 5 ]]; then echo "  Password must be at least 5 characters."; continue; fi
   read -r -s -p "  Verify root password: " PW2; echo
@@ -145,10 +144,6 @@ while true; do
   echo "  Passwords do not match. Try again."
 done
 echo ""
-if [[ -z "$PASSWORD" ]]; then
-  echo "  WARNING: Blank password enables root auto-login on the Proxmox console."
-  echo ""
-fi
 
 # ── Template discovery & download ─────────────────────────────────────────────
 pveam update
@@ -181,8 +176,8 @@ PCT_OPTIONS=(
   -features "nesting=1"
   -tags "$TAGS"
   -net0 "name=eth0,bridge=${BRIDGE},ip=dhcp,ip6=manual"
+  -password "$PASSWORD"
 )
-[[ -n "$PASSWORD" ]] && PCT_OPTIONS+=(-password "$PASSWORD")
 
 pct create "$CT_ID" "${TEMPLATE_STORAGE}:vztmpl/${TEMPLATE}" "${PCT_OPTIONS[@]}"
 CREATED=1
@@ -199,21 +194,6 @@ for i in $(seq 1 30); do
 done
 [[ -n "$CT_IP" ]] || { echo "  ERROR: No IPv4 address acquired via DHCP within timeout." >&2; exit 1; }
 echo "  CT $CT_ID is up — IP: $CT_IP"
-
-# ── Auto-login (if no password) ───────────────────────────────────────────────
-if [[ -z "$PASSWORD" ]]; then
-  pct exec "$CT_ID" -- bash -lc '
-    set -euo pipefail
-    mkdir -p /etc/systemd/system/container-getty@1.service.d
-    cat > /etc/systemd/system/container-getty@1.service.d/override.conf <<EOF
-[Service]
-ExecStart=
-ExecStart=-/sbin/agetty --autologin root --noclear --keep-baud tty%I 115200,38400,9600 \$TERM
-EOF
-    systemctl daemon-reload
-    systemctl restart container-getty@1.service
-  '
-fi
 
 # ── OS update ─────────────────────────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc '
@@ -636,7 +616,7 @@ pct set "$CT_ID" --protection 1
 
 # ── Summary ───────────────────────────────────────────────────────────────────
 echo ""
-echo "  CT: $CT_ID | IP: ${CT_IP} | Web UI: http://${CT_IP}:${APP_PORT}/ | Login: $([ -n "$PASSWORD" ] && echo 'password set' || echo 'auto-login')"
+echo "  CT: $CT_ID | IP: ${CT_IP} | Web UI: http://${CT_IP}:${APP_PORT}/ | Login: password set"
 echo "  Maintenance: pct exec $CT_ID -- docmost-maint.sh update"
 echo ""
 

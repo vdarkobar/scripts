@@ -28,7 +28,6 @@ INSTALL_CLOUDFLARED=0                # 1 = install cloudflared inside CT
 NPM_DISABLE_IPV6=0                   # 1 = set DISABLE_IPV6=true for NPM app container
 AUTO_UPDATE=0                        # 1 = enable timer-driven maintenance/update runs
 TRACK_LATEST=0                       # 1 = auto-update follows docker.io/jc21/nginx-proxy-manager:latest
-ALLOW_CONSOLE_AUTOLOGIN_IF_BLANK=0   # 1 = enable root console autologin when password blank
 KEEP_BACKUPS=7
 
 # Behavior
@@ -52,7 +51,6 @@ DB_IMAGE="${DB_IMAGE_REPO}:${DB_TAG}"
 #   /etc/systemd/system/npm-stack.service
 #   /etc/systemd/system/npm-update.service
 #   /etc/systemd/system/npm-update.timer
-#   /etc/systemd/system/container-getty@1.service.d/override.conf   (optional)
 #   /etc/update-motd.d/00-header
 #   /etc/update-motd.d/10-sysinfo
 #   /etc/update-motd.d/30-app
@@ -69,7 +67,6 @@ DB_IMAGE="${DB_IMAGE_REPO}:${DB_TAG}"
 [[ "$KEEP_BACKUPS" =~ ^[0-9]+$ ]] || { echo "  ERROR: KEEP_BACKUPS must be numeric." >&2; exit 1; }
 [[ "$AUTO_UPDATE" =~ ^[01]$ ]] || { echo "  ERROR: AUTO_UPDATE must be 0 or 1." >&2; exit 1; }
 [[ "$TRACK_LATEST" =~ ^[01]$ ]] || { echo "  ERROR: TRACK_LATEST must be 0 or 1." >&2; exit 1; }
-[[ "$ALLOW_CONSOLE_AUTOLOGIN_IF_BLANK" =~ ^[01]$ ]] || { echo "  ERROR: ALLOW_CONSOLE_AUTOLOGIN_IF_BLANK must be 0 or 1." >&2; exit 1; }
 [[ "$INSTALL_CLOUDFLARED" =~ ^[01]$ ]] || { echo "  ERROR: INSTALL_CLOUDFLARED must be 0 or 1." >&2; exit 1; }
 [[ "$NPM_DISABLE_IPV6" =~ ^[01]$ ]] || { echo "  ERROR: NPM_DISABLE_IPV6 must be 0 or 1." >&2; exit 1; }
 [[ "$NPM_TAG" == "latest" || "$NPM_TAG" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9._-]+)?$ ]] || {
@@ -142,7 +139,6 @@ cat <<EOF2
   Disable IPv6 app:  $([ "$NPM_DISABLE_IPV6" -eq 1 ] && echo "yes" || echo "no")
   Auto-update:       $([ "$AUTO_UPDATE" -eq 1 ] && echo "enabled" || echo "disabled")
   Track latest:      $([ "$TRACK_LATEST" -eq 1 ] && echo "enabled" || echo "disabled")
-  Console autologin: $([ "$ALLOW_CONSOLE_AUTOLOGIN_IF_BLANK" -eq 1 ] && echo "allowed if password blank" || echo "disabled")
   Keep backups:      $KEEP_BACKUPS
   Cloudflare Tunnel: $([ "$INSTALL_CLOUDFLARED" -eq 1 ] && echo "yes" || echo "no")
   Cleanup on fail:   $CLEANUP_ON_FAIL
@@ -194,8 +190,8 @@ ip link show "$BRIDGE" >/dev/null 2>&1 \
 # ── Root password ─────────────────────────────────────────────────────────────
 PASSWORD=""
 while true; do
-  read -r -s -p "  Set root password (blank allowed): " PW1; echo
-  [[ -z "$PW1" ]] && break
+  read -r -s -p "  Set root password: " PW1; echo
+  if [[ -z "$PW1" ]]; then echo "  Password cannot be blank."; continue; fi
   if [[ "$PW1" == *" "* ]]; then echo "  Password cannot contain spaces."; continue; fi
   if [[ ${#PW1} -lt 8 ]]; then echo "  Password must be at least 8 characters."; continue; fi
   read -r -s -p "  Verify root password: " PW2; echo
@@ -204,13 +200,6 @@ while true; do
 done
 
 echo ""
-if [[ -z "$PASSWORD" ]]; then
-  echo "  WARNING: No root password was set."
-  if [[ "$ALLOW_CONSOLE_AUTOLOGIN_IF_BLANK" -eq 1 ]]; then
-    echo "  WARNING: Console auto-login is enabled by configuration."
-  fi
-  echo ""
-fi
 
 # ── Cloudflare Tunnel token ───────────────────────────────────────────────────
 TUNNEL_TOKEN=""
@@ -264,8 +253,8 @@ PCT_OPTIONS=(
   -features "nesting=1,keyctl=1,fuse=1"
   -tags "$TAGS"
   -net0 "name=eth0,bridge=${BRIDGE},ip=dhcp,ip6=manual"
+  -password "$PASSWORD"
 )
-[[ -n "$PASSWORD" ]] && PCT_OPTIONS+=(-password "$PASSWORD")
 
 pct create "$CT_ID" "${TEMPLATE_STORAGE}:vztmpl/${TEMPLATE}" "${PCT_OPTIONS[@]}"
 CREATED=1
@@ -282,21 +271,6 @@ for i in $(seq 1 30); do
 done
 [[ -n "$CT_IP" ]] || { echo "  ERROR: No IPv4 address acquired via DHCP within timeout." >&2; exit 1; }
 echo "  CT $CT_ID is up — IP: $CT_IP"
-
-# ── Auto-login (optional, blank password only) ────────────────────────────────
-if [[ -z "$PASSWORD" && "$ALLOW_CONSOLE_AUTOLOGIN_IF_BLANK" -eq 1 ]]; then
-  pct exec "$CT_ID" -- bash -lc '
-    set -euo pipefail
-    mkdir -p /etc/systemd/system/container-getty@1.service.d
-    cat > /etc/systemd/system/container-getty@1.service.d/override.conf <<EOF2
-[Service]
-ExecStart=
-ExecStart=-/sbin/agetty --autologin root --noclear --keep-baud tty%I 115200,38400,9600 \$TERM
-EOF2
-    systemctl daemon-reload
-    systemctl restart container-getty@1.service
-  '
-fi
 
 # ── OS update ─────────────────────────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc '

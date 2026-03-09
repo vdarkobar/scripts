@@ -29,7 +29,6 @@ DEBIAN_VERSION=13
 # Optional features
 AUTO_UPDATE=0                        # 1 = enable timer-driven maintenance/update runs
 TRACK_LATEST=0                       # 1 = auto-update follows ${IMMICH_IMAGE_REPO}:latest
-ENABLE_CONSOLE_AUTOLOGIN=0           # 1 = enable root console autologin when password blank
 KEEP_BACKUPS=7
 
 # Behavior
@@ -53,7 +52,6 @@ APP_URL=""
 #   /etc/systemd/system/immich-stack.service
 #   /etc/systemd/system/immich-update.service
 #   /etc/systemd/system/immich-update.timer
-#   /etc/systemd/system/container-getty@1.service.d/override.conf  (optional)
 #   /etc/update-motd.d/00-header
 #   /etc/update-motd.d/10-sysinfo
 #   /etc/update-motd.d/30-app
@@ -75,7 +73,6 @@ if [[ "$TRACK_LATEST" -eq 0 && "$IMMICH_TAG" == "latest" ]]; then
   echo "  ERROR: IMMICH_TAG must be a concrete tag when TRACK_LATEST=0." >&2
   exit 1
 fi
-[[ "$ENABLE_CONSOLE_AUTOLOGIN" =~ ^[01]$ ]] || { echo "  ERROR: ENABLE_CONSOLE_AUTOLOGIN must be 0 or 1." >&2; exit 1; }
 if [[ -n "$PUBLIC_FQDN" && ! "$PUBLIC_FQDN" =~ ^[A-Za-z0-9.-]+$ ]]; then
   echo "  ERROR: PUBLIC_FQDN contains invalid characters: $PUBLIC_FQDN" >&2
   exit 1
@@ -154,7 +151,6 @@ cat <<EOF2
   Tags:              $TAGS
   Auto-update:       $([ "$AUTO_UPDATE" -eq 1 ] && echo "enabled" || echo "disabled")
   Track latest:      $([ "$TRACK_LATEST" -eq 1 ] && echo "enabled" || echo "disabled")
-  Console autologin: $([ "$ENABLE_CONSOLE_AUTOLOGIN" -eq 1 ] && echo "allowed if password blank" || echo "disabled")
   Keep backups:      $KEEP_BACKUPS
   Cleanup on fail:   $CLEANUP_ON_FAIL
   ────────────────────────────────────────
@@ -205,8 +201,8 @@ ip link show "$BRIDGE" >/dev/null 2>&1 \
 # ── Root password ─────────────────────────────────────────────────────────────
 PASSWORD=""
 while true; do
-  read -r -s -p "  Set root password (blank allowed): " PW1; echo
-  [[ -z "$PW1" ]] && break
+  read -r -s -p "  Set root password: " PW1; echo
+  if [[ -z "$PW1" ]]; then echo "  Password cannot be blank."; continue; fi
   if [[ "$PW1" == *" "* ]]; then echo "  Password cannot contain spaces."; continue; fi
   if [[ ${#PW1} -lt 8 ]]; then echo "  Password must be at least 8 characters."; continue; fi
   read -r -s -p "  Verify root password: " PW2; echo
@@ -215,13 +211,6 @@ while true; do
 done
 
 echo ""
-if [[ -z "$PASSWORD" ]]; then
-  echo "  WARNING: No root password was set."
-  if [[ "$ENABLE_CONSOLE_AUTOLOGIN" -eq 1 ]]; then
-    echo "  WARNING: Console auto-login is enabled by configuration."
-  fi
-  echo ""
-fi
 
 # ── Template discovery & download ─────────────────────────────────────────────
 pveam update
@@ -253,8 +242,8 @@ PCT_OPTIONS=(
   -features "nesting=1,keyctl=1,fuse=1"
   -tags "$TAGS"
   -net0 "name=eth0,bridge=${BRIDGE},ip=dhcp,ip6=manual"
+  -password "$PASSWORD"
 )
-[[ -n "$PASSWORD" ]] && PCT_OPTIONS+=(-password "$PASSWORD")
 
 pct create "$CT_ID" "${TEMPLATE_STORAGE}:vztmpl/${TEMPLATE}" "${PCT_OPTIONS[@]}"
 CREATED=1
@@ -336,21 +325,6 @@ echo "  CT $CT_ID is up — IP: $CT_IP"
 
 if [[ -z "$APP_URL" ]]; then
   APP_URL="http://${CT_IP}:${APP_PORT}"
-fi
-
-# ── Console auto-login (optional) ───────────────────────────────────────────
-if [[ -z "$PASSWORD" && "$ENABLE_CONSOLE_AUTOLOGIN" -eq 1 ]]; then
-  pct exec "$CT_ID" -- bash -lc '
-    set -euo pipefail
-    mkdir -p /etc/systemd/system/container-getty@1.service.d
-    cat > /etc/systemd/system/container-getty@1.service.d/override.conf <<EOF2
-[Service]
-ExecStart=
-ExecStart=-/sbin/agetty --autologin root --noclear --keep-baud tty%I 115200,38400,9600 \$TERM
-EOF2
-    systemctl daemon-reload
-    systemctl restart container-getty@1.service
-  '
 fi
 
 # ── OS update ─────────────────────────────────────────────────────────────────
@@ -1022,7 +996,7 @@ pct set "$CT_ID" --protection 1
 
 # ── Summary ───────────────────────────────────────────────────────────────────
 echo ""
-echo "  CT: $CT_ID | IP: ${CT_IP} | Login: $([ -n "$PASSWORD" ] && echo 'password set' || echo 'no password set')"
+echo "  CT: $CT_ID | IP: ${CT_IP} | Login: password set"
 echo ""
 echo "  Access (local):"
 echo "    Main: http://${CT_IP}:${APP_PORT}/"

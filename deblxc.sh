@@ -17,7 +17,6 @@ TAGS="debian;lxc"
 DEBIAN_VERSION=13
 
 # Behavior
-ALLOW_CONSOLE_AUTOLOGIN_IF_BLANK=0  # 1 = allow root console auto-login only when password is blank
 DISABLE_IPV6=0                      # 1 = also disable IPv6 via sysctl hardening
 CLEANUP_ON_FAIL=1                   # 1 = destroy CT on error, 0 = keep for debugging
 
@@ -25,7 +24,6 @@ CLEANUP_ON_FAIL=1                   # 1 = destroy CT on error, 0 = keep for debu
 #   /etc/update-motd.d/00-header
 #   /etc/update-motd.d/10-sysinfo
 #   /etc/update-motd.d/99-footer
-#   /etc/systemd/system/container-getty@1.service.d/override.conf  (conditional: blank password + ALLOW_CONSOLE_AUTOLOGIN_IF_BLANK=1)
 #   /etc/apt/apt.conf.d/52unattended-<hostname>.conf
 #   /etc/sysctl.d/99-hardening.conf
 
@@ -65,7 +63,6 @@ done
 [[ "$RAM" =~ ^[0-9]+$ ]] || { echo "  ERROR: RAM must be numeric." >&2; exit 1; }
 [[ "$DISK" =~ ^[0-9]+$ ]] || { echo "  ERROR: DISK must be numeric." >&2; exit 1; }
 [[ "$DEBIAN_VERSION" =~ ^[0-9]+$ ]] || { echo "  ERROR: DEBIAN_VERSION must be numeric." >&2; exit 1; }
-[[ "$ALLOW_CONSOLE_AUTOLOGIN_IF_BLANK" =~ ^[01]$ ]] || { echo "  ERROR: ALLOW_CONSOLE_AUTOLOGIN_IF_BLANK must be 0 or 1." >&2; exit 1; }
 [[ "$DISABLE_IPV6" =~ ^[01]$ ]] || { echo "  ERROR: DISABLE_IPV6 must be 0 or 1." >&2; exit 1; }
 if [[ ! "$APP_TZ" =~ ^[A-Za-z0-9._/+:-]+$ ]]; then
   echo "  ERROR: APP_TZ contains invalid characters: $APP_TZ" >&2
@@ -95,7 +92,6 @@ cat <<EOF2
   Debian Version:    $DEBIAN_VERSION
   Timezone:          $APP_TZ
   Tags:              $TAGS
-  Blank pw autologin:$([ "$ALLOW_CONSOLE_AUTOLOGIN_IF_BLANK" -eq 1 ] && echo ' enabled' || echo ' disabled')
   Disable IPv6:      $([ "$DISABLE_IPV6" -eq 1 ] && echo 'yes' || echo 'no')
   Cleanup on fail:   $CLEANUP_ON_FAIL
   ────────────────────────────────────────
@@ -146,8 +142,8 @@ ip link show "$BRIDGE" >/dev/null 2>&1 || { echo "  ERROR: Bridge not found: $BR
 # ── Root password ─────────────────────────────────────────────────────────────
 PASSWORD=""
 while true; do
-  read -r -s -p "  Set root password (blank allowed): " PW1; echo
-  [[ -z "$PW1" ]] && break
+  read -r -s -p "  Set root password: " PW1; echo
+  if [[ -z "$PW1" ]]; then echo "  Password cannot be blank."; continue; fi
   if [[ "$PW1" == *" "* ]]; then echo "  Password cannot contain spaces."; continue; fi
   if [[ ${#PW1} -lt 8 ]]; then echo "  Password must be at least 8 characters."; continue; fi
   read -r -s -p "  Verify root password: " PW2; echo
@@ -156,13 +152,6 @@ while true; do
 done
 
 echo ""
-if [[ -z "$PASSWORD" ]]; then
-  echo "  WARNING: No root password was set."
-  if [[ "$ALLOW_CONSOLE_AUTOLOGIN_IF_BLANK" -eq 1 ]]; then
-    echo "  WARNING: Console auto-login is enabled by configuration."
-  fi
-  echo ""
-fi
 
 # ── Template discovery & download ─────────────────────────────────────────────
 pveam update
@@ -194,8 +183,8 @@ PCT_OPTIONS=(
   -features "nesting=1"
   -tags "$TAGS"
   -net0 "name=eth0,bridge=${BRIDGE},ip=dhcp,ip6=manual"
+  -password "$PASSWORD"
 )
-[[ -n "$PASSWORD" ]] && PCT_OPTIONS+=(-password "$PASSWORD")
 
 pct create "$CT_ID" "${TEMPLATE_STORAGE}:vztmpl/${TEMPLATE}" "${PCT_OPTIONS[@]}"
 CREATED=1
@@ -214,21 +203,6 @@ for i in $(seq 1 30); do
   sleep 1
 done
 [[ -n "$CT_IP" ]] || { echo "  ERROR: No IPv4 address acquired via DHCP within timeout." >&2; exit 1; }
-
-# ── Auto-login (optional, blank password only) ────────────────────────────────
-if [[ -z "$PASSWORD" && "$ALLOW_CONSOLE_AUTOLOGIN_IF_BLANK" -eq 1 ]]; then
-  pct exec "$CT_ID" -- bash -lc '
-    set -euo pipefail
-    mkdir -p /etc/systemd/system/container-getty@1.service.d
-    cat > /etc/systemd/system/container-getty@1.service.d/override.conf <<EOF2
-[Service]
-ExecStart=
-ExecStart=-/sbin/agetty --autologin root --noclear --keep-baud tty%I 115200,38400,9600 \$TERM
-EOF2
-    systemctl daemon-reload
-    systemctl restart container-getty@1.service
-  '
-fi
 
 # ── OS update ─────────────────────────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc '
@@ -385,12 +359,6 @@ pct set "$CT_ID" --description "$DEB_DESC"
 pct set "$CT_ID" --protection 1
 
 # ── Summary ───────────────────────────────────────────────────────────────────
-LOGIN_STATE="password set"
-if [[ -z "$PASSWORD" ]]; then
-  LOGIN_STATE="blank password"
-  [[ "$ALLOW_CONSOLE_AUTOLOGIN_IF_BLANK" -eq 1 ]] && LOGIN_STATE="blank password + console auto-login"
-fi
-
 echo ""
-echo "CT: $CT_ID | IP: ${CT_IP} | Login: ${LOGIN_STATE}"
+echo "CT: $CT_ID | IP: ${CT_IP} | Login: password set"
 echo ""

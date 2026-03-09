@@ -32,7 +32,6 @@ DEBIAN_VERSION=13
 # Optional features
 AUTO_UPDATE=0                        # 1 = enable timer-driven maintenance/update runs
 TRACK_LATEST=0                       # 1 = auto-update follows :latest for Synapse + Element
-ALLOW_CONSOLE_AUTOLOGIN_IF_BLANK=0   # 1 = enable root console autologin when password blank
 KEEP_BACKUPS=7
 
 # Behavior
@@ -56,7 +55,6 @@ ELEMENT_FQDN="chat.${MATRIX_DOMAIN}"
 #   /etc/update-motd.d/10-sysinfo
 #   /etc/update-motd.d/30-app
 #   /etc/update-motd.d/99-footer
-#   /etc/systemd/system/container-getty@1.service.d/override.conf  (optional)
 #   /etc/systemd/system/matrix-stack.service
 #   /etc/systemd/system/matrix-update.service
 #   /etc/systemd/system/matrix-update.timer
@@ -73,7 +71,6 @@ ELEMENT_FQDN="chat.${MATRIX_DOMAIN}"
 [[ "$KEEP_BACKUPS" =~ ^[0-9]+$ ]] || { echo "  ERROR: KEEP_BACKUPS must be numeric." >&2; exit 1; }
 [[ "$AUTO_UPDATE" =~ ^[01]$ ]] || { echo "  ERROR: AUTO_UPDATE must be 0 or 1." >&2; exit 1; }
 [[ "$TRACK_LATEST" =~ ^[01]$ ]] || { echo "  ERROR: TRACK_LATEST must be 0 or 1." >&2; exit 1; }
-[[ "$ALLOW_CONSOLE_AUTOLOGIN_IF_BLANK" =~ ^[01]$ ]] || { echo "  ERROR: ALLOW_CONSOLE_AUTOLOGIN_IF_BLANK must be 0 or 1." >&2; exit 1; }
 [[ "$SYNAPSE_TAG" == "latest" || "$SYNAPSE_TAG" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9._-]+)?$ ]] || {
   echo "  ERROR: SYNAPSE_TAG must look like v1.148.0 or latest." >&2
   exit 1
@@ -152,7 +149,6 @@ cat <<EOF
   Redis image:       $REDIS_IMAGE
   Auto-update:       $([ "$AUTO_UPDATE" -eq 1 ] && echo "enabled" || echo "disabled")
   Track latest:      $([ "$TRACK_LATEST" -eq 1 ] && echo "enabled" || echo "disabled")
-  Console autologin: $([ "$ALLOW_CONSOLE_AUTOLOGIN_IF_BLANK" -eq 1 ] && echo "allowed if password blank" || echo "disabled")
   Keep backups:      $KEEP_BACKUPS
   Cleanup on fail:   $CLEANUP_ON_FAIL
   ────────────────────────────────────────
@@ -202,8 +198,8 @@ ip link show "$BRIDGE" >/dev/null 2>&1 || { echo "  ERROR: Bridge not found: $BR
 # ── Root password ─────────────────────────────────────────────────────────────
 PASSWORD=""
 while true; do
-  read -r -s -p "  Set root password (blank allowed): " PW1; echo
-  [[ -z "$PW1" ]] && break
+  read -r -s -p "  Set root password: " PW1; echo
+  if [[ -z "$PW1" ]]; then echo "  Password cannot be blank."; continue; fi
   if [[ "$PW1" == *" "* ]]; then echo "  Password cannot contain spaces."; continue; fi
   if [[ ${#PW1} -lt 8 ]]; then echo "  Password must be at least 8 characters."; continue; fi
   read -r -s -p "  Verify root password: " PW2; echo
@@ -211,13 +207,6 @@ while true; do
   echo "  Passwords do not match. Try again."
 done
 echo ""
-if [[ -z "$PASSWORD" ]]; then
-  echo "  WARNING: No root password was set."
-  if [[ "$ALLOW_CONSOLE_AUTOLOGIN_IF_BLANK" -eq 1 ]]; then
-    echo "  WARNING: Console auto-login is enabled by configuration."
-  fi
-  echo ""
-fi
 
 # ── Template discovery & download ─────────────────────────────────────────────
 pveam update
@@ -249,8 +238,8 @@ PCT_OPTIONS=(
   -features "nesting=1,keyctl=1,fuse=1"
   -tags "$TAGS"
   -net0 "name=eth0,bridge=${BRIDGE},ip=dhcp,ip6=manual"
+  -password "$PASSWORD"
 )
-[[ -n "$PASSWORD" ]] && PCT_OPTIONS+=(-password "$PASSWORD")
 
 pct create "$CT_ID" "${TEMPLATE_STORAGE}:vztmpl/${TEMPLATE}" "${PCT_OPTIONS[@]}"
 CREATED=1
@@ -270,21 +259,6 @@ for i in $(seq 1 30); do
 done
 [[ -n "$CT_IP" ]] || { echo "  ERROR: No IPv4 address acquired via DHCP within timeout." >&2; exit 1; }
 echo "  CT $CT_ID is up — IP: $CT_IP"
-
-# ── Auto-login (optional, blank password only) ────────────────────────────────
-if [[ -z "$PASSWORD" && "$ALLOW_CONSOLE_AUTOLOGIN_IF_BLANK" -eq 1 ]]; then
-  pct exec "$CT_ID" -- bash -lc '
-    set -euo pipefail
-    mkdir -p /etc/systemd/system/container-getty@1.service.d
-    cat > /etc/systemd/system/container-getty@1.service.d/override.conf <<EOF
-[Service]
-ExecStart=
-ExecStart=-/sbin/agetty --autologin root --noclear --keep-baud tty%I 115200,38400,9600 \$TERM
-EOF
-    systemctl daemon-reload
-    systemctl restart container-getty@1.service
-  '
-fi
 
 # ── OS update ─────────────────────────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc '
@@ -1176,7 +1150,7 @@ pct set "$CT_ID" --protection 1
 # ── Summary ───────────────────────────────────────────────────────────────────
 cat <<EOF
 
-  CT: $CT_ID | IP: ${CT_IP} | Login: $([ -n "$PASSWORD" ] && echo 'password set' || echo 'no password set')
+  CT: $CT_ID | IP: ${CT_IP} | Login: password set
   Synapse: http://${CT_IP}:${SYNAPSE_PORT}
   Element: http://${CT_IP}:${ELEMENT_PORT}
 
