@@ -31,7 +31,6 @@ SHARE_STORAGE="rootfs"              # rootfs | <zfs-pool-name> | /host/path
 #   pct exec <CT_ID> -- smbpasswd -e <username>
 
 # Optional features
-ALLOW_CONSOLE_AUTOLOGIN_IF_BLANK=0
 DISABLE_IPV6=0
 
 # Behavior
@@ -43,7 +42,6 @@ CLEANUP_ON_FAIL=1  # 1 = destroy CT on error, 0 = keep for debugging
 #   /etc/update-motd.d/10-sysinfo
 #   /etc/update-motd.d/30-app
 #   /etc/update-motd.d/99-footer
-#   /etc/systemd/system/container-getty@1.service.d/override.conf  (optional: blank pw + ALLOW_CONSOLE_AUTOLOGIN_IF_BLANK=1)
 #   /etc/apt/apt.conf.d/52unattended-<hostname>.conf
 #   /etc/apt/apt.conf.d/20auto-upgrades
 #   /etc/sysctl.d/99-hardening.conf
@@ -108,7 +106,7 @@ if [[ "$SHARE_STORAGE" != "rootfs" && "$SHARE_STORAGE" != /* ]]; then
 fi
 
 # ── Discover available resources ──────────────────────────────────────────────
-AVAIL_BRIDGES="$(ip -o link show type bridge 2>/dev/null | awk -F': ' '{print $2}' | sort | paste -sd', ' || echo "n/a")"
+AVAIL_BRIDGES="$(ip -o link show type bridge 2>/dev/null | awk -F': ' '{print $2}' | grep -E '^vmbr' | sort | paste -sd, | sed 's/,/, /g' || echo "n/a")"
 AVAIL_TMPL_STORES="$(pvesh get /storage --output-format json 2>/dev/null \
   | python3 -c "import sys,json; print(', '.join(sorted(s['storage'] for s in json.load(sys.stdin) if 'vztmpl' in s.get('content',''))))" 2>/dev/null || echo "n/a")"
 AVAIL_CT_STORES="$(pvesh get /storage --output-format json 2>/dev/null \
@@ -190,8 +188,8 @@ ip link show "$BRIDGE" >/dev/null 2>&1 || { echo "  ERROR: Bridge not found: $BR
 # ── Root password ─────────────────────────────────────────────────────────────
 PASSWORD=""
 while true; do
-  read -r -s -p "  Set root password (blank allowed): " PW1; echo
-  [[ -z "$PW1" ]] && break
+  read -r -s -p "  Set root password: " PW1; echo
+  if [[ -z "$PW1" ]]; then echo "  Password cannot be blank."; continue; fi
   if [[ "$PW1" == *" "* ]]; then echo "  Password cannot contain spaces."; continue; fi
   if [[ ${#PW1} -lt 5 ]]; then echo "  Password must be at least 5 characters."; continue; fi
   read -r -s -p "  Verify root password: " PW2; echo
@@ -199,12 +197,6 @@ while true; do
   echo "  Passwords do not match. Try again."
 done
 echo ""
-
-if [[ -z "$PASSWORD" ]]; then
-  echo "  WARNING: No root password was set."
-  [[ "$ALLOW_CONSOLE_AUTOLOGIN_IF_BLANK" -eq 1 ]] && echo "  WARNING: Console auto-login is enabled by configuration."
-  echo ""
-fi
 
 # ── First Samba user ──────────────────────────────────────────────────────────
 SMB_USER=""
@@ -259,8 +251,8 @@ PCT_OPTIONS=(
   -features "nesting=1"
   -tags "$TAGS"
   -net0 "name=eth0,bridge=${BRIDGE},ip=dhcp,ip6=manual"
+  -password "$PASSWORD"
 )
-[[ -n "$PASSWORD" ]] && PCT_OPTIONS+=(-password "$PASSWORD")
 
 pct create "$CT_ID" "${TEMPLATE_STORAGE}:vztmpl/${TEMPLATE}" "${PCT_OPTIONS[@]}"
 CREATED=1
@@ -302,21 +294,6 @@ for i in $(seq 1 30); do
   sleep 1
 done
 [[ -n "$CT_IP" ]] || { echo "  ERROR: No IPv4 address acquired via DHCP within timeout." >&2; exit 1; }
-
-# ── Auto-login (if no password) ───────────────────────────────────────────────
-if [[ -z "$PASSWORD" && "${ALLOW_CONSOLE_AUTOLOGIN_IF_BLANK}" -eq 1 ]]; then
-  pct exec "$CT_ID" -- bash -lc '
-    set -euo pipefail
-    mkdir -p /etc/systemd/system/container-getty@1.service.d
-    cat > /etc/systemd/system/container-getty@1.service.d/override.conf <<EOF
-[Service]
-ExecStart=
-ExecStart=-/sbin/agetty --autologin root --noclear --keep-baud tty%I 115200,38400,9600 \$TERM
-EOF
-    systemctl daemon-reload
-    systemctl restart container-getty@1.service
-  '
-fi
 
 # ── OS update ─────────────────────────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc '
@@ -657,7 +634,7 @@ pct set "$CT_ID" --protection 1
 
 # ── Summary ───────────────────────────────────────────────────────────────────
 echo ""
-echo "CT: $CT_ID | IP: ${CT_IP} | SMB: \\\\${CT_IP}\\${SMB_SHARE_NAME} | User: ${SMB_USER:-none} | Login: $([ -n "$PASSWORD" ] && echo 'password set' || { [ "${ALLOW_CONSOLE_AUTOLOGIN_IF_BLANK}" -eq 1 ] && echo 'no password + console autologin' || echo 'no password set'; })"
+echo "CT: $CT_ID | IP: ${CT_IP} | SMB: \\\\${CT_IP}\\${SMB_SHARE_NAME} | User: ${SMB_USER:-none} | Login: password set"
 echo ""
 echo "  Share storage:"
 if [[ "$SHARE_STORAGE" == "rootfs" ]]; then
