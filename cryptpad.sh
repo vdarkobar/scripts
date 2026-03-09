@@ -40,7 +40,8 @@ MAIN_FQDN=""
 [[ -n "$DOMAIN_NAME" ]] && MAIN_FQDN="cryptpad.${DOMAIN_NAME}"
 
 # ── Trap cleanup ──────────────────────────────────────────────────────────────
-trap 'trap - ERR; rc=$?;
+trap 'rc=$?;
+  trap - ERR
   echo "  ERROR: failed (rc=$rc) near line ${BASH_LINENO[0]:-?}" >&2
   echo "  Command: $BASH_COMMAND" >&2
   if [[ "${CLEANUP_ON_FAIL:-0}" -eq 1 && "${CREATED:-0}" -eq 1 ]]; then
