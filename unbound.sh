@@ -830,7 +830,8 @@ else
   printf '  Unbound:   stopped\n'
 fi
 printf '  Config:    /etc/unbound/unbound.conf\n'
-printf '  Requires post-install editing:\n'
+printf '\n'
+printf '  # requires post-install editing\n'
 printf '  VLANs:     /etc/unbound/unbound.conf.d/vlans.conf\n'
 printf '  Hosts:     /etc/unbound/unbound.conf.d/30-static-hosts.conf\n'
 printf '  Reload:    systemctl reload unbound\n'
@@ -883,8 +884,10 @@ echo "  Domain:   ${UB_DOMAIN}"
 echo ""
 echo "  Config files:"
 echo "    /etc/unbound/unbound.conf"
-echo "    /etc/unbound/unbound.conf.d/vlans.conf           # requires post-install editing"
-echo "    /etc/unbound/unbound.conf.d/30-static-hosts.conf # requires post-install editing"
+echo ""
+echo "    # requires post-install editing"
+echo "    /etc/unbound/unbound.conf.d/vlans.conf"
+echo "    /etc/unbound/unbound.conf.d/30-static-hosts.conf"
 echo ""
 echo "  Reload after edits:"
 echo "    pct exec $CT_ID -- systemctl reload unbound"
