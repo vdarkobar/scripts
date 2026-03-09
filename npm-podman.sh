@@ -83,7 +83,8 @@ DB_IMAGE="${DB_IMAGE_REPO}:${DB_TAG}"
 [[ -e "/usr/share/zoneinfo/${APP_TZ}" ]] || { echo "  ERROR: APP_TZ not found in /usr/share/zoneinfo: $APP_TZ" >&2; exit 1; }
 
 # ── Trap cleanup ──────────────────────────────────────────────────────────────
-trap 'trap - ERR; rc=$?;
+trap 'rc=$?;
+  trap - ERR
   echo "  ERROR: failed (rc=$rc) near line ${BASH_LINENO[0]:-?}" >&2
   echo "  Command: $BASH_COMMAND" >&2
   if [[ "${CLEANUP_ON_FAIL:-0}" -eq 1 && "${CREATED:-0}" -eq 1 ]]; then
