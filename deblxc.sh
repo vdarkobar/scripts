@@ -111,7 +111,7 @@ case "$response" in
   *)
     echo ""
     echo "  Saving script to ${SCRIPT_LOCAL} for editing..."
-    if [[ -n "$SCRIPT_SOURCE" && -r "$SCRIPT_SOURCE" ]] && cat "$SCRIPT_SOURCE" > "$SCRIPT_LOCAL"; then
+    if [[ -f "$SCRIPT_SOURCE" && -r "$SCRIPT_SOURCE" ]] && cat "$SCRIPT_SOURCE" > "$SCRIPT_LOCAL"; then
       chmod +x "$SCRIPT_LOCAL"
       echo "  Edit:  nano ${SCRIPT_LOCAL}"
       echo "  Run:   bash ${SCRIPT_LOCAL}"
