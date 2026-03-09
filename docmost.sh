@@ -40,7 +40,8 @@ CLEANUP_ON_FAIL=1  # 1 = destroy CT on error, 0 = keep for debugging
 #   /etc/sysctl.d/99-hardening.conf
 
 # ── Trap cleanup ──────────────────────────────────────────────────────────────
-trap 'trap - ERR; rc=$?;
+trap 'rc=$?;
+  trap - ERR
   echo "  ERROR: failed (rc=$rc) near line ${BASH_LINENO[0]:-?}" >&2
   echo "  Command: $BASH_COMMAND" >&2
   if [[ "${CLEANUP_ON_FAIL:-0}" -eq 1 && "${CREATED:-0}" -eq 1 ]]; then
