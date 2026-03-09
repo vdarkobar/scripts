@@ -3,43 +3,75 @@ set -Eeo pipefail
 
 # ── Config ────────────────────────────────────────────────────────────────────
 CT_ID="$(pvesh get /cluster/nextid)"
-HN="unbound"
+HN="samba"
 CPU=4
 RAM=4096
-DISK=4
+DISK=8
 BRIDGE="vmbr0"
 TEMPLATE_STORAGE="local"
 CONTAINER_STORAGE="local-lvm"
 
-# Unbound
+# Samba
 APP_TZ="Europe/Berlin"
-UB_DOMAIN=""                # auto-detect from CT resolv.conf, or set manually
-TAGS="unbound;dns;lxc"
+SMB_SHARE_NAME="Data"
+SMB_SHARE_PATH="/srv/samba/Data"
+SMB_GROUP="sambashare"
+SMB_WORKGROUP="WORKGROUP"
+SMB_SERVER_NAME="FILESERVER"
+SMB_MIN_PROTOCOL="SMB3_11"
+SMB_SERVER_SIGNING="required"
+SMB_ENCRYPTION="required"
+TAGS="samba;fileserver;lxc"
 DEBIAN_VERSION=13
+SHARE_STORAGE="rootfs"              # rootfs | <zfs-pool-name> | /host/path
 
-# Post-install: edit these drop-in files inside the CT for your network
-#   /etc/unbound/unbound.conf.d/vlans.conf           VLAN access control
-#   /etc/unbound/unbound.conf.d/30-static-hosts.conf Static DNS records (A + PTR)
-# Then reload: pct exec <CT_ID> -- systemctl reload unbound
+# Post-install: add more Samba users inside the CT
+#   pct exec <CT_ID> -- useradd -M -s /usr/sbin/nologin -G sambashare <username>
+#   pct exec <CT_ID> -- smbpasswd -a <username>
+#   pct exec <CT_ID> -- smbpasswd -e <username>
+
+# Optional features
+ALLOW_CONSOLE_AUTOLOGIN_IF_BLANK=0
+DISABLE_IPV6=0
 
 # Behavior
-CLEANUP_ON_FAIL=1                    # 1 = destroy CT on error, 0 = keep for debugging
-DISABLE_IPV6=1                       # 1 = disable IPv6 in sysctl (CT uses ip6=manual + do-ip6: no)
+CLEANUP_ON_FAIL=1  # 1 = destroy CT on error, 0 = keep for debugging
 
 # ── Custom configs created by this script ─────────────────────────────────────
+#   /etc/samba/smb.conf
 #   /etc/update-motd.d/00-header
 #   /etc/update-motd.d/10-sysinfo
 #   /etc/update-motd.d/30-app
 #   /etc/update-motd.d/99-footer
+#   /etc/systemd/system/container-getty@1.service.d/override.conf  (optional: blank pw + ALLOW_CONSOLE_AUTOLOGIN_IF_BLANK=1)
 #   /etc/apt/apt.conf.d/52unattended-<hostname>.conf
+#   /etc/apt/apt.conf.d/20auto-upgrades
 #   /etc/sysctl.d/99-hardening.conf
-#   /etc/unbound/unbound.conf.d/vlans.conf
-#   /etc/unbound/unbound.conf.d/30-static-hosts.conf
-#   /etc/dhcp/dhclient.conf
+#   <pool>/samba-share-lxc<CT_ID>                                      (optional: ZFS dataset, when SHARE_STORAGE=<pool>)
+
+# ── Validate config values (guard against sed injection) ──────────────────────
+fail=""
+[[ "$APP_TZ"             =~ ^[A-Za-z0-9._+-]+(/[A-Za-z0-9._+-]+)+$ ]] || fail="APP_TZ"
+[[ "$SMB_WORKGROUP"      =~ ^[A-Za-z0-9._-]+$ ]]     || fail="SMB_WORKGROUP"
+[[ "$SMB_SERVER_NAME"    =~ ^[A-Za-z0-9._-]+$ ]]     || fail="SMB_SERVER_NAME"
+[[ "$SMB_SHARE_NAME"     =~ ^[A-Za-z0-9_-]+$ ]]      || fail="SMB_SHARE_NAME"
+[[ "$SMB_GROUP"          =~ ^[a-z_][a-z0-9_-]*$ ]]   || fail="SMB_GROUP"
+[[ "$SMB_SHARE_PATH"     =~ ^/[A-Za-z0-9/_.-]+$ ]]   || fail="SMB_SHARE_PATH"
+[[ "$SMB_MIN_PROTOCOL"   =~ ^[A-Za-z0-9_]+$ ]]       || fail="SMB_MIN_PROTOCOL"
+[[ "$SMB_SERVER_SIGNING" =~ ^[a-z]+$ ]]              || fail="SMB_SERVER_SIGNING"
+[[ "$SMB_ENCRYPTION"     =~ ^[a-z]+$ ]]              || fail="SMB_ENCRYPTION"
+if [[ -n "$fail" ]]; then
+  echo "  ERROR: Invalid characters in $fail — check the Config section." >&2
+  exit 1
+fi
+
+if [[ "$SHARE_STORAGE" != "rootfs" && "$SHARE_STORAGE" != /* && ! "$SHARE_STORAGE" =~ ^[A-Za-z0-9_.:-]+$ ]]; then
+  echo "  ERROR: SHARE_STORAGE must be rootfs, an absolute host path, or a ZFS pool name." >&2
+  exit 1
+fi
 
 # ── Trap cleanup ──────────────────────────────────────────────────────────────
-trap 'rc=$?;
-  trap - ERR
+trap 'trap - ERR; rc=$?;
   echo "  ERROR: failed (rc=$rc) near line ${BASH_LINENO[0]:-?}" >&2
   echo "  Command: $BASH_COMMAND" >&2
   if [[ "${CLEANUP_ON_FAIL:-0}" -eq 1 && "${CREATED:-0}" -eq 1 ]]; then
@@ -61,20 +93,6 @@ trap 'rc=$?;
   exit "$rc"
 ' INT TERM
 
-# ── Config validation ─────────────────────────────────────────────────────────
-[[ "$DISABLE_IPV6" =~ ^[01]$ ]] \
-  || { echo "  ERROR: DISABLE_IPV6 must be 0 or 1." >&2; exit 1; }
-[[ "$CPU" =~ ^[1-9][0-9]*$ ]] \
-  || { echo "  ERROR: CPU must be a positive integer." >&2; exit 1; }
-[[ "$DEBIAN_VERSION" =~ ^[0-9]+$ ]] \
-  || { echo "  ERROR: DEBIAN_VERSION must be numeric." >&2; exit 1; }
-[[ -e "/usr/share/zoneinfo/${APP_TZ}" ]] \
-  || { echo "  ERROR: APP_TZ not found in /usr/share/zoneinfo: $APP_TZ" >&2; exit 1; }
-if [[ -n "$UB_DOMAIN" ]]; then
-  [[ "$UB_DOMAIN" =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)*$ ]] \
-    || { echo "  ERROR: UB_DOMAIN is invalid: $UB_DOMAIN" >&2; exit 1; }
-fi
-
 # ── Preflight — root & commands ───────────────────────────────────────────────
 [[ "$(id -u)" -eq 0 ]] || { echo "  ERROR: Run as root on the Proxmox host." >&2; exit 1; }
 
@@ -83,28 +101,33 @@ for cmd in pvesh pveam pct pvesm curl python3 ip awk sort paste; do
 done
 
 [[ -n "$CT_ID" ]] || { echo "  ERROR: Could not obtain next CT ID." >&2; exit 1; }
+[[ "$DEBIAN_VERSION" =~ ^[0-9]+$ ]] || { echo "  ERROR: DEBIAN_VERSION must be numeric." >&2; exit 1; }
 
-if [[ "$DEBIAN_VERSION" -ge 13 ]]; then
-  PVC_VER="$(dpkg-query -W -f='${Version}' pve-container 2>/dev/null | cut -d. -f1-2 || echo "0.0")"
-  if dpkg --compare-versions "$PVC_VER" lt "5.3"; then
-    echo "  ERROR: pve-container $PVC_VER is too old for Debian 13 templates." >&2
-    echo "  Fix:   apt install --only-upgrade pve-container" >&2
-    exit 1
-  fi
+if [[ "$SHARE_STORAGE" != "rootfs" && "$SHARE_STORAGE" != /* ]]; then
+  command -v zfs >/dev/null 2>&1 || { echo "  ERROR: zfs command is required when SHARE_STORAGE is a ZFS pool name." >&2; exit 1; }
 fi
 
 # ── Discover available resources ──────────────────────────────────────────────
-AVAIL_BRIDGES="$(ip -o link show type bridge 2>/dev/null | awk -F': ' '{print $2}' | grep -E '^vmbr' | sort | paste -sd', ' || echo "n/a")"
+AVAIL_BRIDGES="$(ip -o link show type bridge 2>/dev/null | awk -F': ' '{print $2}' | sort | paste -sd', ' || echo "n/a")"
 AVAIL_TMPL_STORES="$(pvesh get /storage --output-format json 2>/dev/null \
   | python3 -c "import sys,json; print(', '.join(sorted(s['storage'] for s in json.load(sys.stdin) if 'vztmpl' in s.get('content',''))))" 2>/dev/null || echo "n/a")"
 AVAIL_CT_STORES="$(pvesh get /storage --output-format json 2>/dev/null \
   | python3 -c "import sys,json; print(', '.join(sorted(s['storage'] for s in json.load(sys.stdin) if 'rootdir' in s.get('content',''))))" 2>/dev/null || echo "n/a")"
+AVAIL_ZFS_POOLS="$(zpool list -H -o name 2>/dev/null | sort | paste -sd, - | sed 's/,/, /g' || echo "n/a")"
 
 # ── Show defaults & confirm ───────────────────────────────────────────────────
+if [[ "$SHARE_STORAGE" == "rootfs" ]]; then
+  SHARE_DERIVED="inside CT rootfs: ${SMB_SHARE_PATH}"
+elif [[ "$SHARE_STORAGE" == /* ]]; then
+  SHARE_DERIVED="${SHARE_STORAGE} -> ${SMB_SHARE_PATH} (CT mp0)"
+else
+  SHARE_DERIVED="${SHARE_STORAGE}/samba-share-lxc${CT_ID} -> ${SMB_SHARE_PATH} (CT mp0)"
+fi
+
 cat <<EOF
 
-  Unbound DNS LXC Creator — Configuration
-  ────────────────────────────────────────
+  Samba File Server LXC Creator — Configuration
+  ────────────────────────────────────────────────
   CT ID:             $CT_ID
   Hostname:          $HN
   CPU:               $CPU core(s)
@@ -115,18 +138,27 @@ cat <<EOF
   Container Storage: $CONTAINER_STORAGE ($AVAIL_CT_STORES)
   Debian Version:    $DEBIAN_VERSION
   Timezone:          $APP_TZ
-  Domain:            ${UB_DOMAIN:-"(auto-detect)"}
+  Share Name:        $SMB_SHARE_NAME
+  Share Path:        $SMB_SHARE_PATH
+  Group:             $SMB_GROUP
+  Workgroup:         $SMB_WORKGROUP
+  Server Name:       $SMB_SERVER_NAME
+  Min Protocol:      $SMB_MIN_PROTOCOL
+  Server Signing:    $SMB_SERVER_SIGNING
+  SMB Encryption:    $SMB_ENCRYPTION
+  Share Storage:     $SHARE_STORAGE (available ZFS pools: $AVAIL_ZFS_POOLS)
+  Derived:           $SHARE_DERIVED
   Tags:              $TAGS
   Cleanup on fail:   $CLEANUP_ON_FAIL
-  ────────────────────────────────────────
+  ────────────────────────────────────────────────
   To change defaults, press Enter and
   edit the Config section at the top of
   this script, then re-run.
 
 EOF
 
-SCRIPT_URL="https://raw.githubusercontent.com/vdarkobar/scripts/main/unbound.sh"
-SCRIPT_LOCAL="/root/unbound.sh"
+SCRIPT_URL="https://raw.githubusercontent.com/vdarkobar/scripts/main/samba.sh"
+SCRIPT_LOCAL="/root/samba.sh"
 
 read -r -p "  Continue with these settings? [y/N]: " response
 case "$response" in
@@ -158,8 +190,8 @@ ip link show "$BRIDGE" >/dev/null 2>&1 || { echo "  ERROR: Bridge not found: $BR
 # ── Root password ─────────────────────────────────────────────────────────────
 PASSWORD=""
 while true; do
-  read -r -s -p "  Set root password: " PW1; echo
-  if [[ -z "$PW1" ]]; then echo "  Password cannot be blank."; continue; fi
+  read -r -s -p "  Set root password (blank allowed): " PW1; echo
+  [[ -z "$PW1" ]] && break
   if [[ "$PW1" == *" "* ]]; then echo "  Password cannot contain spaces."; continue; fi
   if [[ ${#PW1} -lt 5 ]]; then echo "  Password must be at least 5 characters."; continue; fi
   read -r -s -p "  Verify root password: " PW2; echo
@@ -168,9 +200,39 @@ while true; do
 done
 echo ""
 
+if [[ -z "$PASSWORD" ]]; then
+  echo "  WARNING: No root password was set."
+  [[ "$ALLOW_CONSOLE_AUTOLOGIN_IF_BLANK" -eq 1 ]] && echo "  WARNING: Console auto-login is enabled by configuration."
+  echo ""
+fi
+
+# ── First Samba user ──────────────────────────────────────────────────────────
+SMB_USER=""
+SMB_USER_PASS=""
+while true; do
+  read -r -p "  Samba username (blank = skip): " SMB_USER
+  [[ -z "$SMB_USER" ]] && break
+  if [[ ! "$SMB_USER" =~ ^[a-z_][a-z0-9_-]*$ ]]; then
+    echo "  Invalid: lowercase letters, numbers, underscore, dash only."
+    SMB_USER=""
+    continue
+  fi
+  while true; do
+    read -r -s -p "  Samba password for $SMB_USER: " SP1; echo
+    if [[ -z "$SP1" ]]; then echo "  Password cannot be blank."; continue; fi
+    if [[ ${#SP1} -lt 5 ]]; then echo "  Password must be at least 5 characters."; continue; fi
+    read -r -s -p "  Verify password: " SP2; echo
+    if [[ "$SP1" == "$SP2" ]]; then SMB_USER_PASS="$SP1"; break; fi
+    echo "  Passwords do not match. Try again."
+  done
+  break
+done
+echo ""
+
 # ── Template discovery & download ─────────────────────────────────────────────
 pveam update
 echo ""
+
 TEMPLATE="$(pveam available -section system | awk -v p="debian-${DEBIAN_VERSION}" '$2 ~ ("^" p) {print $2}' | sort -V | tail -n1)"
 if [[ -z "$TEMPLATE" ]]; then
   echo "  WARNING: No Debian ${DEBIAN_VERSION} template found, trying any Debian..." >&2
@@ -197,11 +259,34 @@ PCT_OPTIONS=(
   -features "nesting=1"
   -tags "$TAGS"
   -net0 "name=eth0,bridge=${BRIDGE},ip=dhcp,ip6=manual"
-  -password "$PASSWORD"
 )
+[[ -n "$PASSWORD" ]] && PCT_OPTIONS+=(-password "$PASSWORD")
 
 pct create "$CT_ID" "${TEMPLATE_STORAGE}:vztmpl/${TEMPLATE}" "${PCT_OPTIONS[@]}"
 CREATED=1
+
+# ── Share storage — ZFS dataset / bind-mount ──────────────────────────────────
+if [[ "$SHARE_STORAGE" == "rootfs" ]]; then
+  echo "  WARNING: No external share storage configured — share will use rootfs (${DISK} GB)." >&2
+elif [[ "$SHARE_STORAGE" == /* ]]; then
+  mkdir -p "$SHARE_STORAGE"
+  chown 100000:100000 "$SHARE_STORAGE"
+  pct set "$CT_ID" --mp0 "${SHARE_STORAGE},mp=${SMB_SHARE_PATH}"
+  echo "  Share mount: ${SHARE_STORAGE} -> ${SMB_SHARE_PATH} (CT ${CT_ID})"
+else
+  SHARE_DATASET="${SHARE_STORAGE}/samba-share-lxc${CT_ID}"
+  SHARE_HOST_PATH="$(zfs get -H -o value mountpoint "${SHARE_DATASET}" 2>/dev/null || true)"
+  if [[ -z "$SHARE_HOST_PATH" || "$SHARE_HOST_PATH" == "-" ]]; then
+    echo "  Creating ZFS dataset: ${SHARE_DATASET}"
+    zfs create -o compression=lz4 "${SHARE_DATASET}"
+    SHARE_HOST_PATH="$(zfs get -H -o value mountpoint "${SHARE_DATASET}")"
+  else
+    echo "  ZFS dataset already exists: ${SHARE_DATASET} -> ${SHARE_HOST_PATH}"
+  fi
+  chown 100000:100000 "$SHARE_HOST_PATH"
+  pct set "$CT_ID" --mp0 "${SHARE_HOST_PATH},mp=${SMB_SHARE_PATH}"
+  echo "  Share mount: ${SHARE_HOST_PATH} -> ${SMB_SHARE_PATH} (CT ${CT_ID})"
+fi
 
 # ── Start & wait for IPv4 ─────────────────────────────────────────────────────
 pct start "$CT_ID"
@@ -217,6 +302,21 @@ for i in $(seq 1 30); do
   sleep 1
 done
 [[ -n "$CT_IP" ]] || { echo "  ERROR: No IPv4 address acquired via DHCP within timeout." >&2; exit 1; }
+
+# ── Auto-login (if no password) ───────────────────────────────────────────────
+if [[ -z "$PASSWORD" && "${ALLOW_CONSOLE_AUTOLOGIN_IF_BLANK}" -eq 1 ]]; then
+  pct exec "$CT_ID" -- bash -lc '
+    set -euo pipefail
+    mkdir -p /etc/systemd/system/container-getty@1.service.d
+    cat > /etc/systemd/system/container-getty@1.service.d/override.conf <<EOF
+[Service]
+ExecStart=
+ExecStart=-/sbin/agetty --autologin root --noclear --keep-baud tty%I 115200,38400,9600 \$TERM
+EOF
+    systemctl daemon-reload
+    systemctl restart container-getty@1.service
+  '
+fi
 
 # ── OS update ─────────────────────────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc '
@@ -258,448 +358,166 @@ pct exec "$CT_ID" -- bash -lc "
   echo '${APP_TZ}' > /etc/timezone
 "
 
-# ── Detect domain name (inside CT) ────────────────────────────────────────────
-if [[ -z "$UB_DOMAIN" ]]; then
-  UB_DOMAIN="$(pct exec "$CT_ID" -- sh -lc "
-    awk '/^domain/ {print \$2; exit}' /etc/resolv.conf 2>/dev/null || true
-  " 2>/dev/null || true)"
-fi
-if [[ -z "$UB_DOMAIN" ]]; then
-  UB_DOMAIN="$(pct exec "$CT_ID" -- sh -lc "
-    awk '/^search/ {print \$2; exit}' /etc/resolv.conf 2>/dev/null || true
-  " 2>/dev/null || true)"
-fi
-if [[ -z "$UB_DOMAIN" ]]; then
-  read -r -p "  Could not detect domain. Enter local domain (e.g. home.local): " UB_DOMAIN
-  [[ -n "$UB_DOMAIN" ]] || { echo "  ERROR: Domain name is required." >&2; exit 1; }
-fi
-[[ "$UB_DOMAIN" =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)*$ ]] \
-  || { echo "  ERROR: Invalid domain name: $UB_DOMAIN" >&2; exit 1; }
-echo "  Domain: $UB_DOMAIN"
-
-# ── Install Unbound ───────────────────────────────────────────────────────────
+# ── Install Samba ─────────────────────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc '
   set -euo pipefail
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -qq
-  apt-get install -y unbound dnsutils dns-root-data wget
+  apt-get install -y samba samba-common-bin acl attr
 '
 
-# ── Update root hints (atomic) ────────────────────────────────────────────────
-pct exec "$CT_ID" -- bash -lc '
-  set -euo pipefail
-  tmp="$(mktemp)"
-  if wget -qO "$tmp" https://www.internic.net/domain/named.root && test -s "$tmp"; then
-    install -m 0644 "$tmp" /usr/share/dns/root.hints
-  else
-    echo "  WARNING: Failed to update root hints (using existing)"
-  fi
-  rm -f "$tmp"
-'
-
-# ── Write unbound.conf ────────────────────────────────────────────────────────
+# ── Create group and share directory ──────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc "
   set -euo pipefail
-  cat > /etc/unbound/unbound.conf <<'UNBOUND_CONF'
-# Unbound configuration file for Debian.
-#
-# See the unbound.conf(5) man page.
-#
-# See /usr/share/doc/unbound/examples/unbound.conf for a commented
-# reference config file.
-#
-# The following line includes additional configuration files from the
-# /etc/unbound/unbound.conf.d directory.
-
-include-toplevel: \"/etc/unbound/unbound.conf.d/*.conf\"
-
-# ============================================================================
-#                         Static DNS host records
-# ----------------------------------------------------------------------------
-# All local A and PTR records are maintained in:
-#
-#             /etc/unbound/unbound.conf.d/30-static-hosts.conf
-#
-# Do NOT add local-data entries in this file.
-# Modify the file above instead.
-#
-# ============================================================================
-# Authoritative, validating, recursive caching DNS with DNS-Over-TLS support
-# ============================================================================
-server:
-
-    # ------------------------------------------------------------------------
-    # Runtime environment
-    # ------------------------------------------------------------------------
-
-    # Limit permissions
-    username: \"unbound\"
-
-    # Working directory
-    directory: \"/etc/unbound\"
-
-    # Chain of Trust (system CA bundle for DNS-over-TLS upstream validation)
-    tls-cert-bundle: /etc/ssl/certs/ca-certificates.crt
-
-
-    # ------------------------------------------------------------------------
-    # Privacy
-    # ------------------------------------------------------------------------
-
-    # Send minimal amount of information to upstream servers to enhance privacy
-    qname-minimisation: yes
-
-
-    # ------------------------------------------------------------------------
-    # Centralized logging
-    # ------------------------------------------------------------------------
-
-    use-syslog: yes
-    # Increase to get more logging.
-    verbosity: 1
-    # For every user query that fails a line is printed
-    val-log-level: 1
-    # Logging of DNS queries
-    log-queries: no
-
-
-    # ------------------------------------------------------------------------
-    # Root trust and DNSSEC
-    # ------------------------------------------------------------------------
-
-    # Root hints (note: unused when forwarding \".\"; kept as reference/fallback)
-    root-hints: /usr/share/dns/root.hints
-    harden-dnssec-stripped: yes
-
-
-    # ------------------------------------------------------------------------
-    # Network interfaces
-    # ------------------------------------------------------------------------
-
-    # Listen on all interfaces, answer queries from allowed subnets (ACLs below)
-    interface: 0.0.0.0
-    # interface: ::0
-
-    do-ip4: yes
-    do-ip6: no
-    # do-ip6: yes
-    do-udp: yes
-    do-tcp: yes
-
-
-    # ------------------------------------------------------------------------
-    # Ports
-    # ------------------------------------------------------------------------
-
-    # Standard DNS
-    port: 53
-
-    # Local DNS-over-TLS port (for clients to unbound, only useful if you configure server cert/key)
-    # tls-port: 853
-
-
-    # ------------------------------------------------------------------------
-    # Upstream communication
-    # ------------------------------------------------------------------------
-
-    # Use TCP connections for all upstream communications
-    # when using DNS-over-TLS, otherwise default (no)
-    tcp-upstream: yes
-
-
-    # ------------------------------------------------------------------------
-    # Cache behaviour
-    # ------------------------------------------------------------------------
-
-    # Perform prefetching of almost expired DNS cache entries.
-    prefetch: yes
-
-    # Serve expired cache entries if upstream DNS is temporarily unreachable
-    # (RFC 8767 – improves resilience during ISP / upstream outages)
-    serve-expired: yes
-    serve-expired-ttl: 3600
-
-    # Enable DNS cache (TTL limits)
-    cache-max-ttl: 14400
-    cache-min-ttl: 1200
-
-
-    # ------------------------------------------------------------------------
-    # Unbound privacy and security
-    # ------------------------------------------------------------------------
-
-    aggressive-nsec: yes
-    hide-identity: yes
-    hide-version: yes
-    use-caps-for-id: yes
-
-
-    # =========================================================================
-    # Define Private Network and Access Control Lists (ACLs)
-    # =========================================================================
-
-    # Define private address ranges (RFC1918/ULA/link-local)
-    private-address: 10.0.0.0/8
-    private-address: 172.16.0.0/12
-    private-address: 192.168.0.0/16
-    private-address: 169.254.0.0/16
-    # private-address: fd00::/8
-    # private-address: fe80::/10
-
-
-    # ------------------------------------------------------------------------
-    # Control which clients are allowed to make (recursive) queries
-    # ------------------------------------------------------------------------
-
-    # Administrative access (localhost only)
-    access-control: 127.0.0.1/32 allow_snoop
-    # access-control: ::1/128 allow_snoop
-
-    # Normal DNS access from loopback
-    access-control: 127.0.0.0/8 allow
-    # access-control: ::1/128 allow
-
-
-    # ------------------------------------------------------------------------
-    # UniFi networks (VLAN's)
-    # ------------------------------------------------------------------------
-
-    # data located > /etc/unbound/unbound.conf.d/vlans.conf
-
-
-    # ------------------------------------------------------------------------
-    # Default deny (critical)
-    # ------------------------------------------------------------------------
-
-    access-control: 0.0.0.0/0 refuse
-    # access-control: ::0/0 refuse
-
-
-    # =========================================================================
-    # Setup Local Domain
-    # =========================================================================
-
-    # Internal DNS namespace
-    private-domain: \"__DOMAIN__\"
-
-    # Local authoritative zone
-    local-zone: \"__DOMAIN__.\" static
-
-    # A Records Local
-
-    # data located > /etc/unbound/unbound.conf.d/30-static-hosts.conf
-
-    # =========================================================================
-    # Reverse DNS (per VLAN / subnet)
-    # =========================================================================
-    # Define reverse zones for each VLAN subnet so PTR answers are authoritative.
-    # PTR records are defined using local-data-ptr (simple and readable).
-
-    # Reverse zones for /24 networks *(don't change: in-addr.arpa.)
-
-    # data located in > /etc/unbound/unbound.conf.d/30-static-hosts.conf
-
-    # Reverse Lookups Local (PTR records)
-
-    # data located in > /etc/unbound/unbound.conf.d/30-static-hosts.conf
-
-
-    # =========================================================================
-    # Unbound Performance Tuning and Tweak
-    # =========================================================================
-
-    num-threads: __CPU__
-    msg-cache-slabs: 8
-    rrset-cache-slabs: 8
-    infra-cache-slabs: 8
-    key-cache-slabs: 8
-    rrset-cache-size: 256m
-    msg-cache-size: 128m
-    so-rcvbuf: 8m
-
-
-# ============================================================================
-# Use DNS over TLS (Upstream Forwarding)
-# ============================================================================
-forward-zone:
-    name: \".\"
-    forward-tls-upstream: yes
-
-    # Quad9 DNS
-    forward-addr: 9.9.9.9@853#dns.quad9.net
-    forward-addr: 149.112.112.112@853#dns.quad9.net
-    # forward-addr: 2620:fe::11@853#dns.quad9.net
-    # forward-addr: 2620:fe::fe:11@853#dns.quad9.net
-
-    # Quad9 DNS (Malware Blocking + Privacy) slower
-    # forward-addr: 9.9.9.11@853#dns11.quad9.net
-    # forward-addr: 149.112.112.11@853#dns11.quad9.net
-    # forward-addr: 2620:fe::11@853#dns11.quad9.net
-    # forward-addr: 2620:fe::fe:11@853#dns11.quad9.net
-
-    # Cloudflare DNS
-    forward-addr: 1.1.1.1@853#cloudflare-dns.com
-    forward-addr: 1.0.0.1@853#cloudflare-dns.com
-    # forward-addr: 2606:4700:4700::1111@853#cloudflare-dns.com
-    # forward-addr: 2606:4700:4700::1001@853#cloudflare-dns.com
-
-    # Cloudflare DNS (Malware Blocking) slower
-    # forward-addr: 1.1.1.2@853#cloudflare-dns.com
-    # forward-addr: 2606:4700:4700::1112@853#cloudflare-dns.com
-    # forward-addr: 1.0.0.2@853#cloudflare-dns.com
-    # forward-addr: 2606:4700:4700::1002@853#cloudflare-dns.com
-
-    # Google
-    # forward-addr: 8.8.8.8@853#dns.google
-    # forward-addr: 8.8.4.4@853#dns.google
-    # forward-addr: 2001:4860:4860::8888@853#dns.google
-    # forward-addr: 2001:4860:4860::8844@853#dns.google
-UNBOUND_CONF
+  
+  # Create group
+  if ! getent group '${SMB_GROUP}' >/dev/null 2>&1; then
+    groupadd '${SMB_GROUP}'
+  fi
+  
+  # Create share directory
+  mkdir -p '${SMB_SHARE_PATH}'
+  chown root:'${SMB_GROUP}' '${SMB_SHARE_PATH}'
+  chmod 2775 '${SMB_SHARE_PATH}'
+  
+  # Set default ACLs
+  setfacl -d -m 'g:${SMB_GROUP}:rwx' '${SMB_SHARE_PATH}' 2>/dev/null || true
+  setfacl -d -m 'm:rwx' '${SMB_SHARE_PATH}' 2>/dev/null || true
+"
+
+# ── Write smb.conf ────────────────────────────────────────────────────────────
+pct exec "$CT_ID" -- bash -lc "
+  set -euo pipefail
+  
+  # Backup original
+  [[ -f /etc/samba/smb.conf ]] && cp /etc/samba/smb.conf /etc/samba/smb.conf.orig
+  
+  cat > /etc/samba/smb.conf <<'SAMBA_CONF'
+#======================= Global Settings =======================
+
+[global]
+   workgroup = __WORKGROUP__
+   server string = Samba File Server %v
+   netbios name = __SERVER_NAME__
+
+   security = user
+   passdb backend = tdbsam
+   map to guest = never
+
+   server min protocol = __MIN_PROTOCOL__
+   client min protocol = __MIN_PROTOCOL__
+   server signing = __SERVER_SIGNING__
+   client signing = __SERVER_SIGNING__
+   smb encrypt = __SMB_ENCRYPTION__
+   server smb3 encryption algorithms = AES-256-GCM, AES-256-CCM
+   server smb3 signing algorithms = AES-256-GMAC
+   ntlm auth = ntlmv2-only
+
+   log file = /var/log/samba/log.%m
+   max log size = 5000
+   log level = 1
+   logging = syslog@1 file
+
+   load printers = no
+   printcap name = /dev/null
+   disable spoolss = yes
+   show add printer wizard = no
+
+   dns proxy = no
+
+   unix extensions = no
+   follow symlinks = no
+   wide links = no
+
+#======================= Share Definitions =======================
+
+[__SHARE_NAME__]
+   comment = Shared Directory
+   path = __SHARE_PATH__
+   browseable = yes
+   writable = yes
+   guest ok = no
+   valid users = @__GROUP__
+   create mask = 0664
+   directory mask = 2775
+   force group = __GROUP__
+
+   oplocks = yes
+   level2 oplocks = yes
+
+   vfs objects = acl_xattr
+   inherit acls = yes
+   inherit permissions = yes
+   ea support = yes
+   store dos attributes = yes
+   map archive = no
+   map hidden = no
+   map readonly = no
+   map system = no
+SAMBA_CONF
 "
 
 # Replace placeholders
-pct exec "$CT_ID" -- sed -i "s/__DOMAIN__/${UB_DOMAIN}/g" /etc/unbound/unbound.conf
-pct exec "$CT_ID" -- sed -i "s/__CPU__/${CPU}/g"         /etc/unbound/unbound.conf
-
-# ── Create drop-in: vlans.conf ────────────────────────────────────────────────
-pct exec "$CT_ID" -- bash -lc '
-  set -euo pipefail
-  mkdir -p /etc/unbound/unbound.conf.d
-  cat > /etc/unbound/unbound.conf.d/vlans.conf <<VLANS
-# VLAN access-control and reverse zones for Unbound
-# Uncomment and adjust subnets for your network, then reload:
-#   systemctl reload unbound
-#
-# Each VLAN that should query this DNS server needs an access-control
-# line and (for /24 networks) a reverse zone for PTR lookups.
-
-server:
-
-    # ------------------------------------------------------------------------
-    # VLAN networks - allowed to query this DNS server
-    # ------------------------------------------------------------------------
-
-    # access-control: 192.168.1.0/24 allow    # Main LAN
-    # access-control: 192.168.20.0/24 allow   # IoT VLAN
-    # access-control: 192.168.30.0/24 allow   # Guest VLAN
-    # access-control: 10.10.0.0/24 allow      # Management VLAN
-
-    # ------------------------------------------------------------------------
-    # Reverse zones for /24 networks
-    # ------------------------------------------------------------------------
-
-    # local-zone: "1.168.192.in-addr.arpa." static      # Main LAN
-    # local-zone: "20.168.192.in-addr.arpa." static     # IoT VLAN
-    # local-zone: "30.168.192.in-addr.arpa." static     # Guest VLAN
-    # local-zone: "10.10.10.in-addr.arpa." static       # Management VLAN
-VLANS
-'
-
-# ── Create drop-in: 30-static-hosts.conf ──────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc "
   set -euo pipefail
-  cat > /etc/unbound/unbound.conf.d/30-static-hosts.conf <<HOSTS
-# Static DNS host records (A + PTR) for Unbound
-# Domain: ${UB_DOMAIN}
-# Uncomment and adjust for your infrastructure, then reload:
-#   systemctl reload unbound
-#
-# Format:
-#   local-data: \"hostname.${UB_DOMAIN}. IN A <ip>\"
-#   local-data-ptr: \"<ip> hostname.${UB_DOMAIN}\"
-
-server:
-
-    # =========================================================================
-    # Subnet: 192.168.1.0/24  (example — adjust to your network)
-    # =========================================================================
-
-    # local-data: \"proxmox.${UB_DOMAIN}. IN A 192.168.1.10\"
-    # local-data-ptr: \"192.168.1.10 proxmox.${UB_DOMAIN}\"
-
-    # local-data: \"nas.${UB_DOMAIN}. IN A 192.168.1.20\"
-    # local-data-ptr: \"192.168.1.20 nas.${UB_DOMAIN}\"
-
-    # local-data: \"printer.${UB_DOMAIN}. IN A 192.168.1.30\"
-    # local-data-ptr: \"192.168.1.30 printer.${UB_DOMAIN}\"
-HOSTS
+  sed -i \
+    -e 's|__WORKGROUP__|${SMB_WORKGROUP}|g' \
+    -e 's|__SERVER_NAME__|${SMB_SERVER_NAME}|g' \
+    -e 's|__MIN_PROTOCOL__|${SMB_MIN_PROTOCOL}|g' \
+    -e 's|__SERVER_SIGNING__|${SMB_SERVER_SIGNING}|g' \
+    -e 's|__SMB_ENCRYPTION__|${SMB_ENCRYPTION}|g' \
+    -e 's|__SHARE_NAME__|${SMB_SHARE_NAME}|g' \
+    -e 's|__SHARE_PATH__|${SMB_SHARE_PATH}|g' \
+    -e 's|__GROUP__|${SMB_GROUP}|g' \
+    /etc/samba/smb.conf
 "
 
 # ── Validate config ───────────────────────────────────────────────────────────
-if pct exec "$CT_ID" -- unbound-checkconf /etc/unbound/unbound.conf >/dev/null 2>&1; then
+# Note: "Weak crypto is allowed by GnuTLS" is a cosmetic testparm message
+# reflecting system GnuTLS state, not a config problem. Safe to ignore —
+# smb.conf enforces SMB3 + mandatory encryption + ntlmv2-only.
+if pct exec "$CT_ID" -- testparm -s /etc/samba/smb.conf >/dev/null 2>&1; then
   echo "  Configuration validation passed"
 else
-  echo "  ERROR: Unbound configuration validation failed." >&2
-  pct exec "$CT_ID" -- unbound-checkconf /etc/unbound/unbound.conf >&2 || true
+  echo "  ERROR: smb.conf validation failed" >&2
+  pct exec "$CT_ID" -- testparm -s /etc/samba/smb.conf >&2 || true
   exit 1
 fi
 
-# ── Cron: quarterly root hints update (atomic) ────────────────────────────────
+# ── Start services ────────────────────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc '
   set -euo pipefail
-  export DEBIAN_FRONTEND=noninteractive
-  apt-get update -qq
-  apt-get install -y cron
-  systemctl enable --now cron
-  ( crontab -l 2>/dev/null || true
-    echo ""
-    echo "# Update root hints and reload unbound (quarterly)"
-    echo "0 0 1 */3 * tmp=\$(mktemp) && wget -qO \"\$tmp\" https://www.internic.net/domain/named.root && test -s \"\$tmp\" && install -m 0644 \"\$tmp\" /usr/share/dns/root.hints && rm -f \"\$tmp\" && systemctl reload unbound"
-  ) | crontab -
-'
-
-# ── Start service ─────────────────────────────────────────────────────────────
-pct exec "$CT_ID" -- bash -lc '
-  set -euo pipefail
-  systemctl enable unbound
-  systemctl restart unbound
+  mkdir -p /var/log/samba
+  systemctl enable smbd
+  systemctl restart smbd
 '
 sleep 2
 
-# ── Persist DNS settings via Proxmox (CT will use itself on boot) ─────────────
-pct set "$CT_ID" --nameserver 127.0.0.1 --searchdomain "$UB_DOMAIN"
-
-# Apply immediately (pct set only takes effect on next boot)
-pct exec "$CT_ID" -- bash -lc "
-  set -euo pipefail
-  cat > /etc/resolv.conf <<EOF
-nameserver 127.0.0.1
-domain ${UB_DOMAIN}
-search ${UB_DOMAIN}
-EOF
-"
-
-# ── Prevent DHCP from overriding DNS settings ─────────────────────────────────
-pct exec "$CT_ID" -- bash -lc "
-  set -euo pipefail
-  mkdir -p /etc/dhcp
-  cat > /etc/dhcp/dhclient.conf <<EOF
-# Unbound DNS container - ignore DHCP DNS from router
-supersede domain-name-servers 127.0.0.1;
-supersede domain-name \"${UB_DOMAIN}\";
-supersede domain-search \"${UB_DOMAIN}\";
-EOF
-"
-
-# ── Health check ─────────────────────────────────────────────────────────────
-UB_HEALTHY=0
-for i in $(seq 1 15); do
-  if pct exec "$CT_ID" -- dig @127.0.0.1 google.com +short +time=2 +tries=1 >/dev/null 2>&1; then
-    UB_HEALTHY=1
-    break
-  fi
-  sleep 1
-done
-
-if [[ "$UB_HEALTHY" -eq 1 ]]; then
-  echo "  Unbound is resolving queries"
+# Verify smbd is running
+if pct exec "$CT_ID" -- systemctl is-active --quiet smbd 2>/dev/null; then
+  echo "  Samba service is running"
 else
-  echo "  WARNING: Unbound not responding yet — service may still be initializing." >&2
-  echo "  Check manually: pct enter $CT_ID -> dig @127.0.0.1 google.com" >&2
-  pct exec "$CT_ID" -- journalctl -u unbound --no-pager -n 20 >&2 || true
+  echo "  WARNING: Samba service may not have started." >&2
+  pct exec "$CT_ID" -- journalctl -u smbd --no-pager -n 20 >&2 || true
 fi
 
-# ── Unattended upgrades (do NOT overwrite Debian defaults) ────────────────────
+if pct exec "$CT_ID" -- sh -lc "ss -ltn 2>/dev/null | grep -q ':445 '" 2>/dev/null; then
+  echo "  SMB port 445 is listening"
+else
+  echo "  WARNING: SMB port 445 is not listening." >&2
+  pct exec "$CT_ID" -- journalctl -u smbd --no-pager -n 20 >&2 || true
+fi
+
+# ── Create first Samba user ───────────────────────────────────────────────────
+if [[ -n "$SMB_USER" ]]; then
+  pct exec "$CT_ID" -- useradd -M -s /usr/sbin/nologin -G "$SMB_GROUP" "$SMB_USER"
+  printf '%s\n%s\n' "$SMB_USER_PASS" "$SMB_USER_PASS" \
+    | pct exec "$CT_ID" -- smbpasswd -a -s "$SMB_USER"
+  pct exec "$CT_ID" -- smbpasswd -e "$SMB_USER"
+  echo "  Samba user created: $SMB_USER"
+fi
+
+# ── Unattended upgrades ───────────────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc '
   set -euo pipefail
   export DEBIAN_FRONTEND=noninteractive
@@ -735,9 +553,10 @@ EOF
 '
 
 # ── Sysctl hardening ──────────────────────────────────────────────────────────
-pct exec "$CT_ID" -- bash -lc '
+pct exec "$CT_ID" -- bash -lc "
   set -euo pipefail
-  cat > /etc/sysctl.d/99-hardening.conf <<EOF
+  {
+    cat <<'EOF'
 net.ipv4.conf.all.rp_filter = 1
 net.ipv4.conf.default.rp_filter = 1
 net.ipv4.conf.all.accept_redirects = 0
@@ -749,20 +568,16 @@ net.ipv4.conf.default.accept_source_route = 0
 net.ipv4.icmp_echo_ignore_broadcasts = 1
 net.ipv4.icmp_ignore_bogus_error_responses = 1
 EOF
-  sysctl --system >/dev/null 2>&1 || true
-'
-
-if [[ "${DISABLE_IPV6:-1}" -eq 1 ]]; then
-  pct exec "$CT_ID" -- bash -lc '
-    set -euo pipefail
-    cat >> /etc/sysctl.d/99-hardening.conf <<EOF
+    if [[ '${DISABLE_IPV6}' -eq 1 ]]; then
+      cat <<'EOF'
 net.ipv6.conf.all.disable_ipv6 = 1
 net.ipv6.conf.default.disable_ipv6 = 1
 net.ipv6.conf.lo.disable_ipv6 = 1
 EOF
-    sysctl --system >/dev/null 2>&1 || true
-  '
-fi
+    fi
+  } > /etc/sysctl.d/99-hardening.conf
+  sysctl --system >/dev/null 2>&1 || true
+"
 
 # ── Cleanup packages ──────────────────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc '
@@ -782,7 +597,7 @@ pct exec "$CT_ID" -- bash -lc "
 
   cat > /etc/update-motd.d/00-header <<'MOTD'
 #!/bin/sh
-printf '\n  Unbound DNS Resolver (DNS-over-TLS)\n'
+printf '\n  Samba File Server (SMB3 encrypted)\n'
 printf '  ────────────────────────────────────\n'
 MOTD
 
@@ -797,20 +612,22 @@ MOTD
 
   cat > /etc/update-motd.d/30-app <<'MOTD'
 #!/bin/sh
-if systemctl is-active --quiet unbound 2>/dev/null; then
-  printf '  Unbound:   running\n'
+if systemctl is-active --quiet smbd 2>/dev/null; then
+  printf '  Samba:     running\n'
 else
-  printf '  Unbound:   stopped\n'
+  printf '  Samba:     stopped\n'
 fi
-printf '  Config:    /etc/unbound/unbound.conf\n'
+printf '  Config:    /etc/samba/smb.conf\n'
+printf '  Share:     ${SMB_SHARE_PATH}\n'
+printf '  Storage:   ${SHARE_DERIVED}\n'
+printf '  Group:     ${SMB_GROUP}\n'
+printf '  Validate:  testparm -s\n'
+printf '  Restart:   systemctl restart smbd\n'
 printf '\n'
-printf '  # requires post-install editing\n'
-printf '  VLANs:     /etc/unbound/unbound.conf.d/vlans.conf\n'
-printf '  Hosts:     /etc/unbound/unbound.conf.d/30-static-hosts.conf\n'
-printf '  Reload:    systemctl reload unbound\n'
-printf '  Test:      dig google.com\n'
-printf '  Updates:   unattended-upgrades (automatic)\n'
-printf '  Hints:     quarterly cron (internic.net)\n'
+printf '  Add user:\n'
+printf '    useradd -M -s /usr/sbin/nologin -G ${SMB_GROUP} <user>\n'
+printf '    smbpasswd -a <user>\n'
+printf '    smbpasswd -e <user>\n'
 MOTD
 
   cat > /etc/update-motd.d/99-footer <<'MOTD'
@@ -828,37 +645,31 @@ pct exec "$CT_ID" -- bash -lc '
 '
 
 # ── Proxmox UI description ────────────────────────────────────────────────────
-UB_DESC="Unbound DNS (${CT_IP})
-<details><summary>Details</summary>Unbound DNS Resolver (DNS-over-TLS) on Debian ${DEBIAN_VERSION} LXC
-Domain: ${UB_DOMAIN}
-Created by unbound.sh</details>"
-pct set "$CT_ID" --description "$UB_DESC"
+SMB_DESC="Samba File Server (${CT_IP})
+<details><summary>Details</summary>Samba File Server (SMB3 encrypted) on Debian ${DEBIAN_VERSION} LXC
+Share: ${SMB_SHARE_NAME} → ${SMB_SHARE_PATH}
+Workgroup: ${SMB_WORKGROUP}
+Created by samba.sh</details>"
+pct set "$CT_ID" --description "$SMB_DESC"
 
 # ── Protect container ─────────────────────────────────────────────────────────
 pct set "$CT_ID" --protection 1
 
 # ── Summary ───────────────────────────────────────────────────────────────────
 echo ""
-echo "  CT: $CT_ID | IP: ${CT_IP} | Login: password set"
+echo "CT: $CT_ID | IP: ${CT_IP} | SMB: \\\\${CT_IP}\\${SMB_SHARE_NAME} | User: ${SMB_USER:-none} | Login: $([ -n "$PASSWORD" ] && echo 'password set' || { [ "${ALLOW_CONSOLE_AUTOLOGIN_IF_BLANK}" -eq 1 ] && echo 'no password + console autologin' || echo 'no password set'; })"
 echo ""
-echo "  Access:"
-echo "    DNS:    ${CT_IP}:53"
+echo "  Share storage:"
+if [[ "$SHARE_STORAGE" == "rootfs" ]]; then
+  echo "    ${SMB_SHARE_PATH} (rootfs — consider external storage for production)"
+elif [[ "$SHARE_STORAGE" == /* ]]; then
+  echo "    ${SHARE_STORAGE} -> ${SMB_SHARE_PATH} (CT mp0)"
+else
+  echo "    ${SHARE_STORAGE}/samba-share-lxc${CT_ID} -> ${SHARE_HOST_PATH} -> ${SMB_SHARE_PATH} (CT mp0)"
+fi
 echo ""
-echo "  Domain:   ${UB_DOMAIN}"
-echo ""
-echo "  Config files:"
-echo "    /etc/unbound/unbound.conf"
-echo ""
-echo "    # requires post-install editing"
-echo "    /etc/unbound/unbound.conf.d/vlans.conf"
-echo "    /etc/unbound/unbound.conf.d/30-static-hosts.conf"
-echo ""
-echo "  Reload after edits:"
-echo "    pct exec $CT_ID -- systemctl reload unbound"
-echo ""
-echo "  Updates:"
-echo "    Package:  unattended-upgrades (automatic)"
-echo "    Hints:    quarterly cron — /usr/share/dns/root.hints"
-echo ""
-echo "  Done."
+echo "  Add more Samba users:"
+echo "    pct exec $CT_ID -- useradd -M -s /usr/sbin/nologin -G $SMB_GROUP <username>"
+echo "    pct exec $CT_ID -- smbpasswd -a <username>"
+echo "    pct exec $CT_ID -- smbpasswd -e <username>"
 echo ""
