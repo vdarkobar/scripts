@@ -23,6 +23,7 @@ SMB_SERVER_SIGNING="required"
 SMB_ENCRYPTION="required"
 TAGS="samba;fileserver;lxc"
 DEBIAN_VERSION=13
+SHARE_STORAGE="rootfs"              # rootfs | <zfs-pool-name> | /host/path
 
 # Post-install: add more Samba users inside the CT
 #   pct exec <CT_ID> -- useradd -M -s /usr/sbin/nologin -G sambashare <username>
@@ -46,6 +47,7 @@ CLEANUP_ON_FAIL=1  # 1 = destroy CT on error, 0 = keep for debugging
 #   /etc/apt/apt.conf.d/52unattended-<hostname>.conf
 #   /etc/apt/apt.conf.d/20auto-upgrades
 #   /etc/sysctl.d/99-hardening.conf
+#   <pool>/samba-share-lxc<CT_ID>                                      (optional: ZFS dataset, when SHARE_STORAGE=<pool>)
 
 # ── Validate config values (guard against sed injection) ──────────────────────
 fail=""
@@ -60,6 +62,11 @@ fail=""
 [[ "$SMB_ENCRYPTION"     =~ ^[a-z]+$ ]]              || fail="SMB_ENCRYPTION"
 if [[ -n "$fail" ]]; then
   echo "  ERROR: Invalid characters in $fail — check the Config section." >&2
+  exit 1
+fi
+
+if [[ "$SHARE_STORAGE" != "rootfs" && "$SHARE_STORAGE" != /* && ! "$SHARE_STORAGE" =~ ^[A-Za-z0-9_.:-]+$ ]]; then
+  echo "  ERROR: SHARE_STORAGE must be rootfs, an absolute host path, or a ZFS pool name." >&2
   exit 1
 fi
 
@@ -96,14 +103,27 @@ done
 [[ -n "$CT_ID" ]] || { echo "  ERROR: Could not obtain next CT ID." >&2; exit 1; }
 [[ "$DEBIAN_VERSION" =~ ^[0-9]+$ ]] || { echo "  ERROR: DEBIAN_VERSION must be numeric." >&2; exit 1; }
 
+if [[ "$SHARE_STORAGE" != "rootfs" && "$SHARE_STORAGE" != /* ]]; then
+  command -v zfs >/dev/null 2>&1 || { echo "  ERROR: zfs command is required when SHARE_STORAGE is a ZFS pool name." >&2; exit 1; }
+fi
+
 # ── Discover available resources ──────────────────────────────────────────────
 AVAIL_BRIDGES="$(ip -o link show type bridge 2>/dev/null | awk -F': ' '{print $2}' | sort | paste -sd', ' || echo "n/a")"
 AVAIL_TMPL_STORES="$(pvesh get /storage --output-format json 2>/dev/null \
   | python3 -c "import sys,json; print(', '.join(sorted(s['storage'] for s in json.load(sys.stdin) if 'vztmpl' in s.get('content',''))))" 2>/dev/null || echo "n/a")"
 AVAIL_CT_STORES="$(pvesh get /storage --output-format json 2>/dev/null \
   | python3 -c "import sys,json; print(', '.join(sorted(s['storage'] for s in json.load(sys.stdin) if 'rootdir' in s.get('content',''))))" 2>/dev/null || echo "n/a")"
+AVAIL_ZFS_POOLS="$(zpool list -H -o name 2>/dev/null | sort | paste -sd, - | sed 's/,/, /g' || echo "n/a")"
 
 # ── Show defaults & confirm ───────────────────────────────────────────────────
+if [[ "$SHARE_STORAGE" == "rootfs" ]]; then
+  SHARE_DERIVED="inside CT rootfs: ${SMB_SHARE_PATH}"
+elif [[ "$SHARE_STORAGE" == /* ]]; then
+  SHARE_DERIVED="${SHARE_STORAGE} -> ${SMB_SHARE_PATH} (CT mp0)"
+else
+  SHARE_DERIVED="${SHARE_STORAGE}/samba-share-lxc${CT_ID} -> ${SMB_SHARE_PATH} (CT mp0)"
+fi
+
 cat <<EOF
 
   Samba File Server LXC Creator — Configuration
@@ -126,6 +146,8 @@ cat <<EOF
   Min Protocol:      $SMB_MIN_PROTOCOL
   Server Signing:    $SMB_SERVER_SIGNING
   SMB Encryption:    $SMB_ENCRYPTION
+  Share Storage:     $SHARE_STORAGE (available ZFS pools: $AVAIL_ZFS_POOLS)
+  Derived:           $SHARE_DERIVED
   Tags:              $TAGS
   Cleanup on fail:   $CLEANUP_ON_FAIL
   ────────────────────────────────────────────────
@@ -242,6 +264,29 @@ PCT_OPTIONS=(
 
 pct create "$CT_ID" "${TEMPLATE_STORAGE}:vztmpl/${TEMPLATE}" "${PCT_OPTIONS[@]}"
 CREATED=1
+
+# ── Share storage — ZFS dataset / bind-mount ──────────────────────────────────
+if [[ "$SHARE_STORAGE" == "rootfs" ]]; then
+  echo "  WARNING: No external share storage configured — share will use rootfs (${DISK} GB)." >&2
+elif [[ "$SHARE_STORAGE" == /* ]]; then
+  mkdir -p "$SHARE_STORAGE"
+  chown 100000:100000 "$SHARE_STORAGE"
+  pct set "$CT_ID" --mp0 "${SHARE_STORAGE},mp=${SMB_SHARE_PATH}"
+  echo "  Share mount: ${SHARE_STORAGE} -> ${SMB_SHARE_PATH} (CT ${CT_ID})"
+else
+  SHARE_DATASET="${SHARE_STORAGE}/samba-share-lxc${CT_ID}"
+  SHARE_HOST_PATH="$(zfs get -H -o value mountpoint "${SHARE_DATASET}" 2>/dev/null || true)"
+  if [[ -z "$SHARE_HOST_PATH" || "$SHARE_HOST_PATH" == "-" ]]; then
+    echo "  Creating ZFS dataset: ${SHARE_DATASET}"
+    zfs create -o compression=lz4 "${SHARE_DATASET}"
+    SHARE_HOST_PATH="$(zfs get -H -o value mountpoint "${SHARE_DATASET}")"
+  else
+    echo "  ZFS dataset already exists: ${SHARE_DATASET} -> ${SHARE_HOST_PATH}"
+  fi
+  chown 100000:100000 "$SHARE_HOST_PATH"
+  pct set "$CT_ID" --mp0 "${SHARE_HOST_PATH},mp=${SMB_SHARE_PATH}"
+  echo "  Share mount: ${SHARE_HOST_PATH} -> ${SMB_SHARE_PATH} (CT ${CT_ID})"
+fi
 
 # ── Start & wait for IPv4 ─────────────────────────────────────────────────────
 pct start "$CT_ID"
@@ -574,6 +619,7 @@ else
 fi
 printf '  Config:    /etc/samba/smb.conf\n'
 printf '  Share:     ${SMB_SHARE_PATH}\n'
+printf '  Storage:   ${SHARE_DERIVED}\n'
 printf '  Group:     ${SMB_GROUP}\n'
 printf '  Validate:  testparm -s\n'
 printf '  Restart:   systemctl restart smbd\n'
@@ -612,6 +658,15 @@ pct set "$CT_ID" --protection 1
 # ── Summary ───────────────────────────────────────────────────────────────────
 echo ""
 echo "CT: $CT_ID | IP: ${CT_IP} | SMB: \\\\${CT_IP}\\${SMB_SHARE_NAME} | User: ${SMB_USER:-none} | Login: $([ -n "$PASSWORD" ] && echo 'password set' || { [ "${ALLOW_CONSOLE_AUTOLOGIN_IF_BLANK}" -eq 1 ] && echo 'no password + console autologin' || echo 'no password set'; })"
+echo ""
+echo "  Share storage:"
+if [[ "$SHARE_STORAGE" == "rootfs" ]]; then
+  echo "    ${SMB_SHARE_PATH} (rootfs — consider external storage for production)"
+elif [[ "$SHARE_STORAGE" == /* ]]; then
+  echo "    ${SHARE_STORAGE} -> ${SMB_SHARE_PATH} (CT mp0)"
+else
+  echo "    ${SHARE_STORAGE}/samba-share-lxc${CT_ID} -> ${SHARE_HOST_PATH} -> ${SMB_SHARE_PATH} (CT mp0)"
+fi
 echo ""
 echo "  Add more Samba users:"
 echo "    pct exec $CT_ID -- useradd -M -s /usr/sbin/nologin -G $SMB_GROUP <username>"
