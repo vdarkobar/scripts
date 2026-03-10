@@ -7,7 +7,6 @@ SERVICE_USER="filebrowser"
 INSTALL_BIN="/usr/local/bin/filebrowser"
 CONFIG_DIR="/opt/filebrowser"
 CONFIG_FILE="${CONFIG_DIR}/fq-config.yaml"
-ENV_FILE="${CONFIG_DIR}/.env"
 DB_FILE="${CONFIG_DIR}/database.db"
 SERVICE_NAME="filebrowser"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
@@ -46,7 +45,7 @@ command -v systemctl >/dev/null 2>&1 \
 [[ "$(id -u)" -eq 0 ]] \
   || { echo "  ERROR: Run as root." >&2; exit 1; }
 
-# Bootstrap curl before checking for it
+# Bootstrap curl before checking for it — it may just need installing
 if ! command -v curl >/dev/null 2>&1; then
   echo "  curl not found — installing..."
   # AUDIT FIX 4: always update before install; surface errors
@@ -75,10 +74,10 @@ if [[ -x "$INSTALL_BIN" && -f "$CONFIG_FILE" && -f "$SERVICE_FILE" ]]; then
   read -rp "  Uninstall ${APP}? (y/N): " _uninstall
   if [[ "${_uninstall,,}" =~ ^(y|yes)$ ]]; then
     echo "  Uninstalling ${APP}..."
-    systemctl disable --now "${SERVICE_NAME}.service" 2>/dev/null || true
+    systemctl disable --now "${SERVICE_NAME}.service" &>/dev/null || true
     rm -f "$SERVICE_FILE"
-    systemctl daemon-reload 2>/dev/null || true
-    rm -f "$INSTALL_BIN" "$CONFIG_FILE" "$ENV_FILE" "$DB_FILE"
+    systemctl daemon-reload &>/dev/null || true
+    rm -f "$INSTALL_BIN" "$CONFIG_FILE" "$DB_FILE"
     # AUDIT FIX 8: clarify that service user, config dir, and share dir are kept
     echo ""
     echo "  [OK]    ${APP} app files removed."
@@ -99,8 +98,14 @@ if [[ -x "$INSTALL_BIN" && -f "$CONFIG_FILE" && -f "$SERVICE_FILE" ]]; then
       exit 1
     fi
     chmod +x "$TMP_BIN"
+    if ! "$TMP_BIN" version >/dev/null 2>&1; then
+      echo "  ERROR: Downloaded binary failed version check — aborting update" >&2
+      rm -f "$TMP_BIN"
+      exit 1
+    fi
+    _ver="$("$TMP_BIN" version 2>/dev/null | head -n1 || true)"
     mv -f "$TMP_BIN" "$INSTALL_BIN"
-    echo "  [OK]    Binary updated"
+    echo "  [OK]    Binary updated to: ${_ver:-unknown}"
     if systemctl restart "$SERVICE_NAME"; then
       echo "  [OK]    Service restarted"
     else
@@ -147,6 +152,7 @@ if [[ "$FQ_NOAUTH" -eq 0 ]]; then
     read -r -s -p "  Set FileBrowser admin password: " AP1; echo
     if [[ -z "$AP1" ]];          then echo "  Password cannot be blank."; continue; fi
     if [[ "$AP1" == *" "* ]];    then echo "  Password cannot contain spaces."; continue; fi
+    if [[ "$AP1" == *","* ]];    then echo "  Password cannot contain commas."; continue; fi
     if [[ ${#AP1} -lt 8 ]];      then echo "  Password must be at least 8 characters."; continue; fi
     read -r -s -p "  Verify admin password: " AP2; echo
     if [[ "$AP1" == "$AP2" ]]; then FQ_ADMIN_PASS="$AP1"; break; fi
@@ -170,33 +176,49 @@ if ! id "$SERVICE_USER" &>/dev/null; then
 fi
 
 # ── Suggest users for shared access ───────────────────────────────────────────
-# AUDIT FIX 5: show human accounts (UID >= 1000), not just service accounts (100–999)
-_noise="nobody"
+# Show both installed service accounts (UID 100–999) and human accounts (UID 1000+)
+# as candidates for share access — e.g. jellyfin, kavita, vaultwarden, or a human login.
+# Well-known OS noise is filtered out; the filebrowser service user is excluded (it already
+# has direct ACL access set below).
+_svc_noise="nobody messagebus systemd-network systemd-resolve systemd-timesync \
+            _apt daemon bin sys games man lp mail news uucp proxy www-data \
+            backup list irc gnats sshd"
 
-echo ""
-echo "  Human users found on this system (UID >= 1000):"
 _found=0
+_share_candidates=()
+
 while IFS=: read -r _name _ _uid _; do
-  if (( _uid >= 1000 && _uid <= 60000 )); then
+  # Service accounts: 100–999 (installed apps)
+  if (( _uid >= 100 && _uid <= 999 )); then
+    [[ "$_name" == "$SERVICE_USER" ]] && continue
     _skip=0
-    for _n in $_noise; do [[ "$_name" == "$_n" ]] && _skip=1 && break; done
-    if [[ "$_skip" -eq 0 ]]; then
-      echo "    - ${_name}"
-      _found=1
-    fi
+    for _n in $_svc_noise; do [[ "$_name" == "$_n" ]] && _skip=1 && break; done
+    [[ "$_skip" -eq 0 ]] && _share_candidates+=("$_name") && _found=1
+  # Human accounts: 1000–60000
+  elif (( _uid >= 1000 && _uid <= 60000 )); then
+    _share_candidates+=("$_name") && _found=1
   fi
 done < /etc/passwd
-[[ "$_found" -eq 0 ]] && echo "    (none — you may still enter usernames manually)"
 
-echo ""
-read -rp "  Add users to access '${SERVE_ROOT}' (space-separated, or Enter to skip): " _input
-SHARE_USERS="${_input:-}"
-echo ""
+SHARE_USERS=""
+if [[ "$_found" -eq 1 ]]; then
+  echo ""
+  echo "  Users available for share access:"
+  for _u in "${_share_candidates[@]}"; do echo "    - ${_u}"; done
+  echo ""
+  read -rp "  Add users to access '${SERVE_ROOT}' (space-separated, or Enter to skip): " _input
+  SHARE_USERS="${_input:-}"
+  echo ""
+else
+  echo "  [NOTE]  No candidate users found — skipping share-access prompt."
+  echo "          Add users later with: setfacl -m u:<username>:rwx ${SERVE_ROOT}"
+  echo ""
+fi
 
 # ── Download binary ────────────────────────────────────────────────────────────
 echo "  Downloading ${APP} binary (${APP_VERSION})..."
-# AUDIT FIX 7: note — no checksum/signature available from this upstream yet.
-# Validate by inspecting the binary's reported version after install.
+# No checksum/signature feed available from this upstream yet.
+# Validate the download before replacing any live binary.
 TMP_BIN="$(mktemp)"
 if ! curl -fsSL "$RELEASE_URL" -o "$TMP_BIN"; then
   echo "  ERROR: Download failed" >&2
@@ -204,16 +226,18 @@ if ! curl -fsSL "$RELEASE_URL" -o "$TMP_BIN"; then
   exit 1
 fi
 chmod +x "$TMP_BIN"
+
+# Validate BEFORE overwriting the live binary — 'version' is the correct subcommand
+if ! "$TMP_BIN" version >/dev/null 2>&1; then
+  echo "  ERROR: Downloaded binary failed version check — aborting" >&2
+  rm -f "$TMP_BIN"
+  exit 1
+fi
+_ver="$("$TMP_BIN" version 2>/dev/null | head -n1 || true)"
+echo "  [OK]    Downloaded binary version: ${_ver:-unknown}"
+
 mv -f "$TMP_BIN" "$INSTALL_BIN"
 echo "  [OK]    Binary installed"
-
-# Confirm binary is executable and report its version
-if "$INSTALL_BIN" --version >/dev/null 2>&1; then
-  _ver="$("$INSTALL_BIN" --version 2>/dev/null | head -n1 || true)"
-  echo "  [OK]    Binary version: ${_ver:-unknown}"
-else
-  echo "  [WARN]  Binary installed but --version check failed — verify the download manually"
-fi
 
 # ── Directories ────────────────────────────────────────────────────────────────
 mkdir -p "$CONFIG_DIR" "$SERVE_ROOT"
@@ -286,22 +310,32 @@ chown "${SERVICE_USER}:${SERVICE_USER}" "$CONFIG_FILE"
 chmod 0640 "$CONFIG_FILE"
 echo "  [OK]    Config written"
 
-# ── Write env file (secrets) ───────────────────────────────────────────────────
+# ── Admin password seeding ─────────────────────────────────────────────────────
+# Seed the password once via the CLI user-setup flow before the service starts.
+# Using FILEBROWSER_ADMIN_PASSWORD via EnvironmentFile would reset the password
+# on every service restart, overwriting any UI-based password change. The CLI
+# approach writes the credential into the database once and is not re-applied
+# on subsequent starts. The service must be stopped during CLI DB operations
+# (upstream warns only one process should access the database at a time).
 if [[ "$FQ_NOAUTH" -eq 0 ]]; then
-  cat > "$ENV_FILE" <<EOF
-FILEBROWSER_ADMIN_PASSWORD=${FQ_ADMIN_PASS}
-EOF
-  chown "${SERVICE_USER}:${SERVICE_USER}" "$ENV_FILE"
-  chmod 0600 "$ENV_FILE"
-  echo "  [OK]    Env file written"
+  echo "  Seeding admin credentials..."
+  # runuser is used instead of sudo — sudo is not guaranteed on minimal Debian/LXC systems.
+  # The service is not yet started, satisfying upstream's requirement that only one process
+  # accesses the database at a time.
+  if ! runuser -u "${SERVICE_USER}" -- \
+       "${INSTALL_BIN}" set -u "${FQ_ADMIN_USER},${FQ_ADMIN_PASS}" -a -c "${CONFIG_FILE}"; then
+    echo "  ERROR: Failed to seed admin credentials" >&2
+    exit 1
+  fi
+  echo "  [OK]    Admin credentials seeded"
 fi
 
 # ── Service registration ───────────────────────────────────────────────────────
 echo "  Registering service..."
 
-ENV_LINE=""
-[[ "$FQ_NOAUTH" -eq 0 ]] && ENV_LINE="EnvironmentFile=${ENV_FILE}"
-
+# No EnvironmentFile in the unit — password was seeded into the DB above.
+# Leaving EnvironmentFile with FILEBROWSER_ADMIN_PASSWORD would cause it to be
+# reset on every restart, making UI password changes non-persistent.
 cat > "$SERVICE_FILE" <<EOF
 [Unit]
 Description=${APP}
@@ -313,7 +347,6 @@ Type=simple
 User=${SERVICE_USER}
 Group=${SERVICE_USER}
 WorkingDirectory=${CONFIG_DIR}
-${ENV_LINE}
 ExecStart=${INSTALL_BIN} -c ${CONFIG_FILE}
 Restart=always
 RestartSec=5
@@ -324,7 +357,6 @@ StandardError=journal
 WantedBy=multi-user.target
 EOF
 
-# AUDIT FIX 4: don't suppress systemctl output — surface failures visibly
 systemctl daemon-reload
 if systemctl enable --now "$SERVICE_NAME"; then
   echo "  [OK]    Service registered and started"
@@ -345,12 +377,11 @@ if [[ "$FQ_NOAUTH" -eq 1 ]]; then
   echo "    Auth  : disabled (no-auth mode)"
 else
   echo "    Auth  : ${FQ_ADMIN_USER} / (password set at install)"
-  echo "    Env   : ${ENV_FILE}"
+  echo "    Note  : Password is stored in the DB only — changing it in the UI is permanent."
 fi
-# AUDIT FIX 6: surface the non-determinism of "latest" so the operator knows to pin
 if [[ "$APP_VERSION" == "latest" ]]; then
   echo ""
-  echo "  [NOTE]  APP_VERSION=\"latest\" was used. The installed version is shown above."
+  echo "  [NOTE]  APP_VERSION=\"latest\" was used. The resolved version is shown above."
   echo "          Pin APP_VERSION to that tag in the script for reproducible future installs."
 fi
 echo ""
