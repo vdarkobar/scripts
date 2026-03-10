@@ -4,7 +4,7 @@ set -Eeo pipefail
 # ── Config ─────────────────────────────────────────────────────────────────────
 APP="FileBrowser Quantum"
 SERVICE_USER="filebrowser"
-SHARE_GROUP="media"                  # shared group for FileBrowser + Kavita access
+SHARE_GROUP="media"                  # shared group for shared directory access
 INSTALL_BIN="/usr/local/bin/filebrowser"
 CONFIG_DIR="/opt/filebrowser"
 CONFIG_FILE="${CONFIG_DIR}/fq-config.yaml"
@@ -142,7 +142,40 @@ if ! id "$SERVICE_USER" &>/dev/null; then
   echo "  [OK]    Service user '${SERVICE_USER}' created"
 fi
 usermod -aG "$SHARE_GROUP" "$SERVICE_USER"
-usermod -aG "$SHARE_GROUP" kavita 2>/dev/null || true
+
+# ── Suggest users for shared group ────────────────────────────────────────────
+_noise="nobody messagebus systemd-network systemd-resolve systemd-timesync \
+        _apt daemon bin sys games man lp mail news uucp proxy www-data \
+        backup list irc gnats sshd"
+
+echo ""
+echo "  Service users found on this system:"
+_found=0
+while IFS=: read -r _name _ _uid _; do
+  if (( _uid >= 100 && _uid <= 999 )); then
+    _skip=0
+    for _n in $_noise; do [[ "$_name" == "$_n" ]] && _skip=1 && break; done
+    if [[ "$_skip" -eq 0 && "$_name" != "$SERVICE_USER" ]]; then
+      echo "    - ${_name}"
+      _found=1
+    fi
+  fi
+done < /etc/passwd
+[[ "$_found" -eq 0 ]] && echo "    (none)"
+
+echo ""
+read -rp "  Add users to group '${SHARE_GROUP}' (space-separated, or Enter to skip): " _input
+SHARE_USERS="${_input:-}"
+echo ""
+
+for _u in $SHARE_USERS; do
+  if id "$_u" &>/dev/null; then
+    usermod -aG "$SHARE_GROUP" "$_u"
+    echo "  [OK]    Added '${_u}' to group '${SHARE_GROUP}'"
+  else
+    echo "  [WARN]  User '${_u}' not found — skipping"
+  fi
+done
 
 # ── Download binary ────────────────────────────────────────────────────────────
 echo "  Downloading ${APP} binary (${APP_VERSION})..."
