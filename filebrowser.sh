@@ -317,20 +317,9 @@ chmod 0640 "$CONFIG_FILE"
 echo "  [OK]    Config written"
 
 # ── Admin password seeding ─────────────────────────────────────────────────────
-# Seed the password once via the CLI user-setup flow before the service starts.
-# Using FILEBROWSER_ADMIN_PASSWORD via EnvironmentFile would reset the password
-# on every service restart, overwriting any UI-based password change. The CLI
-# approach writes the credential into the database once and is not re-applied
-# on subsequent starts. The service must be stopped during CLI DB operations
-# (upstream warns only one process should access the database at a time).
 if [[ "$FQ_NOAUTH" -eq 0 ]]; then
   echo "  Seeding admin credentials..."
-  # runuser is used instead of sudo — sudo is not guaranteed on minimal Debian/LXC systems.
-  # cd into CONFIG_DIR first so the binary's working directory matches WorkingDirectory= in
-  # the service unit. Without this, runuser inherits the caller's cwd (e.g. /root) and the
-  # binary cannot create its cache directory there.
-  # The service is not yet started, satisfying upstream's requirement that only one process
-  # accesses the database at a time.
+  echo "  DEBUG: admin='${FQ_ADMIN_USER}' pass_len=${#FQ_ADMIN_PASS}"
   if ! ( cd "$CONFIG_DIR" && runuser -u "${SERVICE_USER}" -- \
          "${INSTALL_BIN}" set -u "${FQ_ADMIN_USER},${FQ_ADMIN_PASS}" -a -c "${CONFIG_FILE}" ); then
     echo "  ERROR: Failed to seed admin credentials" >&2
