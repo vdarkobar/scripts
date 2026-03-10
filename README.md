@@ -65,7 +65,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/kavit
   
 #### *FileBrowser Quantum (Addon)*
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/fileBrowser.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/filebrowser.sh)
 ```
   
 #### *LXC updater*
