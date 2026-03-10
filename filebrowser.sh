@@ -75,9 +75,9 @@ if [[ -x "$INSTALL_BIN" && -f "$CONFIG_FILE" && -f "$SERVICE_FILE" ]]; then
   read -rp "  Uninstall ${APP}? (y/N): " _uninstall
   if [[ "${_uninstall,,}" =~ ^(y|yes)$ ]]; then
     echo "  Uninstalling ${APP}..."
-    systemctl disable --now "${SERVICE_NAME}.service" &>/dev/null || true
+    systemctl disable --now "${SERVICE_NAME}.service" 2>/dev/null || true
     rm -f "$SERVICE_FILE"
-    systemctl daemon-reload &>/dev/null || true
+    systemctl daemon-reload 2>/dev/null || true
     rm -f "$INSTALL_BIN" "$CONFIG_FILE" "$DB_FILE"
     rm -rf "$CACHE_DIR"
     # AUDIT FIX 8: clarify that service user, config dir, and share dir are kept
@@ -150,16 +150,17 @@ read -rp "  Install ${APP}? (y/N): " _install
 FQ_ADMIN_USER="admin"
 FQ_ADMIN_PASS=""
 if [[ "$FQ_NOAUTH" -eq 0 ]]; then
+  echo "  Password restrictions: min 8 characters, no spaces or commas"
+  echo ""
   while true; do
     read -r -s -p "  Set FileBrowser admin password: " AP1; echo
     if [[ -z "$AP1" ]];          then echo "  Password cannot be blank."; continue; fi
     if [[ "$AP1" == *" "* ]];    then echo "  Password cannot contain spaces."; continue; fi
     if [[ "$AP1" == *","* ]];    then echo "  Password cannot contain commas."; continue; fi
-    if [[ "$AP1" == *"/"* ]];    then echo "  Password cannot contain forward slashes."; continue; fi
     if [[ ${#AP1} -lt 8 ]];      then echo "  Password must be at least 8 characters."; continue; fi
     read -r -s -p "  Verify admin password: " AP2; echo
     if [[ "$AP1" == "$AP2" ]]; then FQ_ADMIN_PASS="$AP1"; break; fi
-    echo "  Passwords do not match. Try again."
+    echo "  Passwords do not match — please re-enter both."
   done
   echo ""
 fi
