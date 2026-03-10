@@ -63,6 +63,11 @@ bash <(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/searx
 bash <(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/kavita.sh)
 ```
   
+#### *FileBrowser Quantum (Addon)*
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/fileBrowser.sh)
+```
+  
 #### *LXC updater*
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/lxc-update.sh)
