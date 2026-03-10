@@ -7,6 +7,7 @@ SERVICE_USER="filebrowser"
 INSTALL_BIN="/usr/local/bin/filebrowser"
 CONFIG_DIR="/opt/filebrowser"
 CONFIG_FILE="${CONFIG_DIR}/fq-config.yaml"
+CACHE_DIR="${CONFIG_DIR}/cache"
 DB_FILE="${CONFIG_DIR}/database.db"
 SERVICE_NAME="filebrowser"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
@@ -78,6 +79,7 @@ if [[ -x "$INSTALL_BIN" && -f "$CONFIG_FILE" && -f "$SERVICE_FILE" ]]; then
     rm -f "$SERVICE_FILE"
     systemctl daemon-reload &>/dev/null || true
     rm -f "$INSTALL_BIN" "$CONFIG_FILE" "$DB_FILE"
+    rm -rf "$CACHE_DIR"
     # AUDIT FIX 8: clarify that service user, config dir, and share dir are kept
     echo ""
     echo "  [OK]    ${APP} app files removed."
@@ -240,7 +242,7 @@ mv -f "$TMP_BIN" "$INSTALL_BIN"
 echo "  [OK]    Binary installed"
 
 # ── Directories ────────────────────────────────────────────────────────────────
-mkdir -p "$CONFIG_DIR" "$SERVE_ROOT"
+mkdir -p "$CONFIG_DIR" "$CACHE_DIR" "$SERVE_ROOT"
 
 chown -R "${SERVICE_USER}:${SERVICE_USER}" "$CONFIG_DIR"
 chmod 0750 "$CONFIG_DIR"
@@ -273,6 +275,7 @@ if [[ "$FQ_NOAUTH" -eq 1 ]]; then
 server:
   port: ${APP_PORT}
   database: "${DB_FILE}"
+  cacheDir: "${CACHE_DIR}"
   sources:
     - path: "${SERVE_ROOT}"
       name: "Files"
@@ -290,6 +293,7 @@ else
 server:
   port: ${APP_PORT}
   database: "${DB_FILE}"
+  cacheDir: "${CACHE_DIR}"
   sources:
     - path: "${SERVE_ROOT}"
       name: "Files"
@@ -371,6 +375,7 @@ echo "  [OK]    ${APP} is running"
 echo "    URL   : http://${CT_IP}:${APP_PORT}/"
 echo "    Files : ${SERVE_ROOT}"
 echo "    Conf  : ${CONFIG_FILE}"
+echo "    Cache : ${CACHE_DIR}"
 echo "    DB    : ${DB_FILE}"
 echo "    Bin   : ${INSTALL_BIN}"
 if [[ "$FQ_NOAUTH" -eq 1 ]]; then
