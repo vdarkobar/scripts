@@ -155,6 +155,7 @@ if [[ "$FQ_NOAUTH" -eq 0 ]]; then
     if [[ -z "$AP1" ]];          then echo "  Password cannot be blank."; continue; fi
     if [[ "$AP1" == *" "* ]];    then echo "  Password cannot contain spaces."; continue; fi
     if [[ "$AP1" == *","* ]];    then echo "  Password cannot contain commas."; continue; fi
+    if [[ "$AP1" == *"/"* ]];    then echo "  Password cannot contain forward slashes."; continue; fi
     if [[ ${#AP1} -lt 8 ]];      then echo "  Password must be at least 8 characters."; continue; fi
     read -r -s -p "  Verify admin password: " AP2; echo
     if [[ "$AP1" == "$AP2" ]]; then FQ_ADMIN_PASS="$AP1"; break; fi
