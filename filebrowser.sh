@@ -324,10 +324,13 @@ echo "  [OK]    Config written"
 if [[ "$FQ_NOAUTH" -eq 0 ]]; then
   echo "  Seeding admin credentials..."
   # runuser is used instead of sudo — sudo is not guaranteed on minimal Debian/LXC systems.
+  # cd into CONFIG_DIR first so the binary's working directory matches WorkingDirectory= in
+  # the service unit. Without this, runuser inherits the caller's cwd (e.g. /root) and the
+  # binary cannot create its cache directory there.
   # The service is not yet started, satisfying upstream's requirement that only one process
   # accesses the database at a time.
-  if ! runuser -u "${SERVICE_USER}" -- \
-       "${INSTALL_BIN}" set -u "${FQ_ADMIN_USER},${FQ_ADMIN_PASS}" -a -c "${CONFIG_FILE}"; then
+  if ! ( cd "$CONFIG_DIR" && runuser -u "${SERVICE_USER}" -- \
+         "${INSTALL_BIN}" set -u "${FQ_ADMIN_USER},${FQ_ADMIN_PASS}" -a -c "${CONFIG_FILE}" ); then
     echo "  ERROR: Failed to seed admin credentials" >&2
     exit 1
   fi
