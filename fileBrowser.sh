@@ -112,7 +112,8 @@ if [[ "$FQ_NOAUTH" -eq 0 ]]; then
     if [[ -z "$AP1" ]]; then echo "  Password cannot be blank."; continue; fi
     if [[ "$AP1" == *" "* ]]; then echo "  Password cannot contain spaces."; continue; fi
     if [[ ${#AP1} -lt 5 ]]; then echo "  Password must be at least 5 characters."; continue; fi
-    if [[ "$AP1" =~ [:\#\"\''\`\<\>\{\}\|\\] ]]; then
+    _bad_chars='[:#"`'"'"'<>{}|\\]'
+    if [[ "$AP1" =~ $_bad_chars ]]; then
       echo "  Password cannot contain: : # \" ' \` < > { } | \\"
       continue
     fi
