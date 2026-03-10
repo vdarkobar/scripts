@@ -58,6 +58,11 @@ bash <(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/crypt
 bash <(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/searxng.sh)
 ```
   
+#### *Kavita*
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/kavita.sh)
+```
+  
 #### *LXC updater*
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/lxc-update.sh)
