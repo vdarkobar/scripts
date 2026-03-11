@@ -1239,7 +1239,7 @@ CT_DESC="<a href='${KAVITA_LINK}' target='_blank' rel='noopener noreferrer' styl
 Kavita UID:GID ${KAVITA_UID}:${KAVITA_GID} | FB UID:GID ${FB_UID}:${FB_GID} | Media GID ${MEDIA_GID}
 Books: /opt/kavita-books/books (SGID 2775, shared via mediagroup)
 Books storage: ${BOOKS_STORAGE}
-Created by kavita-books-podman.sh</details>"
+Created by kavita-podman.sh</details>"
 pct set "$CT_ID" --description "$CT_DESC"
 
 # ── Protect container ─────────────────────────────────────────────────────────
