@@ -33,7 +33,7 @@ KAVITA_IMAGE="${KAVITA_IMAGE_REPO}:${KAVITA_TAG}"
 # Filebrowser — fully qualified repo per Podman convention
 # Default process user inside the container is UID 1000:GID 1000
 FB_IMAGE_REPO="docker.io/filebrowser/filebrowser"
-FB_TAG="v2.31.2"
+FB_TAG="v2.53.1"
 FB_IMAGE="${FB_IMAGE_REPO}:${FB_TAG}"
 DEBIAN_VERSION=13
 
