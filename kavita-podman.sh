@@ -186,7 +186,7 @@ cat <<EOF2
 EOF2
 
 SCRIPT_URL="https://raw.githubusercontent.com/vdarkobar/scripts/main/kavita-podman.sh"
-SCRIPT_LOCAL="/root/kavita-books-podman.sh"
+SCRIPT_LOCAL="/root/kavita-podman.sh"
 SCRIPT_SELF="$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")"
 
 read -r -p "  Continue with these settings? [y/N]: " response
