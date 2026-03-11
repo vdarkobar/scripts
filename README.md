@@ -58,9 +58,14 @@ bash <(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/crypt
 bash <(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/searxng.sh)
 ```
   
+#### *Kavita on podman*
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/kavita-podman.sh)
+```
+  
 #### *Kavita*
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/kavita.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/kavita-native.sh)
 ```
   
 #### *FileBrowser Quantum (Addon)*
