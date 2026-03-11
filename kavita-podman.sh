@@ -78,7 +78,10 @@ APP_URL=""
 #   /etc/sysctl.d/99-hardening.conf
 
 # ── Config validation ─────────────────────────────────────────────────────────
-[[ -n "$CT_ID" ]] || { echo "  ERROR: Could not obtain next CT ID." >&2; exit 1; }
+[[ -n "$CT_ID" && "$CT_ID" =~ ^[0-9]+$ ]] \
+  || { echo "  ERROR: Could not obtain a valid numeric CT ID." >&2; exit 1; }
+(( CT_ID >= 100 && CT_ID <= 999999999 )) \
+  || { echo "  ERROR: CT ID ${CT_ID} is outside the valid Proxmox range (100–999999999)." >&2; exit 1; }
 [[ "$DEBIAN_VERSION" =~ ^[0-9]+$ ]] || { echo "  ERROR: DEBIAN_VERSION must be numeric." >&2; exit 1; }
 [[ "$KAVITA_PORT" =~ ^[0-9]+$ ]] || { echo "  ERROR: KAVITA_PORT must be numeric." >&2; exit 1; }
 (( KAVITA_PORT >= 1 && KAVITA_PORT <= 65535 )) || { echo "  ERROR: KAVITA_PORT must be between 1 and 65535." >&2; exit 1; }
