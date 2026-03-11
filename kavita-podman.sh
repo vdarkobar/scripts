@@ -509,7 +509,7 @@ pct exec "$CT_ID" -- bash -lc "
   touch '${APP_DIR}/filebrowser/filebrowser.db'
   cat > '${APP_DIR}/filebrowser/settings.json' <<'FBJSON'
 {
-  \"port\": 80,
+  \"port\": 8080,
   \"baseURL\": \"\",
   \"address\": \"\",
   \"log\": \"stdout\",
@@ -570,7 +570,7 @@ services:
       - /opt/kavita-books/filebrowser/filebrowser.db:/database/filebrowser.db:Z
       - /opt/kavita-books/filebrowser/settings.json:/config/settings.json:Z
     ports:
-      - "\${FB_PORT}:80"
+      - "\${FB_PORT}:8080"
 EOF2"
 
 pct exec "$CT_ID" -- bash -lc "
