@@ -93,7 +93,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/lxc-d
 
 
 <details>
-  <summary>Details</summary>
-  <p>Delete helper:</p>
+  <summary>Unbound</summary>
+  <p>test 123:</p>
   <pre><code>bash &lt;(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/lxc-delete.sh)</code></pre>
 </details>
