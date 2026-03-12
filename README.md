@@ -90,3 +90,10 @@ bash <(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/lxc-d
   Domain: <a href="https://${UB_DOMAIN}">${UB_DOMAIN}</a><br>
   Created by <a href="https://example.com/unbound.sh">unbound.sh</a>
 </details>
+
+
+<details>
+  <summary>Details</summary>
+  <p>Delete helper:</p>
+  <pre><code>bash &lt;(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/lxc-delete.sh)</code></pre>
+</details>
