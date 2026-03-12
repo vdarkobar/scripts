@@ -1071,10 +1071,12 @@ else
 fi
 
 # Capture the Filebrowser generated admin password from first-boot logs.
-# FB generates a random password on every fresh database init and prints it once.
+# FB generates a random password on every fresh database init and prints it once to stdout.
+# Actual log line: "User 'admin' initialized with randomly generated password: <pass>"
 FB_ADMIN_PASS="$(pct exec "$CT_ID" -- bash -lc \
-  "podman logs filebrowser 2>&1 | grep -oP 'Generated random admin password for quick setup: \K\S+'" \
-  2>/dev/null || echo "(not found — run: podman logs filebrowser)")"
+  "podman logs filebrowser 2>&1 | grep -oP 'randomly generated password: \K\S+'" \
+  2>/dev/null || true)"
+[[ -n "$FB_ADMIN_PASS" ]] || FB_ADMIN_PASS="(not found — run: pct exec $CT_ID -- podman logs filebrowser)"
 
 # ── Auto-update timer (policy-driven) ─────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc '
@@ -1231,13 +1233,14 @@ pct exec "$CT_ID" -- bash -lc '
 '
 
 # ── Proxmox UI description ────────────────────────────────────────────────────
-if [[ -n "$PUBLIC_FQDN" ]]; then
-  KAVITA_LINK="https://${PUBLIC_FQDN}/"
-else
-  KAVITA_LINK="http://${CT_IP}:${KAVITA_PORT}/"
-fi
+KAVITA_LOCAL_LINK="http://${CT_IP}:${KAVITA_PORT}/"
 FB_LINK="http://${CT_IP}:${FB_PORT}/"
-CT_DESC="<a href='${KAVITA_LINK}' target='_blank' rel='noopener noreferrer' style='text-decoration: none; color: #00617f;'>Kavita Web UI</a> | <a href='${FB_LINK}' target='_blank' rel='noopener noreferrer' style='text-decoration: none; color: #00617f;'>Filebrowser</a>
+if [[ -n "$PUBLIC_FQDN" ]]; then
+  KAVITA_HEADER="<a href='https://${PUBLIC_FQDN}/' target='_blank' rel='noopener noreferrer' style='text-decoration: none; color: #00617f;'>Kavita (public)</a> | <a href='${KAVITA_LOCAL_LINK}' target='_blank' rel='noopener noreferrer' style='text-decoration: none; color: #00617f;'>Kavita (local)</a>"
+else
+  KAVITA_HEADER="<a href='${KAVITA_LOCAL_LINK}' target='_blank' rel='noopener noreferrer' style='text-decoration: none; color: #00617f;'>Kavita Web UI</a>"
+fi
+CT_DESC="${KAVITA_HEADER} | <a href='${FB_LINK}' target='_blank' rel='noopener noreferrer' style='text-decoration: none; color: #00617f;'>Filebrowser</a>
 <details><summary>Details</summary>Kavita ${KAVITA_TAG} + Filebrowser ${FB_TAG} on Debian ${DEBIAN_VERSION} LXC
 Kavita UID:GID ${KAVITA_UID}:${KAVITA_GID} | FB UID:GID ${FB_UID}:${FB_GID} | Media GID ${MEDIA_GID}
 Books: /opt/kavita-books/books (SGID 2775, shared via mediagroup)
@@ -1286,8 +1289,7 @@ echo ""
 echo "  Post-setup:"
 echo "    1. Open Kavita — run the setup wizard to create your admin account"
 echo "    2. Add a Library in Kavita admin settings pointing to /books"
-echo "    3. Open Filebrowser — login: admin / ${FB_ADMIN_PASS}"
-echo "       Change the password immediately after first login"
+echo "    3. Open Filebrowser — login credentials printed at the end of this summary"
 echo "    4. Upload books via Filebrowser (/srv in the container = books/ on host)"
 echo ""
 echo "  IMPORTANT — Kavita folder structure:"
@@ -1308,16 +1310,23 @@ echo "    the required subfolder. Never drop loose files directly into the root 
 echo ""
 echo "  Maintenance:"
 echo "    Policy: AUTO_UPDATE=${AUTO_UPDATE} TRACK_LATEST=${TRACK_LATEST}"
-echo "    pct exec $CT_ID -- kavita-books-maint.sh backup"
-echo "    pct exec $CT_ID -- kavita-books-maint.sh list"
-echo "    pct exec $CT_ID -- kavita-books-maint.sh update kavita <tag>"
-echo "    pct exec $CT_ID -- kavita-books-maint.sh update filebrowser <tag>"
-echo "    pct exec $CT_ID -- kavita-books-maint.sh restore /opt/kavita-books-backups/<backup.tar.gz>"
-echo "    pct exec $CT_ID -- kavita-books-maint.sh auto-update"
+echo "    pct exec $CT_ID -- bash -lc 'kavita-books-maint.sh backup'"
+echo "    pct exec $CT_ID -- bash -lc 'kavita-books-maint.sh list'"
+echo "    pct exec $CT_ID -- bash -lc 'kavita-books-maint.sh update kavita <tag>'"
+echo "    pct exec $CT_ID -- bash -lc 'kavita-books-maint.sh update filebrowser <tag>'"
+echo "    pct exec $CT_ID -- bash -lc 'kavita-books-maint.sh restore /opt/kavita-books-backups/<backup.tar.gz>'"
+echo "    pct exec $CT_ID -- bash -lc 'kavita-books-maint.sh auto-update'"
 echo ""
 echo "  Filebrowser (on-demand — stop when not uploading):"
-echo "    pct exec $CT_ID -- kavita-books-maint.sh start-fb"
-echo "    pct exec $CT_ID -- kavita-books-maint.sh stop-fb"
-echo "    pct exec $CT_ID -- kavita-books-maint.sh fb-status"
+echo "    pct exec $CT_ID -- bash -lc 'kavita-books-maint.sh start-fb'"
+echo "    pct exec $CT_ID -- bash -lc 'kavita-books-maint.sh stop-fb'"
+echo "    pct exec $CT_ID -- bash -lc 'kavita-books-maint.sh fb-status'"
+echo ""
+echo "  ┌─────────────────────────────────────────────────────┐"
+echo "  │  Filebrowser initial credentials                    │"
+echo "  │  User:     admin                                    │"
+echo "  │  Password: ${FB_ADMIN_PASS}"
+echo "  │  Change the password immediately after first login  │"
+echo "  └─────────────────────────────────────────────────────┘"
 echo ""
 echo "  Done."
