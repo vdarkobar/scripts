@@ -82,3 +82,11 @@ bash <(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/lxc-u
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/lxc-delete.sh)
 ```
+
+
+<details>
+  <summary>Details</summary>
+  Unbound DNS Resolver (DNS-over-TLS) on Debian ${DEBIAN_VERSION} LXC<br>
+  Domain: <a href="https://${UB_DOMAIN}">${UB_DOMAIN}</a><br>
+  Created by <a href="https://example.com/unbound.sh">unbound.sh</a>
+</details>
