@@ -3,97 +3,98 @@
 
 <br/>
   
-#### *Debian LXC*
-```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/deblxc.sh)
-```
-  
-#### *NPM on Podman, optional Cloudflared*
-```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/npm-podman.sh)
-```
-  
-#### *Unbound DNS*
-```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/unbound.sh)
-```
-  
-#### *Samba File server*
-```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/samba.sh)
-```
-  
-#### *<a href="https://github.com/vdarkobar/scripts/blob/main/misc/matrix-how-to.md">Matrix</a>, decentralised communication*
-```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/matrix-podman.sh)
-```
-  
-#### *Docmost*
-```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/docmost.sh)
-```
-  
-#### *Docmost on Podman*
-```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/docmost-podman.sh)
-```
-  
-#### *Immich on Podman*
-```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/immich-podman.sh)
-```
-  
-#### *Privatebin*
-```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/privatebin.sh)
-```
-  
-#### *Cryptpad*
-```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/cryptpad.sh)
-```
-
-#### *SearXNG*
-```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/searxng.sh)
-```
-  
-#### *Kavita on Podman*
-```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/kavita-podman.sh)
-```
-  
-#### *Kavita*
-```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/kavita-native.sh)
-```
-  
-#### *FileBrowser Quantum (Addon)*
-```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/filebrowser.sh)
-```
-  
-#### *LXC updater*
-```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/lxc-update.sh)
-```
-
-#### *LXC delete*
-```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/lxc-delete.sh)
-```
-
-
 <details>
-  <summary>unbound</summary>
-  Unbound DNS Resolver (DNS-over-TLS) on Debian ${DEBIAN_VERSION} LXC<br>
-  Domain: <a href="https://${UB_DOMAIN}">${UB_DOMAIN}</a><br>
-  Created by <a href="https://example.com/unbound.sh">unbound.sh</a>
+  <summary>Debian LXC</summary>
+  <p>Creates a Debian LXC container.</p>
+  <pre><code>bash &lt;(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/deblxc.sh)</code></pre>
 </details>
 
+<details>
+  <summary>NPM on Podman, optional Cloudflared</summary>
+  <p>Runs Nginx Proxy Manager on Podman, with optional Cloudflared.</p>
+  <pre><code>bash &lt;(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/npm-podman.sh)</code></pre>
+</details>
 
 <details>
-  <summary>Unbound</summary>
-  <p>Unbound is a validating, recursive, caching DNS resolver</p>
+  <summary>Unbound DNS</summary>
+  <p>Validating, recursive, caching DNS resolver.</p>
+  <pre><code>bash &lt;(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/unbound.sh)</code></pre>
+</details>
+
+<details>
+  <summary>Samba File server</summary>
+  <p>File sharing server for your network.</p>
+  <pre><code>bash &lt;(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/samba.sh)</code></pre>
+</details>
+
+<details>
+  <summary>Matrix</summary>
+  <p><a href="https://github.com/vdarkobar/scripts/blob/main/misc/matrix-how-to.md">Decentralised communication platform.</a></p>
+  <pre><code>bash &lt;(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/matrix-podman.sh)</code></pre>
+</details>
+
+<details>
+  <summary>Docmost</summary>
+  <p>Collaborative wiki and documentation platform.</p>
+  <pre><code>bash &lt;(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/docmost.sh)</code></pre>
+</details>
+
+<details>
+  <summary>Docmost on Podman</summary>
+  <p>Collaborative wiki and documentation platform on Podman.</p>
+  <pre><code>bash &lt;(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/docmost-podman.sh)</code></pre>
+</details>
+
+<details>
+  <summary>Immich on Podman</summary>
+  <p>Self-hosted photo and video backup platform.</p>
+  <pre><code>bash &lt;(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/immich-podman.sh)</code></pre>
+</details>
+
+<details>
+  <summary>Privatebin</summary>
+  <p>Minimalist self-hosted pastebin.</p>
+  <pre><code>bash &lt;(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/privatebin.sh)</code></pre>
+</details>
+
+<details>
+  <summary>Cryptpad</summary>
+  <p>Private collaborative office suite.</p>
+  <pre><code>bash &lt;(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/cryptpad.sh)</code></pre>
+</details>
+
+<details>
+  <summary>SearXNG</summary>
+  <p>Privacy-focused metasearch engine.</p>
+  <pre><code>bash &lt;(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/searxng.sh)</code></pre>
+</details>
+
+<details>
+  <summary>Kavita on Podman</summary>
+  <p>Digital library server on Podman.</p>
+  <pre><code>bash &lt;(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/kavita-podman.sh)</code></pre>
+</details>
+
+<details>
+  <summary>Kavita</summary>
+  <p>Digital library server.</p>
+  <pre><code>bash &lt;(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/kavita-native.sh)</code></pre>
+</details>
+
+<details>
+  <summary>FileBrowser Quantum (Addon)</summary>
+  <p>Web-based file manager addon.</p>
+  <pre><code>bash &lt;(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/filebrowser.sh)</code></pre>
+</details>
+
+<details>
+  <summary>LXC updater</summary>
+  <p>Updates LXC containers.</p>
+  <pre><code>bash &lt;(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/lxc-update.sh)</code></pre>
+</details>
+
+<details>
+  <summary>LXC delete</summary>
+  <p>Deletes LXC containers.</p>
   <pre><code>bash &lt;(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/lxc-delete.sh)</code></pre>
 </details>
