@@ -58,7 +58,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/crypt
 bash <(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/searxng.sh)
 ```
   
-#### *Kavita on podman*
+#### *Kavita on Podman*
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/kavita-podman.sh)
 ```
