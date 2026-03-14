@@ -88,6 +88,12 @@
 </details>
 
 <details>
+  <summary>PBS</summary>
+  <p>Proxmox Backup Server.</p>
+  <pre><code>bash &lt;(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/pbs-lxc.sh)</code></pre>
+</details>
+
+<details>
   <summary>LXC updater</summary>
   <p>Updates LXC containers.</p>
   <pre><code>bash &lt;(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/lxc-update.sh)</code></pre>
