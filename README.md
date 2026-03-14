@@ -89,7 +89,7 @@
 
 <details>
   <summary>PBS</summary>
-  <p>Proxmox Backup Server.</p>
+  <p>Proxmox Backup Server on Debian LXC.</p>
   <pre><code>bash &lt;(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/pbs-lxc.sh)</code></pre>
 </details>
 
