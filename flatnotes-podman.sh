@@ -875,13 +875,13 @@ MOTD
 "
 
 # ── Proxmox UI description ────────────────────────────────────────────────────
+FN_LOCAL_LINK="<a href='http://${CT_IP}:${APP_PORT}/' target='_blank' rel='noopener noreferrer' style='text-decoration: none; color: #00617f;'>Flatnotes (local)</a>"
 if [[ -n "$APP_FQDN" ]]; then
-  FN_PUBLIC_LINK="<a href='https://${APP_FQDN}/' target='_blank' rel='noopener noreferrer' style='text-decoration: none; color: #00617f;'>Flatnotes (${APP_FQDN})</a>"
+  FN_DESC="<a href='https://${APP_FQDN}/' target='_blank' rel='noopener noreferrer' style='text-decoration: none; color: #00617f;'>Flatnotes (public)</a> | ${FN_LOCAL_LINK}"
 else
-  FN_PUBLIC_LINK="<span style='color: #888;'>Public URL: not set (APP_FQDN blank)</span>"
+  FN_DESC="${FN_LOCAL_LINK}"
 fi
-FN_DESC="${FN_PUBLIC_LINK}
-<a href='http://${CT_IP}:${APP_PORT}/' target='_blank' rel='noopener noreferrer' style='text-decoration: none; color: #00617f;'>Flatnotes (local)</a>
+FN_DESC+="
 <details><summary>Details</summary>Flatnotes (Podman) on Debian ${DEBIAN_VERSION} LXC
 Auth: ${FLATNOTES_AUTH_TYPE} | Tag: ${APP_TAG}
 Created by flatnotes-podman.sh</details>"
