@@ -16,6 +16,8 @@ APP_PORT=8080
 APP_TZ="Europe/Berlin"
 APP_FQDN=""                             # e.g. notes.example.com — used in Proxmox UI description; leave blank if not yet known
 FLATNOTES_AUTH_TYPE="password"          # password | none | read_only | totp
+FLATNOTES_SESSION_EXPIRY_DAYS=30        # days before login token expires and re-auth is required
+FLATNOTES_PATH_PREFIX=""                # sub-path if hosting at a prefix e.g. /flatnotes; leave blank for root
 TAGS="flatnotes;podman;lxc"
 
 # Images / versions
@@ -62,6 +64,10 @@ APP_IMAGE="${APP_IMAGE_REPO}:${APP_TAG}"
 [[ "$TRACK_LATEST" =~ ^[01]$ ]] || { echo "  ERROR: TRACK_LATEST must be 0 or 1." >&2; exit 1; }
 [[ "$FLATNOTES_AUTH_TYPE" =~ ^(password|none|read_only|totp)$ ]] || {
   echo "  ERROR: FLATNOTES_AUTH_TYPE must be password, none, read_only, or totp." >&2; exit 1;
+}
+[[ "$FLATNOTES_SESSION_EXPIRY_DAYS" =~ ^[0-9]+$ ]] || { echo "  ERROR: FLATNOTES_SESSION_EXPIRY_DAYS must be numeric." >&2; exit 1; }
+[[ -z "$FLATNOTES_PATH_PREFIX" || "$FLATNOTES_PATH_PREFIX" =~ ^/[A-Za-z0-9._~-]+$ ]] || {
+  echo "  ERROR: FLATNOTES_PATH_PREFIX must be empty or start with / and contain no trailing slash (e.g. /flatnotes)." >&2; exit 1;
 }
 [[ "$APP_TAG" == "latest" || "$APP_TAG" =~ ^v[0-9]+(\.[0-9]+){0,2}([.-][A-Za-z0-9._-]+)?$ ]] || {
   echo "  ERROR: APP_TAG must look like v5, v5.5, v5.5.4, or latest." >&2; exit 1;
@@ -126,6 +132,8 @@ cat <<EOF2
   App port:          $APP_PORT
   Public FQDN:       ${APP_FQDN:-"(not set)"}
   Auth type:         $FLATNOTES_AUTH_TYPE
+  Session expiry:    ${FLATNOTES_SESSION_EXPIRY_DAYS} days
+  Path prefix:       ${FLATNOTES_PATH_PREFIX:-"(none)"}
   Timezone:          $APP_TZ
   Tags:              $TAGS
   Auto-update:       $([ "$AUTO_UPDATE" -eq 1 ] && echo "enabled" || echo "disabled")
@@ -386,6 +394,8 @@ services:
       FLATNOTES_PASSWORD: \${FLATNOTES_PASSWORD}
       FLATNOTES_SECRET_KEY: \${FLATNOTES_SECRET_KEY}
       FLATNOTES_TOTP_KEY: \${FLATNOTES_TOTP_KEY}
+      FLATNOTES_SESSION_EXPIRY_DAYS: \${FLATNOTES_SESSION_EXPIRY_DAYS}
+      FLATNOTES_PATH_PREFIX: \${FLATNOTES_PATH_PREFIX}
     volumes:
       - ${APP_DIR}/data:/data:Z
 EOF2"
@@ -405,6 +415,8 @@ services:
       FLATNOTES_USERNAME: \${FLATNOTES_USERNAME}
       FLATNOTES_PASSWORD: \${FLATNOTES_PASSWORD}
       FLATNOTES_SECRET_KEY: \${FLATNOTES_SECRET_KEY}
+      FLATNOTES_SESSION_EXPIRY_DAYS: \${FLATNOTES_SESSION_EXPIRY_DAYS}
+      FLATNOTES_PATH_PREFIX: \${FLATNOTES_PATH_PREFIX}
     volumes:
       - ${APP_DIR}/data:/data:Z
 EOF2"
@@ -422,6 +434,8 @@ services:
       PUID: \"1000\"
       PGID: \"1000\"
       FLATNOTES_AUTH_TYPE: \${FLATNOTES_AUTH_TYPE}
+      FLATNOTES_SESSION_EXPIRY_DAYS: \${FLATNOTES_SESSION_EXPIRY_DAYS}
+      FLATNOTES_PATH_PREFIX: \${FLATNOTES_PATH_PREFIX}
     volumes:
       - ${APP_DIR}/data:/data:Z
 EOF2"
@@ -438,6 +452,8 @@ APP_TAG=${APP_TAG}
 APP_IMAGE=${APP_IMAGE}
 APP_PORT=${APP_PORT}
 FLATNOTES_AUTH_TYPE=${FLATNOTES_AUTH_TYPE}
+FLATNOTES_SESSION_EXPIRY_DAYS=${FLATNOTES_SESSION_EXPIRY_DAYS}
+FLATNOTES_PATH_PREFIX=${FLATNOTES_PATH_PREFIX}
 AUTO_UPDATE=${AUTO_UPDATE}
 TRACK_LATEST=${TRACK_LATEST}
 EOF2
@@ -890,6 +906,7 @@ if [[ "$FLATNOTES_AUTH_TYPE" == "totp" ]]; then
   echo "  !! TOTP setup required — add this secret to your authenticator app:"
   echo "     TOTP key: ${FLATNOTES_TOTP_KEY}"
   echo "     (also stored in /opt/flatnotes/.env as FLATNOTES_TOTP_KEY)"
+  echo "     QR code:  pct exec $CT_ID -- bash -lc 'cd /opt/flatnotes && podman-compose logs flatnotes'"
 fi
 echo ""
 echo "  Config:  /opt/flatnotes/.env"
