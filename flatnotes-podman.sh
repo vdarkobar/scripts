@@ -14,17 +14,18 @@ CONTAINER_STORAGE="local-lvm"
 # Flatnotes / Podman
 APP_PORT=8080
 APP_TZ="Europe/Berlin"
+APP_FQDN=""                             # e.g. notes.example.com — used in Proxmox UI description; leave blank if not yet known
 FLATNOTES_AUTH_TYPE="password"          # password | none | read_only | totp
 TAGS="flatnotes;podman;lxc"
 
 # Images / versions
 APP_IMAGE_REPO="docker.io/dullage/flatnotes"
-APP_TAG="latest"                        # dullage/flatnotes only publishes :latest to Docker Hub — no versioned tags available
+APP_TAG="v5.5.4"                        # verify latest: https://github.com/dullage/flatnotes/releases
 DEBIAN_VERSION=13
 
 # Policy
-AUTO_UPDATE=0                           # 1 = enable timer-driven maintenance/update runs (re-pulls :latest)
-TRACK_LATEST=1                          # always 1 — upstream only publishes :latest; no versioned tags available
+AUTO_UPDATE=0                           # 1 = enable timer-driven maintenance/update runs
+TRACK_LATEST=0                          # 1 = auto-update follows :latest
 KEEP_BACKUPS=7
 
 # Behavior
@@ -62,8 +63,8 @@ APP_IMAGE="${APP_IMAGE_REPO}:${APP_TAG}"
 [[ "$FLATNOTES_AUTH_TYPE" =~ ^(password|none|read_only|totp)$ ]] || {
   echo "  ERROR: FLATNOTES_AUTH_TYPE must be password, none, read_only, or totp." >&2; exit 1;
 }
-[[ "$APP_TAG" == "latest" ]] || {
-  echo "  ERROR: dullage/flatnotes only publishes :latest to Docker Hub. APP_TAG must be \"latest\"." >&2; exit 1;
+[[ "$APP_TAG" == "latest" || "$APP_TAG" =~ ^v[0-9]+(\.[0-9]+){0,2}([.-][A-Za-z0-9._-]+)?$ ]] || {
+  echo "  ERROR: APP_TAG must look like v5, v5.5, v5.5.4, or latest." >&2; exit 1;
 }
 [[ -e "/usr/share/zoneinfo/${APP_TZ}" ]] || {
   echo "  ERROR: APP_TZ not found in /usr/share/zoneinfo: $APP_TZ" >&2; exit 1;
@@ -121,13 +122,14 @@ cat <<EOF2
   Template storage:  $TEMPLATE_STORAGE ($AVAIL_TMPL_STORES)
   Container storage: $CONTAINER_STORAGE ($AVAIL_CT_STORES)
   Debian:            $DEBIAN_VERSION
-  Image tag:         $APP_TAG (only tag published to Docker Hub)
+  Image tag:         $APP_TAG
   App port:          $APP_PORT
+  Public FQDN:       ${APP_FQDN:-"(not set)"}
   Auth type:         $FLATNOTES_AUTH_TYPE
   Timezone:          $APP_TZ
   Tags:              $TAGS
   Auto-update:       $([ "$AUTO_UPDATE" -eq 1 ] && echo "enabled" || echo "disabled")
-  Track latest:      always (upstream publishes :latest only)
+  Track latest:      $([ "$TRACK_LATEST" -eq 1 ] && echo "enabled" || echo "disabled")
   Keep backups:      $KEEP_BACKUPS
   Cleanup on fail:   $CLEANUP_ON_FAIL
   ─────────────────────────────────────────────
@@ -343,11 +345,14 @@ pct exec "$CT_ID" -- bash -lc "
 "
 
 # ── Generate secret key ───────────────────────────────────────────────────────
-# FLATNOTES_SECRET_KEY is used for JWT signing. Auto-generate and persist in .env.
-set +o pipefail
-SECRET_KEY="$(head -c 4096 /dev/urandom | tr -dc 'A-Za-z0-9' | head -c 48)"
-set -o pipefail
-[[ ${#SECRET_KEY} -eq 48 ]] || { echo "  ERROR: Failed to generate secret key." >&2; exit 1; }
+# FLATNOTES_SECRET_KEY is used for JWT signing — only required for password and totp auth.
+SECRET_KEY=""
+if [[ "$FLATNOTES_AUTH_TYPE" == "password" || "$FLATNOTES_AUTH_TYPE" == "totp" ]]; then
+  set +o pipefail
+  SECRET_KEY="$(head -c 4096 /dev/urandom | tr -dc 'A-Za-z0-9' | head -c 48)"
+  set -o pipefail
+  [[ ${#SECRET_KEY} -eq 48 ]] || { echo "  ERROR: Failed to generate secret key." >&2; exit 1; }
+fi
 
 # ── Prepare persistent paths ──────────────────────────────────────────────────
 # Flatnotes runs as PUID/PGID 1000 inside the container (set explicitly in compose).
@@ -363,7 +368,29 @@ pct exec "$CT_ID" -- bash -lc "
 # ── Compose file ──────────────────────────────────────────────────────────────
 # Variables with \${ } are kept as literals for podman-compose to expand from .env.
 # Variables without backslash (e.g. ${APP_DIR}) are expanded by the outer shell now.
-pct exec "$CT_ID" -- bash -lc "cat > '${APP_DIR}/docker-compose.yml' <<'EOF2'
+# Written in one pass per auth type — no post-hoc sed patching.
+if [[ "$FLATNOTES_AUTH_TYPE" == "totp" ]]; then
+  pct exec "$CT_ID" -- bash -lc "cat > '${APP_DIR}/docker-compose.yml' <<'EOF2'
+services:
+  flatnotes:
+    image: \${APP_IMAGE}
+    container_name: flatnotes
+    restart: unless-stopped
+    ports:
+      - \"\${APP_PORT}:8080\"
+    environment:
+      PUID: \"1000\"
+      PGID: \"1000\"
+      FLATNOTES_AUTH_TYPE: \${FLATNOTES_AUTH_TYPE}
+      FLATNOTES_USERNAME: \${FLATNOTES_USERNAME}
+      FLATNOTES_PASSWORD: \${FLATNOTES_PASSWORD}
+      FLATNOTES_SECRET_KEY: \${FLATNOTES_SECRET_KEY}
+      FLATNOTES_TOTP_KEY: \${FLATNOTES_TOTP_KEY}
+    volumes:
+      - ${APP_DIR}/data:/data:Z
+EOF2"
+elif [[ "$FLATNOTES_AUTH_TYPE" == "password" ]]; then
+  pct exec "$CT_ID" -- bash -lc "cat > '${APP_DIR}/docker-compose.yml' <<'EOF2'
 services:
   flatnotes:
     image: \${APP_IMAGE}
@@ -381,10 +408,23 @@ services:
     volumes:
       - ${APP_DIR}/data:/data:Z
 EOF2"
-if [[ "$FLATNOTES_AUTH_TYPE" == "totp" ]]; then
-  pct exec "$CT_ID" -- bash -lc "
-    sed -i 's|      FLATNOTES_SECRET_KEY: \${FLATNOTES_SECRET_KEY}|      FLATNOTES_SECRET_KEY: \${FLATNOTES_SECRET_KEY}\n      FLATNOTES_TOTP_KEY: \${FLATNOTES_TOTP_KEY}|' '${APP_DIR}/docker-compose.yml'
-  "
+else
+  # none / read_only — no credentials or secret key needed
+  pct exec "$CT_ID" -- bash -lc "cat > '${APP_DIR}/docker-compose.yml' <<'EOF2'
+services:
+  flatnotes:
+    image: \${APP_IMAGE}
+    container_name: flatnotes
+    restart: unless-stopped
+    ports:
+      - \"\${APP_PORT}:8080\"
+    environment:
+      PUID: \"1000\"
+      PGID: \"1000\"
+      FLATNOTES_AUTH_TYPE: \${FLATNOTES_AUTH_TYPE}
+    volumes:
+      - ${APP_DIR}/data:/data:Z
+EOF2"
 fi
 
 # ── Runtime .env ──────────────────────────────────────────────────────────────
@@ -398,14 +438,20 @@ APP_TAG=${APP_TAG}
 APP_IMAGE=${APP_IMAGE}
 APP_PORT=${APP_PORT}
 FLATNOTES_AUTH_TYPE=${FLATNOTES_AUTH_TYPE}
-FLATNOTES_USERNAME=${FLATNOTES_USERNAME}
-FLATNOTES_PASSWORD=${FLATNOTES_PASSWORD}
-FLATNOTES_SECRET_KEY=${SECRET_KEY}
 AUTO_UPDATE=${AUTO_UPDATE}
 TRACK_LATEST=${TRACK_LATEST}
 EOF2
   chmod 0600 '${APP_DIR}/.env'
 "
+if [[ "$FLATNOTES_AUTH_TYPE" == "password" || "$FLATNOTES_AUTH_TYPE" == "totp" ]]; then
+  pct exec "$CT_ID" -- bash -lc "
+    cat >> '${APP_DIR}/.env' <<EOF2
+FLATNOTES_USERNAME=${FLATNOTES_USERNAME}
+FLATNOTES_PASSWORD=${FLATNOTES_PASSWORD}
+FLATNOTES_SECRET_KEY=${SECRET_KEY}
+EOF2
+  "
+fi
 if [[ "$FLATNOTES_AUTH_TYPE" == "totp" ]]; then
   pct exec "$CT_ID" -- bash -lc "echo 'FLATNOTES_TOTP_KEY=${FLATNOTES_TOTP_KEY}' >> '${APP_DIR}/.env'"
 fi
@@ -464,7 +510,7 @@ wait_for_app() {
 }
 
 usage() {
-  echo \"Usage: \$0 backup|list|restore <backup.tar.gz>|update|auto-update|version\"
+  echo \"Usage: \$0 backup|list|restore <backup.tar.gz>|update <tag>|auto-update|version\"
 }
 
 backup_stack() {
@@ -523,26 +569,39 @@ restore_stack() {
 }
 
 update_flatnotes() {
-  local new_image tmp_env
+  local new_tag=\"\$1\"
+  local repo new_image old_tag tmp_env
+  [[ -n \"\$new_tag\" ]] || die \"Usage: flatnotes-maint.sh update <tag|latest>\"
+  [[ \"\$new_tag\" == \"latest\" || \"\$new_tag\" =~ ^v[0-9]+(\\.[0-9]+){0,2}([.-][A-Za-z0-9._-]+)?\$ ]] \
+    || die \"Invalid tag: \$new_tag (expected v5, v5.5, v5.5.4, or latest)\"
+
+  old_tag=\"\$(current_tag)\"
   repo=\"\$(current_repo)\"
   [[ -n \"\$repo\" ]] || die \"Could not read APP_IMAGE_REPO from .env\"
-  new_image=\"\${repo}:latest\"
+  new_image=\"\${repo}:\${new_tag}\"
   tmp_env=\"\$(mktemp)\"
 
-  echo \"  Pulling latest image ...\"
+  echo \"  Current tag: \$old_tag\"
+  echo \"  Target  tag: \$new_tag\"
 
   backup_stack
   cp -a \"\$ENV_FILE\" \"\$tmp_env\"
 
   rollback() {
-    echo \"  !! Update failed — rolling back container ...\" >&2
+    echo \"  !! Update failed — rolling back .env and container ...\" >&2
     cp -a \"\$tmp_env\" \"\$ENV_FILE\"
     cd \"\$APP_DIR\"
     /usr/bin/podman-compose up -d --force-recreate flatnotes || true
   }
   trap rollback ERR
 
+  echo \"  Pulling target image ...\"
   podman pull \"\$new_image\"
+
+  sed -i \
+    -e \"s|^APP_TAG=.*|APP_TAG=\$new_tag|\" \
+    -e \"s|^APP_IMAGE=.*|APP_IMAGE=\$new_image|\" \
+    \"\$ENV_FILE\"
 
   echo \"  Recreating Flatnotes container ...\"
   cd \"\$APP_DIR\"
@@ -553,10 +612,13 @@ update_flatnotes() {
 
   trap - ERR
   rm -f \"\$tmp_env\"
-  echo \"  OK: Flatnotes updated (re-pulled :latest)\"
+  echo \"  OK: Flatnotes updated to \$new_tag\"
 }
 
 auto_update_flatnotes() {
+  # Note: rollback after TRACK_LATEST=1 updates is tag-level only, not image-level.
+  # Restoring .env to APP_TAG=latest re-pulls current latest, not the previous digest.
+  # For reliable rollback, use PBS to restore the full CT instead.
   if ! auto_update_enabled; then
     echo \"  Auto-update disabled in \${ENV_FILE}; nothing to do.\"
     return 0
@@ -579,7 +641,7 @@ case \"\$cmd\" in
   backup)       backup_stack ;;
   list)         ls -1t \"\$BACKUP_DIR\"/flatnotes-backup-*.tar.gz 2>/dev/null || true ;;
   restore)      shift; restore_stack \"\${1:-}\" ;;
-  update)       update_flatnotes ;;
+  update)       shift; update_flatnotes \"\${1:-}\" ;;
   auto-update)  auto_update_flatnotes ;;
   version)
     echo \"Configured image: \$(current_image)\"
@@ -797,7 +859,13 @@ MOTD
 "
 
 # ── Proxmox UI description ────────────────────────────────────────────────────
-FN_DESC="<a href='http://${CT_IP}:${APP_PORT}/' target='_blank' rel='noopener noreferrer' style='text-decoration: none; color: #00617f;'>Flatnotes</a>
+if [[ -n "$APP_FQDN" ]]; then
+  FN_PUBLIC_LINK="<a href='https://${APP_FQDN}/' target='_blank' rel='noopener noreferrer' style='text-decoration: none; color: #00617f;'>Flatnotes (${APP_FQDN})</a>"
+else
+  FN_PUBLIC_LINK="<span style='color: #888;'>Public URL: not set (APP_FQDN blank)</span>"
+fi
+FN_DESC="${FN_PUBLIC_LINK}
+<a href='http://${CT_IP}:${APP_PORT}/' target='_blank' rel='noopener noreferrer' style='text-decoration: none; color: #00617f;'>Flatnotes (local)</a>
 <details><summary>Details</summary>Flatnotes (Podman) on Debian ${DEBIAN_VERSION} LXC
 Auth: ${FLATNOTES_AUTH_TYPE} | Tag: ${APP_TAG}
 Created by flatnotes-podman.sh</details>"
@@ -815,6 +883,7 @@ pct exec "$CT_ID" -- bash -lc '
 # ── Summary ───────────────────────────────────────────────────────────────────
 echo ""
 echo "  CT: $CT_ID | IP: ${CT_IP} | http://${CT_IP}:${APP_PORT}/"
+[[ -n "$APP_FQDN" ]] && echo "  Public:  https://${APP_FQDN}/"
 echo "  Auth: ${FLATNOTES_AUTH_TYPE} | Policy: AUTO_UPDATE=${AUTO_UPDATE} TRACK_LATEST=${TRACK_LATEST}"
 if [[ "$FLATNOTES_AUTH_TYPE" == "totp" ]]; then
   echo ""
@@ -829,7 +898,7 @@ echo ""
 echo "  Maintenance:"
 echo "    pct exec $CT_ID -- /usr/local/bin/flatnotes-maint.sh backup"
 echo "    pct exec $CT_ID -- /usr/local/bin/flatnotes-maint.sh list"
-echo "    pct exec $CT_ID -- /usr/local/bin/flatnotes-maint.sh update"
+echo "    pct exec $CT_ID -- /usr/local/bin/flatnotes-maint.sh update <tag>"
 echo "    pct exec $CT_ID -- /usr/local/bin/flatnotes-maint.sh restore /opt/flatnotes-backups/<backup.tar.gz>"
 echo "    pct exec $CT_ID -- /usr/local/bin/flatnotes-maint.sh auto-update"
 echo ""
