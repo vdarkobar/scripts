@@ -48,7 +48,7 @@
 <details>
   <summary>Flatnotes on Podman</summary>
   <p>Database-less note-taking web app.</p>
-  <pre><code>bash &lt;(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/flatnost-podman.sh)</code></pre>
+  <pre><code>bash &lt;(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/flatnotes-podman.sh)</code></pre>
 </details>
 
 <details>
