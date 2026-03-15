@@ -5,7 +5,7 @@ set -Eeo pipefail
 CT_ID="$(pvesh get /cluster/nextid)"
 HN="flatnotes"
 CPU=2
-RAM=512
+RAM=1024
 DISK=8
 BRIDGE="vmbr0"
 TEMPLATE_STORAGE="local"
@@ -16,7 +16,7 @@ APP_PORT=8080
 APP_TZ="Europe/Berlin"
 APP_FQDN=""                             # e.g. notes.example.com — used in Proxmox UI description; leave blank if not yet known
 FLATNOTES_AUTH_TYPE="password"          # password | none | read_only | totp
-FLATNOTES_SESSION_EXPIRY_DAYS=30        # days before login token expires and re-auth is required
+FLATNOTES_SESSION_EXPIRY_DAYS=1         # days before login token expires and re-auth is required
 FLATNOTES_PATH_PREFIX=""                # sub-path if hosting at a prefix e.g. /flatnotes; leave blank for root
 TAGS="flatnotes;podman;lxc"
 
