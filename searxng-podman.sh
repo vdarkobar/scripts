@@ -438,6 +438,9 @@ server:
     X-Robots-Tag: "noindex, nofollow"
     Referrer-Policy: no-referrer
 
+ui:
+  query_in_title: false
+
 outgoing:
   request_timeout: ${OUTGOING_TIMEOUT}
   max_request_timeout: ${OUTGOING_MAX_TIMEOUT}
