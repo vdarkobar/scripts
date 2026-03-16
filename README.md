@@ -70,6 +70,12 @@
 </details>
 
 <details>
+  <summary>SearXNG on Podman</summary>
+  <p>Privacy-focused metasearch engine.</p>
+  <pre><code>bash &lt;(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/searxng-podman.sh)</code></pre>
+</details>
+
+<details>
   <summary>SearXNG</summary>
   <p>Privacy-focused metasearch engine.</p>
   <pre><code>bash &lt;(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/searxng.sh)</code></pre>
