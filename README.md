@@ -28,7 +28,7 @@
 </details>
 
 <details>
-  <summary>Matrix</summary>
+  <summary>Matrix on Podman</summary>
   <p><a href="https://github.com/vdarkobar/scripts/blob/main/misc/matrix-how-to.md">Decentralised communication platform.</a></p>
   <pre><code>bash &lt;(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/matrix-podman.sh)</code></pre>
 </details>
