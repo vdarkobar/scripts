@@ -142,7 +142,7 @@ cat <<EOF2
   NPM host IP:       ${NPM_HOST_IP:-"(not set — configure after AIO setup)"}
   Timezone:          $APP_TZ
   Tags:              $TAGS
-  Configure TURN:     $([ "$CONFIGURE_TURN" -eq 1 ] && echo "yes (${TURN_SERVER})" || echo "no")
+  Configure TURN:    $([ "$CONFIGURE_TURN" -eq 1 ] && echo "yes (${TURN_SERVER})" || echo "no")
   Cleanup on fail:   $CLEANUP_ON_FAIL
   ─────────────────────────────────────────────────────
   To change defaults, press Enter and
