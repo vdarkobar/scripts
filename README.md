@@ -52,6 +52,12 @@
 </details>
 
 <details>
+  <summary>Nextcloud AIO on Docker</summary>
+  <p>Open source content collaboration platform.</p>
+  <pre><code>bash &lt;(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/nextcloud-aio-docker.sh)</code></pre>
+</details>
+
+<details>
   <summary>Immich on Podman</summary>
   <p>Self-hosted photo and video backup platform.</p>
   <pre><code>bash &lt;(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/immich-podman.sh)</code></pre>
