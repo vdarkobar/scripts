@@ -48,6 +48,19 @@ CONFIGURE_TURN=1
 TURN_SERVER="staticauth.openrelay.metered.ca"
 TURN_SECRET="openrelayprojectsecret"
 
+# Email / SMTP
+# Set CONFIGURE_SMTP=0 to skip email configuration.
+# Re-run configure after filling in the details to apply later.
+CONFIGURE_SMTP=0
+SMTP_HOST="smtp.example.com"
+SMTP_PORT=587
+SMTP_SECURE="tls"                  # tls or ssl
+SMTP_AUTH=1
+SMTP_NAME="nextcloud@example.com"
+SMTP_PASSWORD="yourpassword"
+SMTP_FROM_ADDRESS="nextcloud"      # local part of the from address
+SMTP_DOMAIN="example.com"          # domain part of the from address
+
 # Behavior
 CLEANUP_ON_FAIL=1
 
@@ -75,6 +88,7 @@ AIO_IMAGE="${AIO_IMAGE_REPO}:${AIO_TAG}"
 (( AIO_ADMIN_PORT >= 1 && AIO_ADMIN_PORT <= 65535 )) || { echo "  ERROR: AIO_ADMIN_PORT out of range." >&2; exit 1; }
 [[ "$AIO_APACHE_PORT" =~ ^[0-9]+$ ]] || { echo "  ERROR: AIO_APACHE_PORT must be numeric." >&2; exit 1; }
 (( AIO_APACHE_PORT >= 1 && AIO_APACHE_PORT <= 65535 )) || { echo "  ERROR: AIO_APACHE_PORT out of range." >&2; exit 1; }
+[[ "$CONFIGURE_SMTP" =~ ^[01]$ ]] || { echo "  ERROR: CONFIGURE_SMTP must be 0 or 1." >&2; exit 1; }
 [[ "$CONFIGURE_TURN" =~ ^[01]$ ]] || { echo "  ERROR: CONFIGURE_TURN must be 0 or 1." >&2; exit 1; }
 [[ "$SKIP_DOMAIN_VALIDATION" =~ ^[01]$ ]] || { echo "  ERROR: SKIP_DOMAIN_VALIDATION must be 0 or 1." >&2; exit 1; }
 [[ -e "/usr/share/zoneinfo/${APP_TZ}" ]] || { echo "  ERROR: APP_TZ not found: $APP_TZ" >&2; exit 1; }
@@ -143,6 +157,7 @@ cat <<EOF2
   Timezone:          $APP_TZ
   Tags:              $TAGS
   Configure TURN:    $([ "$CONFIGURE_TURN" -eq 1 ] && echo "yes (${TURN_SERVER})" || echo "no")
+  Configure SMTP:    $([ "$CONFIGURE_SMTP" -eq 1 ] && echo "yes (${SMTP_HOST})" || echo "no")
   Cleanup on fail:   $CLEANUP_ON_FAIL
   ─────────────────────────────────────────────────────
   To change defaults, press Enter and
@@ -373,6 +388,17 @@ NPM_HOST_IP=${NPM_HOST_IP}
 CONFIGURE_TURN=${CONFIGURE_TURN}
 TURN_SERVER=${TURN_SERVER}
 TURN_SECRET=${TURN_SECRET}
+
+# Email / SMTP
+CONFIGURE_SMTP=${CONFIGURE_SMTP}
+SMTP_HOST=${SMTP_HOST}
+SMTP_PORT=${SMTP_PORT}
+SMTP_SECURE=${SMTP_SECURE}
+SMTP_AUTH=${SMTP_AUTH}
+SMTP_NAME=${SMTP_NAME}
+SMTP_PASSWORD=${SMTP_PASSWORD}
+SMTP_FROM_ADDRESS=${SMTP_FROM_ADDRESS}
+SMTP_DOMAIN=${SMTP_DOMAIN}
 EOF_ENV
 
 # ── AIO docker-compose.yml ────────────────────────────────────────────────────
@@ -498,12 +524,24 @@ case "$cmd" in
     # Sets files as the default app, disables the first-run welcome screen,
     # sets the default phone region, sets overwriteprotocol for HTTPS callbacks,
     # and configures the Collabora WOPI allowlist for Cloudflare IP ranges.
+    echo "  Disabling template files for new users..."
+    docker exec --user www-data nextcloud-aio-nextcloud \
+      php occ app:disable templatefiles 2>/dev/null || true
+    echo "  Disabling Nextcloud announcements splash..."
+    docker exec --user www-data nextcloud-aio-nextcloud \
+      php occ app:disable nextcloud_announcements 2>/dev/null || true
+    echo "  Disabling dashboard..."
+    docker exec --user www-data nextcloud-aio-nextcloud \
+      php occ app:disable dashboard 2>/dev/null || true
+    echo "  Disabling first-run wizard..."
+    docker exec --user www-data nextcloud-aio-nextcloud \
+      php occ app:disable firstrunwizard 2>/dev/null || true
+    echo "  Disabling recommendations..."
+    docker exec --user www-data nextcloud-aio-nextcloud \
+      php occ app:disable recommendations 2>/dev/null || true
     echo "  Setting default app to files..."
     docker exec --user www-data nextcloud-aio-nextcloud \
       php occ config:system:set defaultapp --value=files
-    echo "  Disabling first-run welcome screen..."
-    docker exec --user www-data nextcloud-aio-nextcloud \
-      php occ config:app:set firstrunwizard show --value=0
     echo "  Setting default phone region to DE..."
     docker exec --user www-data nextcloud-aio-nextcloud \
       php occ config:system:set default_phone_region --value=DE
@@ -542,6 +580,27 @@ case "$cmd" in
       docker exec --user www-data nextcloud-aio-nextcloud \
         php occ config:app:set spreed turn_servers \
         --value="[{\"schemes\":\"turn\",\"server\":\"${TURN_SERVER:-staticauth.openrelay.metered.ca}:443\",\"secret\":\"${TURN_SECRET:-openrelayprojectsecret}\",\"protocols\":\"udp,tcp\"},{\"schemes\":\"turns\",\"server\":\"${TURN_SERVER:-staticauth.openrelay.metered.ca}:443\",\"secret\":\"${TURN_SECRET:-openrelayprojectsecret}\",\"protocols\":\"udp,tcp\"}]"
+    fi
+    if [[ "${CONFIGURE_SMTP:-0}" -eq 1 ]]; then
+      echo "  Configuring email / SMTP (${SMTP_HOST:-smtp.example.com})..."
+      docker exec --user www-data nextcloud-aio-nextcloud \
+        php occ config:system:set mail_smtpmode --value=smtp
+      docker exec --user www-data nextcloud-aio-nextcloud \
+        php occ config:system:set mail_smtphost --value="${SMTP_HOST:-smtp.example.com}"
+      docker exec --user www-data nextcloud-aio-nextcloud \
+        php occ config:system:set mail_smtpport --value="${SMTP_PORT:-587}"
+      docker exec --user www-data nextcloud-aio-nextcloud \
+        php occ config:system:set mail_smtpsecure --value="${SMTP_SECURE:-tls}"
+      docker exec --user www-data nextcloud-aio-nextcloud \
+        php occ config:system:set mail_smtpauth --value="${SMTP_AUTH:-1}" --type=integer
+      docker exec --user www-data nextcloud-aio-nextcloud \
+        php occ config:system:set mail_smtpname --value="${SMTP_NAME}"
+      docker exec --user www-data nextcloud-aio-nextcloud \
+        php occ config:system:set mail_smtppassword --value="${SMTP_PASSWORD}"
+      docker exec --user www-data nextcloud-aio-nextcloud \
+        php occ config:system:set mail_from_address --value="${SMTP_FROM_ADDRESS:-nextcloud}"
+      docker exec --user www-data nextcloud-aio-nextcloud \
+        php occ config:system:set mail_domain --value="${SMTP_DOMAIN:-example.com}"
     fi
     echo "  Done."
     ;;
@@ -773,6 +832,9 @@ echo "  5. Once Nextcloud is fully up, run the post-install configuration:"
 echo "       pct exec $CT_ID -- /usr/local/bin/nextcloud-aio-maint.sh configure"
 echo "     This sets the default app, phone region, overwriteprotocol, Collabora"
 echo "     WOPI allowlist, local server trust, and runs maintenance repair."
+echo "     SMTP is skipped if CONFIGURE_SMTP=0. To apply email settings later:"
+echo "       1. Edit /opt/nextcloud-aio/.env — set CONFIGURE_SMTP=1 and fill in SMTP values"
+echo "       2. Re-run: pct exec $CT_ID -- /usr/local/bin/nextcloud-aio-maint.sh configure"
 echo ""
 echo ""
 echo "    Cloudflare Tunnel alone does not provide LAN access to Nextcloud."
