@@ -39,15 +39,6 @@ SKIP_DOMAIN_VALIDATION=1
 # Example: NPM_HOST_IP="10.10.10.5"
 NPM_HOST_IP=""
 
-# Nextcloud Talk TURN server
-# Default uses the Open Relay Project — a free public TURN service.
-# Suitable for light homelab use; replace with your own coturn server for
-# production or heavy Talk usage.
-# Set CONFIGURE_TURN=0 to skip TURN configuration entirely.
-CONFIGURE_TURN=1
-TURN_SERVER="staticauth.openrelay.metered.ca"
-TURN_SECRET="openrelayprojectsecret"
-
 # Behavior
 CLEANUP_ON_FAIL=1
 
@@ -75,7 +66,6 @@ AIO_IMAGE="${AIO_IMAGE_REPO}:${AIO_TAG}"
 (( AIO_ADMIN_PORT >= 1 && AIO_ADMIN_PORT <= 65535 )) || { echo "  ERROR: AIO_ADMIN_PORT out of range." >&2; exit 1; }
 [[ "$AIO_APACHE_PORT" =~ ^[0-9]+$ ]] || { echo "  ERROR: AIO_APACHE_PORT must be numeric." >&2; exit 1; }
 (( AIO_APACHE_PORT >= 1 && AIO_APACHE_PORT <= 65535 )) || { echo "  ERROR: AIO_APACHE_PORT out of range." >&2; exit 1; }
-[[ "$CONFIGURE_TURN" =~ ^[01]$ ]] || { echo "  ERROR: CONFIGURE_TURN must be 0 or 1." >&2; exit 1; }
 [[ "$SKIP_DOMAIN_VALIDATION" =~ ^[01]$ ]] || { echo "  ERROR: SKIP_DOMAIN_VALIDATION must be 0 or 1." >&2; exit 1; }
 [[ -e "/usr/share/zoneinfo/${APP_TZ}" ]] || { echo "  ERROR: APP_TZ not found: $APP_TZ" >&2; exit 1; }
 [[ -z "$NPM_HOST_IP" ]] || [[ "$NPM_HOST_IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
@@ -142,7 +132,6 @@ cat <<EOF2
   NPM host IP:       ${NPM_HOST_IP:-"(not set — configure after AIO setup)"}
   Timezone:          $APP_TZ
   Tags:              $TAGS
-  Configure TURN:    $([ "$CONFIGURE_TURN" -eq 1 ] && echo "yes (${TURN_SERVER})" || echo "no")
   Cleanup on fail:   $CLEANUP_ON_FAIL
   ─────────────────────────────────────────────────────
   To change defaults, press Enter and
@@ -368,11 +357,6 @@ SKIP_DOMAIN_VALIDATION=${SKIP_VAL_STR}
 
 # NPM host IP for trusted_proxies — used by: nextcloud-aio-maint.sh set-trusted-proxies
 NPM_HOST_IP=${NPM_HOST_IP}
-
-# Nextcloud Talk TURN server
-CONFIGURE_TURN=${CONFIGURE_TURN}
-TURN_SERVER=${TURN_SERVER}
-TURN_SECRET=${TURN_SECRET}
 EOF_ENV
 
 # ── AIO docker-compose.yml ────────────────────────────────────────────────────
@@ -498,9 +482,15 @@ case "$cmd" in
     # Sets files as the default app, disables the first-run welcome screen,
     # sets the default phone region, sets overwriteprotocol for HTTPS callbacks,
     # and configures the Collabora WOPI allowlist for Cloudflare IP ranges.
-    echo "  Disabling template files for new users..."
+    echo "  Disabling skeleton files for new users..."
     docker exec --user www-data nextcloud-aio-nextcloud \
-      php occ app:disable templatefiles 2>/dev/null || true
+      php occ config:system:set skeletondirectory --value=""
+    echo "  Disabling Deck..."
+    docker exec --user www-data nextcloud-aio-nextcloud \
+      php occ app:disable deck 2>/dev/null || true
+    echo "  Disabling Talk..."
+    docker exec --user www-data nextcloud-aio-nextcloud \
+      php occ app:disable spreed 2>/dev/null || true
     echo "  Disabling Nextcloud announcements splash..."
     docker exec --user www-data nextcloud-aio-nextcloud \
       php occ app:disable nextcloud_announcements 2>/dev/null || true
@@ -549,12 +539,6 @@ case "$cmd" in
     echo "  Running maintenance:repair --include-expensive..."
     docker exec --user www-data nextcloud-aio-nextcloud \
       php occ maintenance:repair --include-expensive
-    if [[ "${CONFIGURE_TURN:-1}" -eq 1 ]]; then
-      echo "  Configuring Nextcloud Talk TURN server (${TURN_SERVER:-staticauth.openrelay.metered.ca})..."
-      docker exec --user www-data nextcloud-aio-nextcloud \
-        php occ config:app:set spreed turn_servers \
-        --value="[{\"schemes\":\"turn\",\"server\":\"${TURN_SERVER:-staticauth.openrelay.metered.ca}:443\",\"secret\":\"${TURN_SECRET:-openrelayprojectsecret}\",\"protocols\":\"udp,tcp\"},{\"schemes\":\"turns\",\"server\":\"${TURN_SERVER:-staticauth.openrelay.metered.ca}:443\",\"secret\":\"${TURN_SECRET:-openrelayprojectsecret}\",\"protocols\":\"udp,tcp\"}]"
-    fi
     echo "  Done."
     ;;
 
@@ -581,10 +565,9 @@ case "$cmd" in
     ;;
 
   update)
-    # The full Nextcloud stack (apps, databases, Talk, etc.) is updated via the AIO
-    # admin UI at https://<LXC_IP>:8080 — do not attempt to update those containers
-    # manually. This command only pulls a new mastercontainer image when AIO_TAG
-    # is changed in .env (e.g. switching from latest to a pinned release tag).
+    # The full Nextcloud stack (apps, databases, etc.) is updated via the AIO
+    # admin UI — do not attempt to update those containers manually. This command
+    # only pulls a new mastercontainer image when AIO_TAG is changed in .env.
     echo "  Pulling mastercontainer image (${AIO_IMAGE:-ghcr.io/nextcloud-releases/all-in-one:latest})..."
     cd "$APP_DIR"
     docker compose pull
@@ -606,13 +589,13 @@ case "$cmd" in
   Commands:
     check                          Check Collabora configuration and connectivity
     repair                         Run maintenance:repair --include-expensive
-    configure                      Set files as default app, disable welcome screen
+    configure                      Post-install configuration (run once after AIO wizard)
     set-trusted-proxies [IP]       Add NPM host as a trusted proxy in Nextcloud
     status                         Show running AIO containers
     update                         Pull updated mastercontainer image
     logs [--tail=N ...]            Show mastercontainer logs
 
-  Note: Full Nextcloud stack updates (apps, DB, Talk) are done via the AIO admin UI.
+  Note: Full Nextcloud stack updates are done via the AIO admin UI.
   Note: Container and data backups are handled by Proxmox Backup Server (PBS).
 USAGE
     ;;
@@ -717,10 +700,8 @@ printf '    Backend:     http://%s:11000  (NPM forward target)\n' "${ip:-<IP>}"
 printf '\n'
 printf '  Maintenance:\n'
 printf '    nextcloud-aio-maint.sh configure\n'
-printf '    nextcloud-aio-maint.sh repair\n'
-printf '    nextcloud-aio-maint.sh set-trusted-proxies <NPM_IP>\n'
+printf '    nextcloud-aio-maint.sh check\n'
 printf '    nextcloud-aio-maint.sh status\n'
-printf '    nextcloud-aio-maint.sh update\n'
 MOTD
 
 pct exec "$CT_ID" -- bash -lc 'cat > /etc/update-motd.d/99-footer && chmod +x /etc/update-motd.d/99-footer' <<'MOTD'
@@ -786,6 +767,7 @@ echo "       pct exec $CT_ID -- /usr/local/bin/nextcloud-aio-maint.sh configure"
 echo "     This sets the default app, phone region, overwriteprotocol, Collabora"
 echo "     WOPI allowlist, local server trust, and runs maintenance repair."
 echo ""
+echo "  ── Local LAN access ─────────────────────────────────────────────────────"
 echo ""
 echo "    Cloudflare Tunnel alone does not provide LAN access to Nextcloud."
 echo "    To reach cloud.example.com from inside your network:"
@@ -804,13 +786,10 @@ echo ""
 echo "    - Upload timeouts: Cloudflare enforces a 100-second request timeout."
 echo "      Large file uploads may time out or fail depending on chunking behavior."
 echo ""
-echo "    - Nextcloud Office / Collabora: if enabled, all Cloudflare IP ranges must"
-echo "      be added to the WOPI allowlist in Nextcloud's Collabora settings."
+echo "    - Nextcloud Office / Collabora: Cloudflare IP ranges are added to the"
+echo "      WOPI allowlist automatically by the configure command. If you see"
+echo "      WOPI errors, re-run configure to refresh the list."
 echo "      See: https://www.cloudflare.com/ips/"
-echo ""
-echo "    - Nextcloud Talk TURN: Talk's built-in TURN server does not work behind"
-echo "      Cloudflare Tunnel. A separate TURN server outside the tunnel is required"
-echo "      if Talk with video/audio is needed."
 echo ""
 echo "  ── Maintenance ──────────────────────────────────────────────────────────"
 echo ""
