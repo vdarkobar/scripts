@@ -491,6 +491,9 @@ case "$cmd" in
     echo "  Disabling Talk..."
     docker exec --user www-data nextcloud-aio-nextcloud \
       php occ app:disable spreed 2>/dev/null || true
+    echo "  Disabling Tasks..."
+    docker exec --user www-data nextcloud-aio-nextcloud \
+      php occ app:disable tasks 2>/dev/null || true
     echo "  Disabling Nextcloud announcements splash..."
     docker exec --user www-data nextcloud-aio-nextcloud \
       php occ app:disable nextcloud_announcements 2>/dev/null || true
