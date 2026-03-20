@@ -12,7 +12,6 @@ TEMPLATE_STORAGE="local"
 CONTAINER_STORAGE="local-lvm"
 
 # Nextcloud AIO / Docker
-AIO_ADMIN_PORT=8080
 AIO_APACHE_PORT=11000
 APP_TZ="Europe/Berlin"
 TAGS="nextcloud;aio;docker;lxc"
@@ -24,8 +23,12 @@ DEBIAN_VERSION=13
 AIO_IMAGE_REPO="ghcr.io/nextcloud-releases/all-in-one"
 AIO_TAG="latest"
 
-# Nextcloud data directory — must be set BEFORE first AIO start and never changed.
-# The path is created by this script and passed to the mastercontainer at startup.
+# Data storage for NEXTCLOUD_DATADIR — choose one mode:
+#   rootfs          — data lives inside the LXC rootfs (default; warn-only)
+#   /host/path      — absolute host path, bind-mounted into the CT
+#   <zfs-pool-name> — ZFS pool; script creates or reuses <pool>/nextcloud-data dataset
+# NEXTCLOUD_DATADIR is the CT-internal path AIO always sees. Do not change it.
+NCDATA_STORAGE="rootfs"
 NEXTCLOUD_DATADIR="/opt/nextcloud-aio/data"
 
 # Domain validation — AIO's domain validation is known not to work behind
@@ -49,7 +52,8 @@ AIO_IMAGE="${AIO_IMAGE_REPO}:${AIO_TAG}"
 # ── Custom configs created by this script ─────────────────────────────────────
 #   /opt/nextcloud-aio/docker-compose.yml        (AIO compose stack)
 #   /opt/nextcloud-aio/.env                      (runtime configuration)
-#   /opt/nextcloud-aio/data/                     (Nextcloud data dir — local storage default)
+#   /opt/nextcloud-aio/data/                     (Nextcloud data dir — rootfs default;
+#                                                 or bind-mounted from NCDATA_STORAGE)
 #   /usr/local/bin/nextcloud-aio-maint.sh        (maintenance helper)
 #   /etc/systemd/system/nextcloud-aio.service
 #   /etc/update-motd.d/00-header
@@ -62,8 +66,6 @@ AIO_IMAGE="${AIO_IMAGE_REPO}:${AIO_TAG}"
 # ── Config validation ─────────────────────────────────────────────────────────
 [[ -n "$CT_ID" ]] || { echo "  ERROR: Could not obtain next CT ID." >&2; exit 1; }
 [[ "$DEBIAN_VERSION" =~ ^[0-9]+$ ]] || { echo "  ERROR: DEBIAN_VERSION must be numeric." >&2; exit 1; }
-[[ "$AIO_ADMIN_PORT" =~ ^[0-9]+$ ]] || { echo "  ERROR: AIO_ADMIN_PORT must be numeric." >&2; exit 1; }
-(( AIO_ADMIN_PORT >= 1 && AIO_ADMIN_PORT <= 65535 )) || { echo "  ERROR: AIO_ADMIN_PORT out of range." >&2; exit 1; }
 [[ "$AIO_APACHE_PORT" =~ ^[0-9]+$ ]] || { echo "  ERROR: AIO_APACHE_PORT must be numeric." >&2; exit 1; }
 (( AIO_APACHE_PORT >= 1 && AIO_APACHE_PORT <= 65535 )) || { echo "  ERROR: AIO_APACHE_PORT out of range." >&2; exit 1; }
 [[ "$SKIP_DOMAIN_VALIDATION" =~ ^[01]$ ]] || { echo "  ERROR: SKIP_DOMAIN_VALIDATION must be 0 or 1." >&2; exit 1; }
@@ -71,6 +73,11 @@ AIO_IMAGE="${AIO_IMAGE_REPO}:${AIO_TAG}"
 [[ -z "$NPM_HOST_IP" ]] || [[ "$NPM_HOST_IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
   echo "  ERROR: NPM_HOST_IP must be an IPv4 address or empty." >&2; exit 1
 }
+if [[ "$NCDATA_STORAGE" != "rootfs" && "$NCDATA_STORAGE" != /* && \
+    ! "$NCDATA_STORAGE" =~ ^[A-Za-z0-9_.:-]+$ ]]; then
+  echo "  ERROR: NCDATA_STORAGE must be 'rootfs', an absolute host path, or a ZFS pool name." >&2
+  exit 1
+fi
 
 # ── Trap cleanup ──────────────────────────────────────────────────────────────
 trap 'rc=$?;
@@ -103,12 +110,18 @@ for cmd in pvesh pveam pct pvesm curl python3 ip awk sort paste readlink cp chmo
   command -v "$cmd" >/dev/null 2>&1 || { echo "  ERROR: Missing required command: $cmd" >&2; exit 1; }
 done
 
+if [[ "$NCDATA_STORAGE" != "rootfs" && "$NCDATA_STORAGE" != /* ]]; then
+  command -v zfs >/dev/null 2>&1 \
+    || { echo "  ERROR: zfs command required when NCDATA_STORAGE is a ZFS pool name." >&2; exit 1; }
+fi
+
 # ── Discover available resources ──────────────────────────────────────────────
 AVAIL_TMPL_STORES="$(pvesh get /storage --output-format json 2>/dev/null \
   | python3 -c "import sys,json; print(', '.join(sorted(s['storage'] for s in json.load(sys.stdin) if 'vztmpl' in s.get('content',''))))" 2>/dev/null || echo "n/a")"
 AVAIL_CT_STORES="$(pvesh get /storage --output-format json 2>/dev/null \
   | python3 -c "import sys,json; print(', '.join(sorted(s['storage'] for s in json.load(sys.stdin) if 'rootdir' in s.get('content',''))))" 2>/dev/null || echo "n/a")"
 AVAIL_BRIDGES="$(ip -o link show type bridge 2>/dev/null | awk -F': ' '{print $2}' | grep -E '^vmbr' | sort | paste -sd, | sed 's/,/, /g' || echo "n/a")"
+AVAIL_ZFS_POOLS="$(zpool list -H -o name 2>/dev/null | sort | paste -sd, - | sed 's/,/, /g' || echo "n/a")"
 
 # ── Show defaults & confirm ───────────────────────────────────────────────────
 cat <<EOF2
@@ -125,11 +138,12 @@ cat <<EOF2
   Container storage: $CONTAINER_STORAGE  ($AVAIL_CT_STORES)
   Debian:            $DEBIAN_VERSION
   AIO image:         $AIO_IMAGE
-  Admin UI port:     $AIO_ADMIN_PORT
+  Admin UI port:     8080 (fixed — AIO does not support remapping this port)
   Apache port:       $AIO_APACHE_PORT  (NPM backend target)
   Data dir:          $NEXTCLOUD_DATADIR
   Domain validation: $([ "$SKIP_DOMAIN_VALIDATION" -eq 1 ] && echo "skipped (correct for Cloudflare Tunnel)" || echo "enabled (only if not using Cloudflare Tunnel)")
   NPM host IP:       ${NPM_HOST_IP:-"(not set — configure after AIO setup)"}
+  Data storage:      ${NCDATA_STORAGE}  (ZFS pools: ${AVAIL_ZFS_POOLS})
   Timezone:          $APP_TZ
   Tags:              $TAGS
   Cleanup on fail:   $CLEANUP_ON_FAIL
@@ -235,6 +249,85 @@ echo "  Creating LXC ${CT_ID} (${HN})..."
 pct create "$CT_ID" "${TEMPLATE_STORAGE}:vztmpl/${TEMPLATE}" "${PCT_OPTIONS[@]}"
 CREATED=1
 
+# ── Data storage — setup and LXC bind mount ───────────────────────────────────
+NCDATA_EXISTING=0    # 1 = existing data confirmed; skip chmod inside CT
+
+if [[ "$NCDATA_STORAGE" == "rootfs" ]]; then
+  echo "  WARNING: No external data storage configured — Nextcloud data will use" >&2
+  echo "           rootfs (${DISK} GB). Consider NCDATA_STORAGE for production use." >&2
+
+elif [[ "$NCDATA_STORAGE" == /* ]]; then
+  if [[ -d "$NCDATA_STORAGE" ]] && [[ -n "$(ls -A "$NCDATA_STORAGE" 2>/dev/null)" ]]; then
+    echo ""
+    echo "  !! EXISTING DATA DETECTED — host path: ${NCDATA_STORAGE}"
+    echo "  This directory is non-empty and will be mounted as NEXTCLOUD_DATADIR"
+    echo "  on the new instance. Existing user files will be preserved."
+    echo "  Host-side ownership is NOT changed — it must already be 100033:100033"
+    echo "  (www-data inside the CT) from the previous deployment."
+    echo "  After AIO setup completes, run:"
+    echo "    nextcloud-aio-maint.sh files-scan --all"
+    echo "  to rebuild the file index. Re-create users with identical usernames"
+    echo "  before scanning, or files will not be reattached correctly."
+    echo ""
+    read -r -p "  Attach existing data to new instance? [y/N]: " _dr
+    case "$_dr" in
+      [yY][eE][sS]|[yY]) NCDATA_EXISTING=1 ;;
+      *) echo "  Aborted." >&2; exit 1 ;;
+    esac
+  else
+    mkdir -p "$NCDATA_STORAGE"
+    # Unprivileged LXC idmap: container UID 33 (www-data, AIO Nextcloud runtime user)
+    # maps to host UID 100033. The bind mount must be owned by 100033:100033 on the
+    # host so AIO can chown NEXTCLOUD_DATADIR to www-data from inside the container.
+    chown 100033:100033 "$NCDATA_STORAGE"
+  fi
+  pct set "$CT_ID" --mp0 "${NCDATA_STORAGE},mp=${NEXTCLOUD_DATADIR}"
+  echo "  Data mount: ${NCDATA_STORAGE} -> ${NEXTCLOUD_DATADIR} (CT ${CT_ID})"
+
+else
+  NCDATA_DATASET="${NCDATA_STORAGE}/nextcloud-data"
+  NCDATA_HOST_PATH="$(zfs get -H -o value mountpoint "${NCDATA_DATASET}" 2>/dev/null || true)"
+  if [[ -z "$NCDATA_HOST_PATH" || "$NCDATA_HOST_PATH" == "-" ]]; then
+    echo "  Creating ZFS dataset: ${NCDATA_DATASET}"
+    zfs create -o compression=lz4 "${NCDATA_DATASET}"
+    NCDATA_HOST_PATH="$(zfs get -H -o value mountpoint "${NCDATA_DATASET}")"
+    # Unprivileged LXC idmap: container UID 33 (www-data, AIO Nextcloud runtime user)
+    # maps to host UID 100033. The dataset mountpoint must be owned by 100033:100033
+    # on the host so AIO can chown NEXTCLOUD_DATADIR to www-data from inside the CT.
+    chown 100033:100033 "$NCDATA_HOST_PATH"
+  else
+    _ncdata_empty=1
+    [[ -n "$(ls -A "$NCDATA_HOST_PATH" 2>/dev/null)" ]] && _ncdata_empty=0
+    echo ""
+    echo "  !! EXISTING ZFS DATASET DETECTED"
+    echo "  Dataset:  ${NCDATA_DATASET}"
+    echo "  Path:     ${NCDATA_HOST_PATH}"
+    if [[ "$_ncdata_empty" -eq 0 ]]; then
+      echo "  Content:  non-empty — existing Nextcloud user data found"
+      echo "  This dataset will be mounted as NEXTCLOUD_DATADIR on the new instance."
+      echo "  Existing user files will be preserved."
+      echo "  Host-side ownership is NOT changed — it must already be 100033:100033"
+      echo "  (www-data inside the CT) from the previous deployment."
+      echo "  After AIO setup completes, run:"
+      echo "    nextcloud-aio-maint.sh files-scan --all"
+      echo "  to rebuild the file index. Re-create users with identical usernames"
+      echo "  before scanning, or files will not be reattached correctly."
+    else
+      echo "  Content:  empty dataset — no existing data"
+    fi
+    echo ""
+    read -r -p "  Attach this dataset to new instance? [y/N]: " _dr
+    case "$_dr" in
+      [yY][eE][sS]|[yY])
+        [[ "$_ncdata_empty" -eq 0 ]] && NCDATA_EXISTING=1
+        ;;
+      *) echo "  Aborted." >&2; exit 1 ;;
+    esac
+  fi
+  pct set "$CT_ID" --mp0 "${NCDATA_HOST_PATH},mp=${NEXTCLOUD_DATADIR}"
+  echo "  Data mount: ${NCDATA_HOST_PATH} -> ${NEXTCLOUD_DATADIR} (CT ${CT_ID})"
+fi
+
 # ── Start & wait for IPv4 ─────────────────────────────────────────────────────
 pct start "$CT_ID"
 
@@ -331,11 +424,17 @@ echo "  Setting up directory structure..."
 pct exec "$CT_ID" -- bash -lc "
   set -euo pipefail
   mkdir -p '${APP_DIR}'
-  mkdir -p '${NEXTCLOUD_DATADIR}'
   chmod 0750 '${APP_DIR}'
-  # NEXTCLOUD_DATADIR permissions are managed by the AIO containers.
-  chmod 0755 '${NEXTCLOUD_DATADIR}'
 "
+# rootfs mode: create and seed the data dir.
+# External modes: bind mount is in place; AIO manages NEXTCLOUD_DATADIR permissions.
+if [[ "$NCDATA_STORAGE" == "rootfs" ]]; then
+  pct exec "$CT_ID" -- bash -lc "
+    set -euo pipefail
+    mkdir -p '${NEXTCLOUD_DATADIR}'
+    chmod 0755 '${NEXTCLOUD_DATADIR}'
+  "
+fi
 
 # ── AIO .env ──────────────────────────────────────────────────────────────────
 # docker compose reads .env from the project directory automatically.
@@ -351,6 +450,7 @@ AIO_TAG=${AIO_TAG}
 AIO_IMAGE=${AIO_IMAGE}
 
 NEXTCLOUD_DATADIR=${NEXTCLOUD_DATADIR}
+NCDATA_STORAGE=${NCDATA_STORAGE}
 APACHE_PORT=${AIO_APACHE_PORT}
 APACHE_IP_BINDING=0.0.0.0
 SKIP_DOMAIN_VALIDATION=${SKIP_VAL_STR}
@@ -380,6 +480,7 @@ services:
     volumes:
       - nextcloud_aio_mastercontainer:/mnt/docker-aio-config
       - /var/run/docker.sock:/var/run/docker.sock:ro
+    network_mode: bridge # Matches upstream compose.yaml — places container on the default bridge, same as docker run.
 
 volumes:
   nextcloud_aio_mastercontainer:
@@ -438,9 +539,9 @@ for i in $(seq 1 36); do
 done
 
 if [[ "$AIO_HEALTHY" -eq 1 ]]; then
-  echo "  AIO admin UI health check passed (port ${AIO_ADMIN_PORT} — HTTP ${HTTP_CODE})"
+  echo "  AIO admin UI health check passed (port 8080 — HTTP ${HTTP_CODE})"
 else
-  echo "  WARNING: AIO admin UI not responding on port ${AIO_ADMIN_PORT} after 3 minutes" >&2
+  echo "  WARNING: AIO admin UI not responding on port 8080 after 3 minutes" >&2
   echo "  Check: pct exec $CT_ID -- docker logs nextcloud-aio-mastercontainer" >&2
   echo "  Check: pct exec $CT_ID -- docker ps -a" >&2
 fi
@@ -585,6 +686,34 @@ case "$cmd" in
     docker logs nextcloud-aio-mastercontainer "${@:2}"
     ;;
 
+  files-scan)
+    # Rebuilds the Nextcloud file index from the contents of NEXTCLOUD_DATADIR.
+    # Use after attaching an existing data directory to a new instance.
+    # Prerequisite: re-create all user accounts with identical usernames first,
+    # otherwise files cannot be reattached to their owners.
+    # Nextcloud must be fully up (AIO wizard complete, all containers running).
+    _scan_target="${2:---all}"
+    # Safety trap: ensure maintenance mode is always disabled on exit or error,
+    # so a failed scan does not leave the instance permanently inaccessible.
+    trap 'echo "  Disabling maintenance mode (cleanup after failure)..." >&2
+          docker exec --user www-data nextcloud-aio-nextcloud \
+            php occ maintenance:mode --off 2>/dev/null || true' ERR EXIT
+    echo "  Enabling maintenance mode..."
+    docker exec --user www-data nextcloud-aio-nextcloud \
+      php occ maintenance:mode --on
+    echo "  Scanning files (${_scan_target})..."
+    docker exec --user www-data nextcloud-aio-nextcloud \
+      php occ files:scan "${_scan_target}"
+    echo "  Cleaning up orphaned file cache entries..."
+    docker exec --user www-data nextcloud-aio-nextcloud \
+      php occ files:cleanup
+    echo "  Disabling maintenance mode..."
+    docker exec --user www-data nextcloud-aio-nextcloud \
+      php occ maintenance:mode --off
+    trap - ERR EXIT
+    echo "  Done. Verify files in the Nextcloud web UI."
+    ;;
+
   ''|-h|--help)
     cat <<USAGE
   Usage: $0 <command> [args]
@@ -597,6 +726,7 @@ case "$cmd" in
     status                         Show running AIO containers
     update                         Pull updated mastercontainer image
     logs [--tail=N ...]            Show mastercontainer logs
+    files-scan [--all | <user>]    Rebuild file index from data dir (recovery use)
 
   Note: Full Nextcloud stack updates are done via the AIO admin UI.
   Note: Container and data backups are handled by Proxmox Backup Server (PBS).
@@ -694,9 +824,15 @@ pct exec "$CT_ID" -- bash -lc 'cat > /etc/update-motd.d/30-app && chmod +x /etc/
 #!/bin/sh
 ip=$(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -n1)
 running=$(docker ps --format '{{.Names}}' 2>/dev/null | grep -c nextcloud || echo 0)
+ncdata_dir=$(awk -F= '/^NEXTCLOUD_DATADIR=/{print $2}' /opt/nextcloud-aio/.env 2>/dev/null | tail -n1)
+ncdata_storage=$(awk -F= '/^NCDATA_STORAGE=/{print $2}' /opt/nextcloud-aio/.env 2>/dev/null | tail -n1)
+ncdata_disk=$(df -h "${ncdata_dir:-/opt/nextcloud-aio/data}" 2>/dev/null | awk 'NR==2{printf "%s/%s (%s used)", $3, $2, $5}')
 printf '\n'
 printf '  Nextcloud AIO:\n'
 printf '    App dir:     /opt/nextcloud-aio\n'
+printf '    Data dir:    %s\n' "${ncdata_dir:-n/a}"
+printf '    Storage:     %s\n' "${ncdata_storage:-rootfs}"
+printf '    Data disk:   %s\n' "${ncdata_disk:-n/a}"
 printf '    Containers:  %s nextcloud container(s) running\n' "$running"
 printf '    Admin UI:    https://%s:8080\n' "${ip:-<IP>}"
 printf '    Backend:     http://%s:11000  (NPM forward target)\n' "${ip:-<IP>}"
@@ -713,7 +849,7 @@ printf '  ───────────────────────�
 MOTD
 
 # ── Proxmox UI description ────────────────────────────────────────────────────
-AIO_DESC="<a href='https://${CT_IP}:${AIO_ADMIN_PORT}/' target='_blank' rel='noopener noreferrer' style='text-decoration: none; color: #00617f;'>AIO Admin</a>
+AIO_DESC="<a href='https://${CT_IP}:8080/' target='_blank' rel='noopener noreferrer' style='text-decoration: none; color: #00617f;'>AIO Admin</a>
 <details><summary>Details</summary>Nextcloud AIO (Docker) on Debian ${DEBIAN_VERSION} LXC
 Apache backend port: ${AIO_APACHE_PORT}
 Data dir: ${NEXTCLOUD_DATADIR}
@@ -734,10 +870,18 @@ pct exec "$CT_ID" -- bash -lc '
 echo ""
 echo "  CT: $CT_ID | IP: ${CT_IP} | Login: password set"
 echo ""
+echo "  Data storage: ${NCDATA_STORAGE}"
+echo "  Data dir:     ${NEXTCLOUD_DATADIR}"
+if [[ "$NCDATA_EXISTING" -eq 1 ]]; then
+  echo ""
+  echo "  !! Existing data was attached. After AIO setup and user re-creation, run:"
+  echo "       pct exec $CT_ID -- /usr/local/bin/nextcloud-aio-maint.sh files-scan --all"
+fi
+echo ""
 echo "  ── Next steps (required — manual) ──────────────────────────────────────"
 echo ""
 echo "  1. Open AIO admin UI using the LXC IP (not the public domain):"
-echo "       https://${CT_IP}:${AIO_ADMIN_PORT}"
+echo "       https://${CT_IP}:8080"
 echo ""
 echo "  2. Enter your public domain (e.g. cloud.example.com) and complete"
 echo "     setup. AIO will pull and start all service containers."
@@ -801,6 +945,8 @@ echo "    pct exec $CT_ID -- /usr/local/bin/nextcloud-aio-maint.sh configure"
 echo "    pct exec $CT_ID -- /usr/local/bin/nextcloud-aio-maint.sh set-trusted-proxies <NPM_HOST_IP>"
 echo "    pct exec $CT_ID -- /usr/local/bin/nextcloud-aio-maint.sh status"
 echo "    pct exec $CT_ID -- /usr/local/bin/nextcloud-aio-maint.sh logs [--tail=50]"
+echo "    pct exec $CT_ID -- /usr/local/bin/nextcloud-aio-maint.sh files-scan [--all | <username>]"
+echo "      (recovery: rebuilds file index after attaching existing NEXTCLOUD_DATADIR to a new instance)"
 echo ""
 echo "  To update Nextcloud, log in at https://cloud.example.com"
 echo "  then go to: Avatar → Administration settings → Nextcloud AIO"
