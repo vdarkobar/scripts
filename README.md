@@ -60,7 +60,7 @@
 
 <details>
   <summary>FileBrowser Quantum</summary>
-  <p>Self-hosted web-based file manager, installs as an add-on to an existing container.</p>
+  <p>Temporary web-based file manager for managing container files.</p>
   <pre><code>bash &lt;(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/filebrowser.sh)</code></pre>
 </details>
 
