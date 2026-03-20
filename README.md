@@ -109,7 +109,7 @@
   <pre><code>bash &lt;(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/kavita-podman.sh)</code></pre>
 </details>
 
-## Search
+## Privacy
 <details>
   <summary>SearXNG</summary>
   <p>Privacy-focused metasearch engine.</p>
@@ -122,7 +122,6 @@
   <pre><code>bash &lt;(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/searxng-podman.sh)</code></pre>
 </details>
 
-## Privacy
 <details>
   <summary>Privatebin</summary>
   <p>Minimalist self-hosted pastebin.</p>
