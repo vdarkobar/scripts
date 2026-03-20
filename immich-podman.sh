@@ -29,14 +29,12 @@ DEBIAN_VERSION=13
 # Optional features
 AUTO_UPDATE=0                        # 1 = enable timer-driven maintenance/update runs
 TRACK_LATEST=0                       # 1 = auto-update follows ${IMMICH_IMAGE_REPO}:latest
-KEEP_BACKUPS=7
 
 # Behavior
 CLEANUP_ON_FAIL=1
 
 # Derived
 APP_DIR="/opt/immich"
-BACKUP_DIR="/opt/immich-backups"
 APP_URL=""
 [[ -n "$PUBLIC_FQDN" ]] && APP_URL="https://${PUBLIC_FQDN}"
 
@@ -47,7 +45,6 @@ APP_URL=""
 #   /opt/immich/redis/                     (Valkey data)
 #   /opt/immich/config/                    (Immich config state)
 #   /opt/immich/library/                   (photo library)
-#   /opt/immich-backups/                   (scoped maintenance backups: .env, compose, config)
 #   /usr/local/bin/immich-maint.sh         (maintenance helper)
 #   /etc/systemd/system/immich-stack.service
 #   /etc/systemd/system/immich-update.service
@@ -64,7 +61,6 @@ APP_URL=""
 [[ "$DEBIAN_VERSION" =~ ^[0-9]+$ ]] || { echo "  ERROR: DEBIAN_VERSION must be numeric." >&2; exit 1; }
 [[ "$APP_PORT" =~ ^[0-9]+$ ]] || { echo "  ERROR: APP_PORT must be numeric." >&2; exit 1; }
 (( APP_PORT >= 1 && APP_PORT <= 65535 )) || { echo "  ERROR: APP_PORT must be between 1 and 65535." >&2; exit 1; }
-[[ "$KEEP_BACKUPS" =~ ^[0-9]+$ ]] || { echo "  ERROR: KEEP_BACKUPS must be numeric." >&2; exit 1; }
 [[ -n "$IMMICH_IMAGE_REPO" && ! "$IMMICH_IMAGE_REPO" =~ [[:space:]] ]] || { echo "  ERROR: IMMICH_IMAGE_REPO must be non-empty and contain no spaces." >&2; exit 1; }
 [[ -n "$IMMICH_TAG" && "$IMMICH_TAG" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || { echo "  ERROR: IMMICH_TAG must contain only tag-safe characters." >&2; exit 1; }
 [[ "$AUTO_UPDATE" =~ ^[01]$ ]] || { echo "  ERROR: AUTO_UPDATE must be 0 or 1." >&2; exit 1; }
@@ -151,7 +147,6 @@ cat <<EOF2
   Tags:              $TAGS
   Auto-update:       $([ "$AUTO_UPDATE" -eq 1 ] && echo "enabled" || echo "disabled")
   Track latest:      $([ "$TRACK_LATEST" -eq 1 ] && echo "enabled" || echo "disabled")
-  Keep backups:      $KEEP_BACKUPS
   Cleanup on fail:   $CLEANUP_ON_FAIL
   ────────────────────────────────────────
   To change defaults, press Enter and
@@ -265,8 +260,26 @@ if [[ "$PHOTO_STORAGE" == "rootfs" ]]; then
   chown 101000:101000 "/var/lib/lxc/${CT_ID}/rootfs/opt/immich/config"
   pct unmount "$CT_ID"
 elif [[ "$PHOTO_STORAGE" == /* ]]; then
-  mkdir -p "$PHOTO_STORAGE"
-  chown 101000:101000 "$PHOTO_STORAGE"
+  PHOTO_EXISTING=0
+  if [[ -d "$PHOTO_STORAGE" ]] && [[ -n "$(ls -A "$PHOTO_STORAGE" 2>/dev/null)" ]]; then
+    echo ""
+    echo "  !! EXISTING DATA DETECTED — host path: ${PHOTO_STORAGE}"
+    echo "  This directory is non-empty and will be mounted as /opt/immich/library"
+    echo "  on the new instance. Existing photos will be preserved."
+    echo "  Host-side ownership is NOT changed — it must already be 101000:101000"
+    echo "  (app user inside the CT) from the previous deployment."
+    echo ""
+    read -r -p "  Attach existing library to new instance? [y/N]: " _pr
+    case "$_pr" in
+      [yY][eE][sS]|[yY]) PHOTO_EXISTING=1 ;;
+      *) echo "  Aborted." >&2; exit 1 ;;
+    esac
+  else
+    mkdir -p "$PHOTO_STORAGE"
+    # Unprivileged LXC idmap: container UID 1000 (Immich app user) maps to host
+    # UID 101000. The bind mount must be owned by 101000:101000 on the host.
+    chown 101000:101000 "$PHOTO_STORAGE"
+  fi
   pct mount "$CT_ID"
   mkdir -p "/var/lib/lxc/${CT_ID}/rootfs/opt/immich" \
            "/var/lib/lxc/${CT_ID}/rootfs/opt/immich/postgresdata" \
@@ -282,17 +295,43 @@ elif [[ "$PHOTO_STORAGE" == /* ]]; then
   pct unmount "$CT_ID"
   pct set "$CT_ID" --mp0 "${PHOTO_STORAGE},mp=/opt/immich/library"
   echo "  Photos mount: ${PHOTO_STORAGE} -> /opt/immich/library (CT ${CT_ID})"
+
 else
+  PHOTO_EXISTING=0
   PHOTOS_DATASET="${PHOTO_STORAGE}/immich-photos"
   PHOTOS_HOST_PATH="$(zfs get -H -o value mountpoint "${PHOTOS_DATASET}" 2>/dev/null || true)"
   if [[ -z "$PHOTOS_HOST_PATH" || "$PHOTOS_HOST_PATH" == "-" ]]; then
     echo "  Creating ZFS dataset: ${PHOTOS_DATASET}"
     zfs create -o compression=lz4 "${PHOTOS_DATASET}"
     PHOTOS_HOST_PATH="$(zfs get -H -o value mountpoint "${PHOTOS_DATASET}")"
+    # Unprivileged LXC idmap: container UID 1000 (Immich app user) maps to host
+    # UID 101000. The dataset mountpoint must be owned by 101000:101000 on the host.
+    chown 101000:101000 "$PHOTOS_HOST_PATH"
   else
-    echo "  ZFS dataset already exists: ${PHOTOS_DATASET} -> ${PHOTOS_HOST_PATH}"
+    _photo_empty=1
+    [[ -n "$(ls -A "$PHOTOS_HOST_PATH" 2>/dev/null)" ]] && _photo_empty=0
+    echo ""
+    echo "  !! EXISTING ZFS DATASET DETECTED"
+    echo "  Dataset:  ${PHOTOS_DATASET}"
+    echo "  Path:     ${PHOTOS_HOST_PATH}"
+    if [[ "$_photo_empty" -eq 0 ]]; then
+      echo "  Content:  non-empty — existing Immich photo library found"
+      echo "  This dataset will be mounted as /opt/immich/library on the new instance."
+      echo "  Existing photos will be preserved."
+      echo "  Host-side ownership is NOT changed — it must already be 101000:101000"
+      echo "  (app user inside the CT) from the previous deployment."
+    else
+      echo "  Content:  empty dataset — no existing data"
+    fi
+    echo ""
+    read -r -p "  Attach this dataset to new instance? [y/N]: " _pr
+    case "$_pr" in
+      [yY][eE][sS]|[yY])
+        [[ "$_photo_empty" -eq 0 ]] && PHOTO_EXISTING=1
+        ;;
+      *) echo "  Aborted." >&2; exit 1 ;;
+    esac
   fi
-  chown 101000:101000 "$PHOTOS_HOST_PATH"
   pct mount "$CT_ID"
   mkdir -p "/var/lib/lxc/${CT_ID}/rootfs/opt/immich" \
            "/var/lib/lxc/${CT_ID}/rootfs/opt/immich/postgresdata" \
@@ -486,12 +525,10 @@ APP_TZ=${APP_TZ}
 PUBLIC_FQDN=${PUBLIC_FQDN}
 APP_URL=${APP_URL}
 DB_PASSWORD=${DB_PASSWORD}
-KEEP_BACKUPS=${KEEP_BACKUPS}
 AUTO_UPDATE=${AUTO_UPDATE}
 TRACK_LATEST=${TRACK_LATEST}
 EOF2
   chmod 0600 '${APP_DIR}/.env' '${APP_DIR}/docker-compose.yml'
-  install -d -m 0755 '${BACKUP_DIR}'
 "
 
 # ── Maintenance script ────────────────────────────────────────────────────────
@@ -500,11 +537,9 @@ pct exec "$CT_ID" -- bash -lc 'cat > /usr/local/bin/immich-maint.sh && chmod 075
 set -Eeo pipefail
 
 APP_DIR="${APP_DIR:-/opt/immich}"
-BACKUP_DIR="${BACKUP_DIR:-/opt/immich-backups}"
 SERVICE="immich-stack.service"
 ENV_FILE="${APP_DIR}/.env"
 COMPOSE_FILE="${APP_DIR}/docker-compose.yml"
-KEEP_BACKUPS="${KEEP_BACKUPS:-7}"
 APP_PORT="${APP_PORT:-2283}"
 
 need_root() { [[ $EUID -eq 0 ]] || { echo "  ERROR: Run as root." >&2; exit 1; }; }
@@ -515,32 +550,22 @@ usage() {
   Immich Maintenance
   ──────────────────
   Usage:
-    $0 backup
-    $0 list
-    $0 restore <backup.tar.gz>
     $0 update <immich-tag|latest>
     $0 auto-update
     $0 version
 
   Notes:
-    - backup stops the stack for a consistent snapshot, then starts it again
-    - backup is intentionally scoped to .env, compose, and /opt/immich/config
-    - backup does NOT include photo library, PostgreSQL, or Valkey data
-    - update backs up first, then changes only the Immich app image tag
+    - update changes only the Immich app image tag
     - latest is only accepted when TRACK_LATEST=1 is intentionally enabled
     - auto-update obeys AUTO_UPDATE and TRACK_LATEST from ${ENV_FILE}
     - PostgreSQL and Valkey image changes are intentionally manual
+    - Container and data backups are handled by Proxmox Backup Server (PBS)
 EOF2
 }
 
 [[ -d "$APP_DIR" ]] || die "APP_DIR not found: $APP_DIR"
 [[ -f "$ENV_FILE" ]] || die "Missing env file: $ENV_FILE"
 [[ -f "$COMPOSE_FILE" ]] || die "Missing compose file: $COMPOSE_FILE"
-
-env_keep_backups="$(awk -F= '/^KEEP_BACKUPS=/{print $2}' "$ENV_FILE" | tail -n1)"
-if [[ "$env_keep_backups" =~ ^[0-9]+$ ]]; then
-  KEEP_BACKUPS="$env_keep_backups"
-fi
 
 env_app_port="$(awk -F= '/^APP_PORT=/{print $2}' "$ENV_FILE" | tail -n1)"
 if [[ "$env_app_port" =~ ^[0-9]+$ ]]; then
@@ -597,56 +622,6 @@ resolve_auto_tag() {
   fi
 }
 
-backup_stack() {
-  local ts out started=0
-  ts="$(date +%Y%m%d-%H%M%S)"
-  out="$BACKUP_DIR/immich-backup-$ts.tar.gz"
-
-  mkdir -p "$BACKUP_DIR"
-
-  if systemctl is-active --quiet "$SERVICE"; then
-    started=1
-    echo "  Stopping Immich stack for consistent backup ..."
-    systemctl stop "$SERVICE"
-  fi
-
-  trap 'if [[ $started -eq 1 ]]; then systemctl start "$SERVICE" || true; fi' RETURN
-
-  echo "  Creating scoped backup: $out"
-  tar -C / -czf "$out" \
-    opt/immich/.env \
-    opt/immich/docker-compose.yml \
-    opt/immich/config
-
-  if [[ "$KEEP_BACKUPS" =~ ^[0-9]+$ ]] && (( KEEP_BACKUPS > 0 )); then
-    ls -1t "$BACKUP_DIR"/immich-backup-*.tar.gz 2>/dev/null | awk -v keep="$KEEP_BACKUPS" 'NR>keep' | xargs -r rm -f --
-  fi
-
-  echo "  OK: $out"
-}
-
-restore_stack() {
-  local backup="$1"
-  [[ -n "$backup" ]] || die "Usage: immich-maint.sh restore <backup.tar.gz>"
-  [[ -f "$backup" ]] || die "Backup not found: $backup"
-
-  echo "  Stopping Immich stack ..."
-  systemctl stop "$SERVICE" 2>/dev/null || true
-
-  echo "  Removing current scoped maintenance state ..."
-  rm -rf \
-    "$APP_DIR/.env" \
-    "$APP_DIR/docker-compose.yml" \
-    "$APP_DIR/config"
-
-  echo "  Restoring backup ..."
-  tar -C / -xzf "$backup"
-
-  echo "  Starting Immich stack ..."
-  systemctl start "$SERVICE"
-  echo "  OK: restore completed."
-}
-
 update_immich() {
   local new_tag="$1" old_image old_tag old_repo new_image tmp_env health=0
   [[ -n "$new_tag" ]] || die "Usage: immich-maint.sh update <immich-tag|latest>"
@@ -668,7 +643,6 @@ update_immich() {
   echo "  Target  Immich tag:   $new_tag"
   echo "  Target  Immich image: $new_image"
 
-  backup_stack
   cp -a "$ENV_FILE" "$tmp_env"
 
   cleanup() { rm -f "$tmp_env"; }
@@ -728,9 +702,6 @@ auto_update_immich() {
 need_root
 cmd="${1:-}"
 case "$cmd" in
-  backup) backup_stack ;;
-  list) ls -1t "$BACKUP_DIR"/immich-backup-*.tar.gz 2>/dev/null || true ;;
-  restore) shift; restore_stack "${1:-}" ;;
   update) shift; update_immich "${1:-}" ;;
   auto-update) auto_update_immich ;;
   version)
@@ -946,9 +917,8 @@ ip=\$(ip -4 -o addr show scope global 2>/dev/null | awk '{print \$4}' | cut -d/ 
 printf '  Stack:     /opt/immich (%s containers running)\n' \"\$running\"
 printf '  Service:   %s\n' \"\$service_active\"
 printf '  Image:     %s\n' \"\${configured_image:-n/a}\"
-printf '  Backup:    /opt/immich-backups (scoped: .env, compose, config)\n'
 printf '  Compose:   cd /opt/immich && podman-compose [up -d|down|logs|ps]\n'
-printf '  Maintain:  immich-maint.sh [backup|list|restore|update|auto-update|version]\n'
+printf '  Maintain:  /usr/local/bin/immich-maint.sh [update|auto-update|version]\n'
 printf '  Web UI:    http://%s:${APP_PORT}\n' \"\${ip:-n/a}\"
 printf '  Health:    http://%s:${APP_PORT}/api/server/ping\n' \"\${ip:-n/a}\"
 [ -n '${PUBLIC_FQDN}' ] && printf '  Public:    https://${PUBLIC_FQDN}\n' || true
@@ -998,6 +968,12 @@ pct set "$CT_ID" --protection 1
 echo ""
 echo "  CT: $CT_ID | IP: ${CT_IP} | Login: password set"
 echo ""
+if [[ "${PHOTO_EXISTING:-0}" -eq 1 ]]; then
+  echo "  !! Existing photo library was attached. Verify library integrity in the"
+  echo "     Immich web UI after first login. If photos are missing from the index,"
+  echo "     trigger a re-scan: Immich UI -> Administration -> Jobs -> Library -> Scan All."
+  echo ""
+fi
 echo "  Access (local):"
 echo "    Main: http://${CT_IP}:${APP_PORT}/"
 echo "    Health: http://${CT_IP}:${APP_PORT}/api/server/ping"
@@ -1020,17 +996,13 @@ if [[ "$PHOTO_STORAGE" == "rootfs" ]]; then
 elif [[ "$PHOTO_STORAGE" == /* ]]; then
   echo "    ${APP_DIR}/library <- ${PHOTO_STORAGE}"
 else
-  echo "    ${APP_DIR}/library <- ${PHOTOS_HOST_PATH} (${PHOTO_STORAGE}/immich-photos)"
+  echo "    ${APP_DIR}/library <- ${PHOTOS_HOST_PATH}  (dataset: ${PHOTO_STORAGE}/immich-photos)"
 fi
 echo ""
 echo "  Maintenance:"
-echo "    pct exec $CT_ID -- immich-maint.sh backup"
-echo "    pct exec $CT_ID -- immich-maint.sh list"
 echo "    Policy: AUTO_UPDATE=${AUTO_UPDATE} TRACK_LATEST=${TRACK_LATEST}"
-echo "    pct exec $CT_ID -- immich-maint.sh update <immich-tag|latest>"
-echo "    Backup scope: .env, compose, config only (no library/DB/redis)"
-echo "    pct exec $CT_ID -- immich-maint.sh auto-update"
-echo "    pct exec $CT_ID -- immich-maint.sh restore /opt/immich-backups/<backup.tar.gz>"
+echo "    pct exec $CT_ID -- /usr/local/bin/immich-maint.sh update <immich-tag|latest>"
+echo "    pct exec $CT_ID -- /usr/local/bin/immich-maint.sh auto-update"
 echo ""
 echo "  Reverse proxy (NPM):"
 echo "    Enable WebSockets Support"
