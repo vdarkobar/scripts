@@ -1,7 +1,5 @@
-## Proxmox Scripts
+# Proxmox Scripts
 #### *container creation, configuration and app install*
-
-<br/>
 
 ## Infrastructure
 <details>
@@ -61,8 +59,8 @@
 </details>
 
 <details>
-  <summary>FileBrowser Quantum (Addon)</summary>
-  <p>Web-based file manager addon.</p>
+  <summary>FileBrowser Quantum</summary>
+  <p>Self-hosted web-based file manager, installs as an add-on to an existing container.</p>
   <pre><code>bash &lt;(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/filebrowser.sh)</code></pre>
 </details>
 
@@ -111,7 +109,7 @@
   <pre><code>bash &lt;(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/kavita-podman.sh)</code></pre>
 </details>
 
-## Search & Privacy
+## Search
 <details>
   <summary>SearXNG</summary>
   <p>Privacy-focused metasearch engine.</p>
@@ -124,6 +122,7 @@
   <pre><code>bash &lt;(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/searxng-podman.sh)</code></pre>
 </details>
 
+## Privacy
 <details>
   <summary>Privatebin</summary>
   <p>Minimalist self-hosted pastebin.</p>
