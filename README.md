@@ -6,6 +6,8 @@
   <summary>PVE Drive Inventory</summary>
   <p>At-a-glance hardware and storage health for Proxmox VE.</p>
   <pre><code>bash &lt;(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/bash/pve-drive-inventory.sh)</code></pre>
+  <p>ZFS Helper Script.</p>
+  <pre><code>bash &lt;(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/bash/zfs-helper.sh)</code></pre>
 </details>
 
 <details>
