@@ -33,16 +33,28 @@ printf "  ${CB}║${NC}  ${W}PVE Drive Inventory${NC}  ${DIM}$(hostname)  —  $
 printf "  ${CB}╚══════════════════════════════════════════════════════════════════╝${NC}\n"
 printf "\n  ${DIM}Total disks: ${W}%d${DIM}  │  ${NC}Legend:  ${NVMe} NVMe  ${SSD} SSD  ${HDD} HDD  ${USB} USB\n\n" "$ALL_DISK_COUNT"
 
+while IFS= read -r byid; do
+  printf "  ${DIM}%s${NC}\n" "$byid"
+done < <(find /dev/disk/by-id -maxdepth 1 -type l -name 'ata-*' ! -name '*-part*' | sort)
+
 # ── Dependency check ──────────────────────────────────────────────────────────
 for _cmd in smartctl lsblk bc; do
   command -v "$_cmd" &>/dev/null || printf "  ${WARN} '$_cmd' not found — install it for full output\n"
 done
 
 # ── Section 1 — Physical disks ───────────────────────────────────────────────
-printf "\n${BB}┌─ ${W}PHYSICAL DISKS${NC}\n${HR}\n"
-
 mapfile -t DISKS < <(lsblk -dno NAME,SIZE,ROTA,TRAN,MODEL,SERIAL 2>/dev/null \
   | awk '$4 != "rom"' | grep -v '^loop' | grep -v '^zd')
+
+DISK_COUNT=0
+for line in "${DISKS[@]}"; do
+  name=$(awk '{print $1}' <<<"$line")
+  [[ -b "/dev/$name" ]] || continue
+  lsblk -no PKNAME "/dev/$name" 2>/dev/null | grep -q . && continue
+  DISK_COUNT=$(( DISK_COUNT + 1 ))
+done
+
+printf "\n${BB}┌─ ${W}PHYSICAL DISKS${NC}  ${DIM}(Standalone, not in any ZFS pool: ${W}%d${DIM})${NC}\n${HR}\n" "$DISK_COUNT"
 
 DISK_COUNT=0
 for line in "${DISKS[@]}"; do
@@ -109,11 +121,16 @@ for line in "${DISKS[@]}"; do
 
 done
 
-printf "\n  ${DIM}Standalone (not in any ZFS pool): ${W}%d${NC}\n" "$DISK_COUNT"
-
 # ── Section 2 — ZFS pool members ─────────────────────────────────────────────
 if command -v zpool &>/dev/null && zpool list &>/dev/null 2>&1; then
-  printf "\n${BB}┌─ ${W}ZFS POOL MEMBERS${NC}\n${HR}\n"
+  _zfs_member_count=$(zpool status 2>/dev/null | awk '
+    /^config:/  { in_config=1; next }
+    /^errors:/  { in_config=0; next }
+    !in_config  { next }
+    ($1 ~ /^(ata|nvme|wwn|scsi|usb|virtio)-/ || $1 ~ /^(sd|hd|vd|nvme|xvd)[a-z0-9]/) { count++ }
+    END { print count+0 }
+  ')
+  printf "\n${BB}┌─ ${W}PHYSICAL DISKS${NC}  ${DIM}(ZFS pool members: ${W}%d${DIM})${NC}\n${HR}\n" "$_zfs_member_count"
 
   current_pool=""
   current_role=""
