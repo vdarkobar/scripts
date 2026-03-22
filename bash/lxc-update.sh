@@ -2,15 +2,15 @@
 set -Eeuo pipefail
 
 # ── Config ────────────────────────────────────────────────────────────────────
-SKIP_STOPPED=0            # -s / --skip-stopped     → 1 = ignore stopped containers
-START_STOPPED=1           # --no-start              → 0 = never start stopped containers
-DRY_RUN=0                 # -n / --dry-run          → 1 = only print actions
-EXCLUDE_IDS=""            # -x / --exclude          → repeatable; numeric CT IDs
-TAKE_SNAPSHOT=1           # --no-snapshot           → 0 = disable snapshots
+SKIP_STOPPED=0        # -s / --skip-stopped     → 1 = ignore stopped containers
+START_STOPPED=1       # --no-start              → 0 = never start stopped containers
+DRY_RUN=0             # -n / --dry-run          → 1 = only print actions
+EXCLUDE_IDS=""        # -x / --exclude          → repeatable; numeric CT IDs
+TAKE_SNAPSHOT=1       # --no-snapshot           → 0 = disable snapshots
 SNAPSHOT_PREFIX="preupd"
 WAIT_SECS_AFTER_START=30
-IGNORE_LOCKS=1            # --respect-locks         → 0 = skip locked containers
-CLEANUP_ON_FAIL=1         # --no-cleanup            → 0 = keep started CTs on error/interruption
+IGNORE_LOCKS=1        # --respect-locks         → 0 = skip locked containers
+CLEANUP_ON_FAIL=1     # --no-cleanup            → 0 = keep started CTs on error/interruption
 
 # ── Parse args ────────────────────────────────────────────────────────────────
 declare -A EXCLUDED=()
