@@ -26,7 +26,7 @@
   <pre><code>bash &lt;(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/bash/lxc-delete.sh)</code></pre>
 </details>
 
-## Networking
+## Network Services
 <details>
   <summary>NPM on Podman, optional Cloudflared</summary>
   <p>Runs Nginx Proxy Manager on Podman, with optional Cloudflared.</p>
