@@ -50,7 +50,7 @@
 <details>
   <summary>Uptime Kuma</summary>
   <p>A Fancy Self-Hosted Monitoring Tool.</p>
-  <pre><code>bash &lt;(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/bash/uptimekuma-podman.sh)</code></pre>
+  <pre><code>bash &lt;(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/bash/uptime-kuma-podman.sh)</code></pre>
 </details>
 
 ## Files & Storage
