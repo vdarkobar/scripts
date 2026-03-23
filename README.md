@@ -47,6 +47,12 @@
   <pre><code>bash &lt;(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/bash/unbound.sh)</code></pre>
 </details>
 
+<details>
+  <summary>Uptime Kuma</summary>
+  <p>A Fancy Self-Hosted Monitoring Tool.</p>
+  <pre><code>bash &lt;(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/bash/uptimekuma-podman.sh)</code></pre>
+</details>
+
 ## Files & Storage
 <details>
   <summary>Samba File server</summary>
