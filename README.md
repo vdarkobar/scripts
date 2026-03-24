@@ -116,6 +116,12 @@
   <pre><code>bash &lt;(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/bash/cryptpad.sh)</code></pre>
 </details>
 
+<details>
+  <summary>Stirling-PDF</summary>
+  <p>Web-based PDF editor.</p>
+  <pre><code>bash &lt;(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/bash/stirling-pdf-podman.sh)</code></pre>
+</details>
+
 ## Media & Libraries
 <details>
   <summary>Kavita</summary>
