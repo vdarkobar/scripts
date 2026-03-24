@@ -140,7 +140,7 @@ cat <<EOF2
 
 EOF2
 
-SCRIPT_URL="https://raw.githubusercontent.com/vdarkobar/scripts/main/stirling-pdf-podman.sh"
+SCRIPT_URL="https://raw.githubusercontent.com/vdarkobar/scripts/main/bash/stirling-pdf-podman.sh"
 SCRIPT_LOCAL="/root/stirling-pdf-podman.sh"
 SCRIPT_SELF="$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")"
 
