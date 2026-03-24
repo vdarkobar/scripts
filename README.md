@@ -48,6 +48,12 @@
 </details>
 
 <details>
+  <summary>Pi-Hole</summary>
+  <p>Network-wide Ad Blocking.</p>
+  <pre><code>bash &lt;(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/bash/pihole.sh)</code></pre>
+</details>
+
+<details>
   <summary>Uptime Kuma</summary>
   <p>A Fancy Self-Hosted Monitoring Tool.</p>
   <pre><code>bash &lt;(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/bash/uptime-kuma-podman.sh)</code></pre>
