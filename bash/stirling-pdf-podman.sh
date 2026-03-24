@@ -346,6 +346,8 @@ services:
     environment:
       SECURITY_ENABLELOGIN: \"false\"
       DISABLE_ADDITIONAL_FEATURES: \"false\"
+      SYSTEM_ENABLEANALYTICS: \"false\"
+      SYSTEM_ENABLESCARF: \"false\"
       LANGS: en_GB
       TZ: \${APP_TZ}
     restart: unless-stopped
