@@ -34,7 +34,7 @@
   <pre><code>bash &lt;(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/bash/lxc-delete.sh)</code></pre>
 </details>
 
-## Network Services
+## Networking & Monitoring
 <details>
   <summary>NPM on Podman, optional Cloudflared</summary>
   <p>Runs Nginx Proxy Manager on Podman, with optional Cloudflared.</p>
@@ -91,7 +91,7 @@
   <pre><code>bash &lt;(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/bash/matrix-podman.sh)</code></pre>
 </details>
 
-## Notes & Writing
+## Documents & Writing
 <details>
   <summary>Docmost</summary>
   <p>Collaborative wiki and documentation platform.</p>
