@@ -332,7 +332,11 @@ pct exec "$CT_ID" -- bash -lc "
   TESS_URL='https://github.com/tesseract-ocr/tessdata_fast/raw/main'
   curl -fsSL \"\${TESS_URL}/eng.traineddata\" -o '${APP_DIR}/tessdata/eng.traineddata'
   curl -fsSL \"\${TESS_URL}/deu.traineddata\" -o '${APP_DIR}/tessdata/deu.traineddata'
-  echo '  eng.traineddata and deu.traineddata downloaded'
+  curl -fsSL \"\${TESS_URL}/deu_latf.traineddata\" -o '${APP_DIR}/tessdata/deu_latf.traineddata'
+  curl -fsSL \"\${TESS_URL}/srp.traineddata\" -o '${APP_DIR}/tessdata/srp.traineddata'
+  curl -fsSL \"\${TESS_URL}/srp_latn.traineddata\" -o '${APP_DIR}/tessdata/srp_latn.traineddata'
+  curl -fsSL \"\${TESS_URL}/hrv.traineddata\" -o '${APP_DIR}/tessdata/hrv.traineddata'
+  echo '  OCR language packs downloaded (eng, deu, deu_latf, srp, srp_latn, hrv)'
   ls -lh '${APP_DIR}/tessdata/'
 "
 
