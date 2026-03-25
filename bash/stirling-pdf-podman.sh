@@ -36,6 +36,12 @@ CLEANUP_ON_FAIL=1
 # Derived
 APP_DIR="/opt/stirling-pdf"
 APP_IMAGE="${APP_IMAGE_REPO}:${APP_TAG}"
+SYSTEM_BACKENDURL=""
+SYSTEM_FRONTENDURL=""
+if [[ -n "$PUBLIC_FQDN" ]]; then
+  SYSTEM_BACKENDURL="https://${PUBLIC_FQDN}"
+  SYSTEM_FRONTENDURL="https://${PUBLIC_FQDN}"
+fi
 
 # ── Custom configs created by this script ─────────────────────────────────────
 #   /opt/stirling-pdf/docker-compose.yml      (Podman compose stack)
@@ -347,7 +353,8 @@ services:
       SECURITY_ENABLELOGIN: \"false\"
       DISABLE_ADDITIONAL_FEATURES: \"false\"
       SYSTEM_ENABLEANALYTICS: \"false\"
-      SYSTEM_ENABLESCARF: \"false\"
+      SYSTEM_BACKENDURL: \${SYSTEM_BACKENDURL:-}
+      SYSTEM_FRONTENDURL: \${SYSTEM_FRONTENDURL:-}
       LANGS: en_GB
       TZ: \${APP_TZ}
     restart: unless-stopped
@@ -364,6 +371,8 @@ APP_IMAGE=${APP_IMAGE}
 APP_PORT=${APP_PORT}
 APP_TZ=${APP_TZ}
 PUBLIC_FQDN=${PUBLIC_FQDN}
+SYSTEM_BACKENDURL=${SYSTEM_BACKENDURL}
+SYSTEM_FRONTENDURL=${SYSTEM_FRONTENDURL}
 AUTO_UPDATE=${AUTO_UPDATE}
 TRACK_LATEST=${TRACK_LATEST}
 EOF2
