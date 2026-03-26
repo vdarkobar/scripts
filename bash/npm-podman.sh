@@ -2,7 +2,7 @@
 set -Eeo pipefail
 
 # ── Config ────────────────────────────────────────────────────────────────────
-CT_ID="$(pvesh get /cluster/nextid)"
+CT_ID=""                             # assigned after preflight validates pvesh
 HN="npm"
 CPU=4
 RAM=4096
@@ -28,14 +28,12 @@ INSTALL_CLOUDFLARED=0                # 1 = install cloudflared inside CT
 NPM_DISABLE_IPV6=0                   # 1 = set DISABLE_IPV6=true for NPM app container
 AUTO_UPDATE=0                        # 1 = enable timer-driven maintenance/update runs
 TRACK_LATEST=0                       # 1 = auto-update follows docker.io/jc21/nginx-proxy-manager:latest
-KEEP_BACKUPS=7
 
 # Behavior
 CLEANUP_ON_FAIL=1
 
 # Derived
 APP_DIR="/opt/npm"
-BACKUP_DIR="/opt/npm-backups"
 NPM_IMAGE="${NPM_IMAGE_REPO}:${NPM_TAG}"
 DB_IMAGE="${DB_IMAGE_REPO}:${DB_TAG}"
 
@@ -46,7 +44,6 @@ DB_IMAGE="${DB_IMAGE_REPO}:${DB_TAG}"
 #   /opt/npm/data/                           (NPM application data)
 #   /opt/npm/letsencrypt/                    (certificates)
 #   /opt/npm/mysql/                          (MariaDB data)
-#   /opt/npm-backups/                        (compressed operational backups)
 #   /usr/local/bin/npm-maint.sh              (maintenance helper)
 #   /etc/systemd/system/npm-stack.service
 #   /etc/systemd/system/npm-update.service
@@ -60,15 +57,25 @@ DB_IMAGE="${DB_IMAGE_REPO}:${DB_TAG}"
 #   /etc/sysctl.d/99-hardening.conf
 
 # ── Config validation ─────────────────────────────────────────────────────────
-[[ -n "$CT_ID" ]] || { echo "  ERROR: Could not obtain next CT ID." >&2; exit 1; }
+[[ "$CPU" =~ ^[0-9]+$ ]] || { echo "  ERROR: CPU must be numeric." >&2; exit 1; }
+[[ "$RAM" =~ ^[0-9]+$ ]] || { echo "  ERROR: RAM must be numeric." >&2; exit 1; }
+[[ "$DISK" =~ ^[0-9]+$ ]] || { echo "  ERROR: DISK must be numeric." >&2; exit 1; }
+[[ "$CLEANUP_ON_FAIL" =~ ^[01]$ ]] || { echo "  ERROR: CLEANUP_ON_FAIL must be 0 or 1." >&2; exit 1; }
 [[ "$DEBIAN_VERSION" =~ ^[0-9]+$ ]] || { echo "  ERROR: DEBIAN_VERSION must be numeric." >&2; exit 1; }
 [[ "$NPM_ADMIN_PORT" =~ ^[0-9]+$ ]] || { echo "  ERROR: NPM_ADMIN_PORT must be numeric." >&2; exit 1; }
 (( NPM_ADMIN_PORT >= 1 && NPM_ADMIN_PORT <= 65535 )) || { echo "  ERROR: NPM_ADMIN_PORT must be between 1 and 65535." >&2; exit 1; }
-[[ "$KEEP_BACKUPS" =~ ^[0-9]+$ ]] || { echo "  ERROR: KEEP_BACKUPS must be numeric." >&2; exit 1; }
 [[ "$AUTO_UPDATE" =~ ^[01]$ ]] || { echo "  ERROR: AUTO_UPDATE must be 0 or 1." >&2; exit 1; }
 [[ "$TRACK_LATEST" =~ ^[01]$ ]] || { echo "  ERROR: TRACK_LATEST must be 0 or 1." >&2; exit 1; }
 [[ "$INSTALL_CLOUDFLARED" =~ ^[01]$ ]] || { echo "  ERROR: INSTALL_CLOUDFLARED must be 0 or 1." >&2; exit 1; }
 [[ "$NPM_DISABLE_IPV6" =~ ^[01]$ ]] || { echo "  ERROR: NPM_DISABLE_IPV6 must be 0 or 1." >&2; exit 1; }
+[[ "$NPM_IMAGE_REPO" =~ ^[a-zA-Z0-9._-]+/[a-zA-Z0-9._/-]+$ ]] || {
+  echo "  ERROR: NPM_IMAGE_REPO must be a valid image repo (e.g. docker.io/jc21/nginx-proxy-manager)." >&2
+  exit 1
+}
+[[ "$DB_IMAGE_REPO" =~ ^[a-zA-Z0-9._-]+/[a-zA-Z0-9._/-]+$ ]] || {
+  echo "  ERROR: DB_IMAGE_REPO must be a valid image repo (e.g. docker.io/jc21/mariadb-aria)." >&2
+  exit 1
+}
 [[ "$NPM_TAG" == "latest" || "$NPM_TAG" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9._-]+)?$ ]] || {
   echo "  ERROR: NPM_TAG must look like 2.14.0 or latest." >&2
   exit 1
@@ -110,6 +117,9 @@ for cmd in pvesh pveam pct pvesm curl python3 ip awk sort paste readlink cp chmo
   command -v "$cmd" >/dev/null 2>&1 || { echo "  ERROR: Missing required command: $cmd" >&2; exit 1; }
 done
 
+CT_ID="$(pvesh get /cluster/nextid)"
+[[ -n "$CT_ID" ]] || { echo "  ERROR: Could not obtain next CT ID." >&2; exit 1; }
+
 # ── Discover available resources ──────────────────────────────────────────────
 AVAIL_TMPL_STORES="$(pvesh get /storage --output-format json 2>/dev/null \
   | python3 -c "import sys,json; print(', '.join(sorted(s['storage'] for s in json.load(sys.stdin) if 'vztmpl' in s.get('content',''))))" 2>/dev/null || echo "n/a")"
@@ -139,7 +149,6 @@ cat <<EOF2
   Disable IPv6 app:  $([ "$NPM_DISABLE_IPV6" -eq 1 ] && echo "yes" || echo "no")
   Auto-update:       $([ "$AUTO_UPDATE" -eq 1 ] && echo "enabled" || echo "disabled")
   Track latest:      $([ "$TRACK_LATEST" -eq 1 ] && echo "enabled" || echo "disabled")
-  Keep backups:      $KEEP_BACKUPS
   Cloudflare Tunnel: $([ "$INSTALL_CLOUDFLARED" -eq 1 ] && echo "yes" || echo "no")
   Cleanup on fail:   $CLEANUP_ON_FAIL
   ────────────────────────────────────────
@@ -182,8 +191,12 @@ echo ""
 # ── Preflight — environment ───────────────────────────────────────────────────
 pvesm status | awk -v s="$TEMPLATE_STORAGE" '$1==s{f=1} END{exit(!f)}' \
   || { echo "  ERROR: Template storage not found: $TEMPLATE_STORAGE" >&2; exit 1; }
+echo "$AVAIL_TMPL_STORES" | grep -qw "$TEMPLATE_STORAGE" \
+  || { echo "  ERROR: Template storage '$TEMPLATE_STORAGE' does not support vztmpl content (available: $AVAIL_TMPL_STORES)." >&2; exit 1; }
 pvesm status | awk -v s="$CONTAINER_STORAGE" '$1==s{f=1} END{exit(!f)}' \
   || { echo "  ERROR: Container storage not found: $CONTAINER_STORAGE" >&2; exit 1; }
+echo "$AVAIL_CT_STORES" | grep -qw "$CONTAINER_STORAGE" \
+  || { echo "  ERROR: Container storage '$CONTAINER_STORAGE' does not support rootdir content (available: $AVAIL_CT_STORES)." >&2; exit 1; }
 ip link show "$BRIDGE" >/dev/null 2>&1 \
   || { echo "  ERROR: Bridge not found: $BRIDGE" >&2; exit 1; }
 
@@ -253,8 +266,8 @@ PCT_OPTIONS=(
   -features "nesting=1,keyctl=1,fuse=1"
   -tags "$TAGS"
   -net0 "name=eth0,bridge=${BRIDGE},ip=dhcp,ip6=manual"
-  -password "$PASSWORD"
 )
+[[ -n "$PASSWORD" ]] && PCT_OPTIONS+=(-password "$PASSWORD")
 
 pct create "$CT_ID" "${TEMPLATE_STORAGE}:vztmpl/${TEMPLATE}" "${PCT_OPTIONS[@]}"
 CREATED=1
@@ -350,17 +363,15 @@ done
 echo "  Detected DB bind-mount ownership: ${DB_UID}:${DB_GID}"
 
 # ── Secrets ───────────────────────────────────────────────────────────────────
-set +o pipefail
-DB_ROOT_PWD="$(head -c 4096 /dev/urandom | tr -dc 'A-Za-z0-9' | head -c 35)"
-MYSQL_PWD="$(head -c 4096 /dev/urandom | tr -dc 'A-Za-z0-9' | head -c 35)"
-set -o pipefail
+DB_ROOT_PWD="$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 35 || true)"
+MYSQL_PWD="$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 35 || true)"
 [[ ${#DB_ROOT_PWD} -eq 35 && ${#MYSQL_PWD} -eq 35 ]] || { echo "  ERROR: Failed to generate secrets." >&2; exit 1; }
 
 # ── Prepare persistent paths ──────────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc "
   set -euo pipefail
   umask 077
-  install -d -m 0755 '${APP_DIR}' '${BACKUP_DIR}'
+  install -d -m 0755 '${APP_DIR}'
   install -d -m 0700 '${APP_DIR}/.secrets' '${APP_DIR}/letsencrypt'
   install -d -m 0755 '${APP_DIR}/data' '${APP_DIR}/mysql'
   chown -R ${DB_UID}:${DB_GID} '${APP_DIR}/mysql'
@@ -435,7 +446,9 @@ DB_IMAGE=${DB_IMAGE}
 NPM_ADMIN_PORT=${NPM_ADMIN_PORT}
 APP_TZ=${APP_TZ}
 DISABLE_IPV6_ENV=${DISABLE_IPV6_ENV}
-KEEP_BACKUPS=${KEEP_BACKUPS}
+# AUTO_UPDATE=1 + TRACK_LATEST=0 re-pulls the pinned tag and recreates (causes a scheduled restart)
+# AUTO_UPDATE=1 + TRACK_LATEST=1 follows upstream :latest on schedule
+# AUTO_UPDATE=0 disables the timer regardless of TRACK_LATEST
 AUTO_UPDATE=${AUTO_UPDATE}
 TRACK_LATEST=${TRACK_LATEST}
 EOF2
@@ -448,11 +461,9 @@ pct exec "$CT_ID" -- bash -lc 'cat > /usr/local/bin/npm-maint.sh && chmod 0755 /
 set -Eeo pipefail
 
 APP_DIR="${APP_DIR:-/opt/npm}"
-BACKUP_DIR="${BACKUP_DIR:-/opt/npm-backups}"
 SERVICE="npm-stack.service"
 ENV_FILE="${APP_DIR}/.env"
 COMPOSE_FILE="${APP_DIR}/docker-compose.yml"
-KEEP_BACKUPS="${KEEP_BACKUPS:-7}"
 
 need_root() { [[ $EUID -eq 0 ]] || { echo "  ERROR: Run as root." >&2; exit 1; }; }
 die() { echo "  ERROR: $*" >&2; exit 1; }
@@ -462,33 +473,22 @@ usage() {
   NPM Maintenance
   ───────────────
   Usage:
-    $0 backup
-    $0 list
-    $0 restore <backup.tar.gz>
-    $0 rollback <backup.tar.gz>    # alias for restore
     $0 update <npm-tag|latest>
     $0 auto-update
     $0 version
 
   Notes:
-    - backup stops the stack for a consistent snapshot, then restarts it
-    - backup scope: .env, docker-compose.yml, .secrets/, data/, letsencrypt/, mysql/
-      (PBS handles CT-level backup; this helper makes restore self-contained)
-    - update backs up first, then changes only the NPM app image tag
+    - take a PVE snapshot before running update
+    - update changes only the NPM app image tag
     - auto-update obeys AUTO_UPDATE and TRACK_LATEST from ${ENV_FILE}
     - DB image changes are intentionally manual
-    - this helper is not a replacement for PBS / full CT backups
+    - use PBS / PVE snapshots for backup and restore
 EOF2
 }
 
 [[ -d "$APP_DIR" ]] || die "APP_DIR not found: $APP_DIR"
 [[ -f "$ENV_FILE" ]] || die "Missing env file: $ENV_FILE"
 [[ -f "$COMPOSE_FILE" ]] || die "Missing compose file: $COMPOSE_FILE"
-
-env_keep_backups="$(awk -F= '/^KEEP_BACKUPS=/{print $2}' "$ENV_FILE" | tail -n1)"
-if [[ "$env_keep_backups" =~ ^[0-9]+$ ]]; then
-  KEEP_BACKUPS="$env_keep_backups"
-fi
 
 current_image() {
   awk -F= '/^NPM_IMAGE=/{print $2}' "$ENV_FILE" | tail -n1
@@ -545,68 +545,6 @@ wait_for_admin() {
   return 1
 }
 
-backup_stack() {
-  local ts out started=0
-  ts="$(date +%Y%m%d-%H%M%S)"
-  out="$BACKUP_DIR/npm-backup-$ts.tar.gz"
-
-  mkdir -p "$BACKUP_DIR"
-
-  if systemctl is-active --quiet "$SERVICE"; then
-    started=1
-    echo "  Stopping NPM stack for consistent backup ..."
-    systemctl stop "$SERVICE"
-  fi
-
-  trap 'if [[ $started -eq 1 ]]; then systemctl start "$SERVICE" || true; fi' RETURN
-
-  echo "  Creating backup: $out"
-  app_rel="${APP_DIR#/}"
-  tar -C / -czf "$out" \
-    "${app_rel}/.env" \
-    "${app_rel}/docker-compose.yml" \
-    "${app_rel}/.secrets" \
-    "${app_rel}/data" \
-    "${app_rel}/letsencrypt" \
-    "${app_rel}/mysql"
-
-  if [[ "$KEEP_BACKUPS" =~ ^[0-9]+$ ]] && (( KEEP_BACKUPS > 0 )); then
-    ls -1t "$BACKUP_DIR"/npm-backup-*.tar.gz 2>/dev/null | awk -v keep="$KEEP_BACKUPS" 'NR>keep' | xargs -r rm -f --
-  fi
-
-  echo "  OK: $out"
-}
-
-restore_stack() {
-  local backup="$1"
-  [[ -n "$backup" ]] || die "Usage: npm-maint.sh restore <backup.tar.gz>"
-  [[ -f "$backup" ]] || die "Backup not found: $backup"
-
-  echo "  Stopping NPM stack ..."
-  systemctl stop "$SERVICE" 2>/dev/null || true
-
-  echo "  Removing current app state ..."
-  rm -rf \
-    "$APP_DIR/.secrets" \
-    "$APP_DIR/data" \
-    "$APP_DIR/letsencrypt" \
-    "$APP_DIR/mysql" \
-    "$APP_DIR/.env" \
-    "$APP_DIR/docker-compose.yml"
-
-  echo "  Restoring backup ..."
-  tar -C / -xzf "$backup"
-
-  echo "  Starting NPM stack ..."
-  systemctl start "$SERVICE"
-
-  if wait_for_admin; then
-    echo "  OK: restore completed."
-  else
-    die "Restore completed, but NPM admin did not become reachable."
-  fi
-}
-
 update_npm() {
   local new_tag="$1"
   local old_image new_image tmp_env old_tag
@@ -624,7 +562,6 @@ update_npm() {
   echo "  Current NPM tag: $old_tag"
   echo "  Target  NPM tag: $new_tag"
 
-  backup_stack
   cp -a "$ENV_FILE" "$tmp_env"
 
   cleanup() { rm -f "$tmp_env"; }
@@ -633,6 +570,7 @@ update_npm() {
     cp -a "$tmp_env" "$ENV_FILE"
     cd "$APP_DIR"
     /usr/bin/podman-compose up -d --force-recreate app || true
+    rm -f "$tmp_env"
   }
   trap rollback ERR
 
@@ -649,7 +587,12 @@ update_npm() {
   /usr/bin/podman-compose up -d --force-recreate app
 
   echo "  Waiting for admin UI ..."
-  wait_for_admin || die "NPM admin UI did not become reachable after update."
+  if ! wait_for_admin; then
+    trap - ERR
+    rollback
+    rm -f "$tmp_env"
+    die "NPM admin UI did not become reachable after update."
+  fi
 
   trap - ERR
   cleanup
@@ -677,10 +620,6 @@ auto_update_npm() {
 need_root
 cmd="${1:-}"
 case "$cmd" in
-  backup) backup_stack ;;
-  list) ls -1t "$BACKUP_DIR"/npm-backup-*.tar.gz 2>/dev/null || true ;;
-  restore) shift; restore_stack "${1:-}" ;;
-  rollback) shift; restore_stack "${1:-}" ;;
   update) shift; update_npm "${1:-}" ;;
   auto-update) auto_update_npm ;;
   version)
@@ -720,6 +659,65 @@ EOF2
   systemctl enable --now npm-stack.service
 '
 
+# Stack service started — disarm destructive cleanup so no subsequent failure
+# can stop/destroy the CT. Verification still hard-fails the script if the
+# stack is unhealthy, but the container is preserved for inspection.
+CLEANUP_ON_FAIL=0
+
+# ── Verification ──────────────────────────────────────────────────────────────
+sleep 3
+
+VERIFY_FAIL=0
+
+if pct exec "$CT_ID" -- systemctl is-active --quiet npm-stack.service 2>/dev/null; then
+  echo "  NPM stack service is active"
+else
+  echo "  ERROR: npm-stack.service is not active" >&2
+  echo "  Check: pct exec $CT_ID -- journalctl -u npm-stack --no-pager -n 50" >&2
+  VERIFY_FAIL=1
+fi
+
+RUNNING=0
+for i in $(seq 1 90); do
+  RUNNING="$(pct exec "$CT_ID" -- sh -lc 'podman ps --format "{{.Names}}" 2>/dev/null | wc -l' 2>/dev/null || echo 0)"
+  [[ "$RUNNING" -ge 2 ]] && break
+  sleep 2
+done
+pct exec "$CT_ID" -- bash -lc 'cd /opt/npm && podman-compose ps' || true
+
+if [[ "$RUNNING" -lt 2 ]]; then
+  echo "  ERROR: Expected 2 containers, found $RUNNING" >&2
+  VERIFY_FAIL=1
+fi
+
+NPM_HEALTHY=0
+for i in $(seq 1 45); do
+  HTTP_CODE="$(pct exec "$CT_ID" -- sh -lc "curl -s -o /dev/null -w '%{http_code}' --max-time 3 http://127.0.0.1:${NPM_ADMIN_PORT}/ 2>/dev/null" 2>/dev/null || echo 000)"
+  case "$HTTP_CODE" in
+    200|301|302|401|403)
+      NPM_HEALTHY=1
+      break
+      ;;
+  esac
+  sleep 2
+done
+
+if [[ "$NPM_HEALTHY" -eq 1 ]]; then
+  echo "  NPM admin check passed"
+else
+  echo "  ERROR: NPM admin UI is not reachable on port ${NPM_ADMIN_PORT}" >&2
+  echo "  Check: pct exec $CT_ID -- journalctl -u npm-stack.service --no-pager -n 80" >&2
+  echo "  Check: pct exec $CT_ID -- bash -lc 'cd /opt/npm && podman-compose logs --tail=80'" >&2
+  VERIFY_FAIL=1
+fi
+
+if (( VERIFY_FAIL == 1 )); then
+  echo "" >&2
+  echo "  FATAL: Core verification failed — CT $CT_ID is preserved but the install is incomplete." >&2
+  echo "  Inspect the container and fix manually, or destroy and re-run." >&2
+  exit 1
+fi
+
 # ── Cloudflare Tunnel (optional) ──────────────────────────────────────────────
 if [[ "$INSTALL_CLOUDFLARED" -eq 1 && -n "$TUNNEL_TOKEN" ]]; then
   echo "  Installing Cloudflare Tunnel ..."
@@ -757,42 +755,6 @@ if [[ "$INSTALL_CLOUDFLARED" -eq 1 && -n "$TUNNEL_TOKEN" ]]; then
   fi
 
   pct set "$CT_ID" --tags "${TAGS};cloudflared"
-fi
-
-# ── Verification ──────────────────────────────────────────────────────────────
-sleep 3
-if pct exec "$CT_ID" -- systemctl is-active --quiet npm-stack.service 2>/dev/null; then
-  echo "  NPM stack service is active"
-else
-  echo "  WARNING: npm-stack.service may not be active — check: pct exec $CT_ID -- journalctl -u npm-stack --no-pager -n 50" >&2
-fi
-
-RUNNING=0
-for i in $(seq 1 90); do
-  RUNNING="$(pct exec "$CT_ID" -- sh -lc 'podman ps --format "{{.Names}}" 2>/dev/null | wc -l' 2>/dev/null || echo 0)"
-  [[ "$RUNNING" -ge 2 ]] && break
-  sleep 2
-done
-pct exec "$CT_ID" -- bash -lc 'cd /opt/npm && podman-compose ps' || true
-
-NPM_HEALTHY=0
-for i in $(seq 1 45); do
-  HTTP_CODE="$(pct exec "$CT_ID" -- sh -lc "curl -s -o /dev/null -w '%{http_code}' --max-time 3 http://127.0.0.1:${NPM_ADMIN_PORT}/ 2>/dev/null" 2>/dev/null || echo 000)"
-  case "$HTTP_CODE" in
-    200|301|302|401|403)
-      NPM_HEALTHY=1
-      break
-      ;;
-  esac
-  sleep 2
-done
-
-if [[ "$NPM_HEALTHY" -eq 1 ]]; then
-  echo "  NPM admin check passed"
-else
-  echo "  WARNING: NPM admin UI did not become reachable yet" >&2
-  echo "  Check: pct exec $CT_ID -- journalctl -u npm-stack.service --no-pager -n 80" >&2
-  echo "  Check: pct exec $CT_ID -- bash -lc 'cd /opt/npm && podman-compose logs --tail=80'" >&2
 fi
 
 # ── Auto-update timer (policy-driven) ─────────────────────────────────────────
@@ -920,8 +882,7 @@ running=\$(podman ps --format '{{.Names}}' 2>/dev/null | wc -l)
 ip=\$(ip -4 -o addr show scope global 2>/dev/null | awk '{print \$4}' | cut -d/ -f1 | head -n1)
 printf '  Stack:     /opt/npm (%s containers running)\n' \"\$running\"
 printf '  Compose:   cd /opt/npm && podman-compose [up -d|down|logs|ps]\n'
-printf '  Maintain:  /usr/local/bin/npm-maint.sh [backup|list|restore|rollback|update|auto-update|version]\n'
-printf '  Rollback:  /usr/local/bin/npm-maint.sh rollback /opt/npm-backups/<backup.tar.gz>\n'
+printf '  Maintain:  /usr/local/bin/npm-maint.sh [update|auto-update|version]\n'
 printf '  Updates:   systemctl status npm-update.timer\n'
 printf '  Admin UI:  http://%s:${NPM_ADMIN_PORT}\n' \"\${ip:-n/a}\"
 MOTD
@@ -969,10 +930,7 @@ pct set "$CT_ID" --protection 1
 echo ""
 echo "CT: $CT_ID | IP: ${CT_IP} | Admin: http://${CT_IP}:${NPM_ADMIN_PORT}"
 echo "    Policy: AUTO_UPDATE=${AUTO_UPDATE} TRACK_LATEST=${TRACK_LATEST}"
-echo "    pct exec $CT_ID -- /usr/local/bin/npm-maint.sh backup"
-echo "    pct exec $CT_ID -- /usr/local/bin/npm-maint.sh list"
 echo "    pct exec $CT_ID -- /usr/local/bin/npm-maint.sh update <npm-tag|latest>"
-echo "    pct exec $CT_ID -- /usr/local/bin/npm-maint.sh restore /opt/npm-backups/<backup.tar.gz>"
-echo "    pct exec $CT_ID -- /usr/local/bin/npm-maint.sh rollback /opt/npm-backups/<backup.tar.gz>"
 echo "    pct exec $CT_ID -- /usr/local/bin/npm-maint.sh auto-update"
+echo "    pct exec $CT_ID -- /usr/local/bin/npm-maint.sh version"
 echo ""
