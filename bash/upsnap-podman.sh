@@ -145,7 +145,7 @@ cat <<EOF2
 
 EOF2
 
-SCRIPT_URL="https://raw.githubusercontent.com/vdarkobar/scripts/main/upsnap-podman.sh"
+SCRIPT_URL="https://raw.githubusercontent.com/vdarkobar/scripts/main/bash/upsnap-podman.sh"
 SCRIPT_LOCAL="/root/upsnap-podman.sh"
 SCRIPT_SELF="$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")"
 
