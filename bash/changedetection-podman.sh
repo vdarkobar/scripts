@@ -155,7 +155,7 @@ cat <<EOF2
 
 EOF2
 
-SCRIPT_URL="https://raw.githubusercontent.com/vdarkobar/scripts/main/changedetection-podman.sh"
+SCRIPT_URL="https://raw.githubusercontent.com/vdarkobar/scripts/main/bash/changedetection-podman.sh"
 SCRIPT_LOCAL="/root/changedetection-podman.sh"
 SCRIPT_SELF="$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")"
 
