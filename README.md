@@ -54,6 +54,12 @@
 </details>
 
 <details>
+  <summary>UpSnap</summary>
+  <p>A simple wake on lan web app.</p>
+  <pre><code>bash &lt;(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/bash/upsnap-podman.sh)</code></pre>
+</details>
+
+<details>
   <summary>Uptime Kuma</summary>
   <p>A Fancy Self-Hosted Monitoring Tool.</p>
   <pre><code>bash &lt;(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/bash/uptime-kuma-podman.sh)</code></pre>
