@@ -61,7 +61,7 @@
 
 <details>
   <summary>Uptime Kuma</summary>
-  <p>A Fancy Self-Hosted Monitoring Tool.</p>
+  <p>Podman Compose</p>
   <pre><code>bash &lt;(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/bash/uptime-kuma-podman.sh)</code></pre>
   <p>Quadlet</p>
   <pre><code>bash &lt;(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/bash/uptime-kuma-quadlet.sh)</code></pre>
