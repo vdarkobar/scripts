@@ -66,6 +66,12 @@
 </details>
 
 <details>
+  <summary>Uptime Kuma Quadlet</summary>
+  <p>A Fancy Self-Hosted Monitoring Tool.</p>
+  <pre><code>bash &lt;(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/bash/uptime-kuma-quadlet.sh)</code></pre>
+</details>
+
+<details>
   <summary>Changedetection.io</summary>
   <p>Detect web page content changes and get instant alerts.</p>
   <pre><code>bash &lt;(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/bash/changedetection-podman.sh)</code></pre>
