@@ -24,7 +24,7 @@ DEBIAN_VERSION=13
 
 # Optional features / policy
 AUTO_UPDATE=0                        # 1 = enable timer-driven maintenance/update runs
-TRACK_LATEST=0                       # 1 = auto-update follows louislam/uptime-kuma:latest
+TRACK_LATEST=0                       # 1 = enable re-pull of pinned tag on auto-update runs
 
 # Behavior
 CLEANUP_ON_FAIL=1
@@ -63,8 +63,8 @@ QUADLET_SERVICE="uptime-kuma.service"
   echo "  ERROR: APP_IMAGE_REPO must be non-empty and contain no spaces." >&2
   exit 1
 }
-[[ "$APP_TAG" == "latest" || "$APP_TAG" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9._-]+)?$ ]] || {
-  echo "  ERROR: APP_TAG must look like 2.2.1 or latest." >&2
+[[ "$APP_TAG" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9._-]+)?$ ]] || {
+  echo "  ERROR: APP_TAG must be a pinned version like 2.2.1 — ':latest' is not permitted." >&2
   exit 1
 }
 [[ -e "/usr/share/zoneinfo/${APP_TZ}" ]] || { echo "  ERROR: APP_TZ not found in /usr/share/zoneinfo: $APP_TZ" >&2; exit 1; }
@@ -134,7 +134,7 @@ cat <<EOF2
   FQDN:              $([ -n "$APP_FQDN" ] && echo "$APP_FQDN" || echo "(local only)")
   Tags:              $TAGS
   Auto-update:       $([ "$AUTO_UPDATE" -eq 1 ] && echo "enabled" || echo "disabled")
-  Track latest:      $([ "$TRACK_LATEST" -eq 1 ] && echo "enabled" || echo "disabled")
+  Auto re-pull:      $([ "$TRACK_LATEST" -eq 1 ] && echo "enabled" || echo "disabled")
   Cleanup on fail:   $CLEANUP_ON_FAIL
   ────────────────────────────────────────
   To change defaults, press Enter and
@@ -321,11 +321,17 @@ pct exec "$CT_ID" -- bash -lc "
 "
 
 # ── Prepare persistent paths ──────────────────────────────────────────────────
-# Uptime Kuma runs as root inside the container; /app/data owned by root is correct.
+# Uptime Kuma's embedded MariaDB runs as UID 1000 inside the container.
+# The mariadb/ and run/ subdirectories must be owned by 1000:1000 or MariaDB
+# cannot write its data files or PID socket — even when the container runs as root.
+# If ownership is stomped (e.g. by a :latest image with a different internal UID),
+# fix with: chown -R 1000:1000 /opt/uptime-kuma/data/mariadb /opt/uptime-kuma/data/run
 pct exec "$CT_ID" -- bash -lc "
   set -euo pipefail
   install -d -m 0755 '${APP_DIR}'
   install -d -m 0755 '${APP_DIR}/data'
+  install -d -m 0755 -o 1000 -g 1000 '${APP_DIR}/data/mariadb'
+  install -d -m 0755 -o 1000 -g 1000 '${APP_DIR}/data/run'
 "
 
 # ── Quadlet unit file ─────────────────────────────────────────────────────────
@@ -400,14 +406,14 @@ usage() {
   Uptime Kuma Maintenance
   ───────────────────────
   Usage:
-    $0 update <tag|latest>
+    $0 update <tag>       # e.g. 2.3.0 — pinned version required, no :latest
     $0 auto-update
     $0 version
 
   Notes:
-    - update pulls the new image, updates the Quadlet unit, and restarts the service
-    - auto-update only runs when AUTO_UPDATE=1; follows :latest only when TRACK_LATEST=1
-    - pinned tags (TRACK_LATEST=0) are only updated manually
+    - update pulls the pinned tag, updates the Quadlet unit, and restarts the service
+    - :latest is not permitted — always specify an explicit version tag
+    - auto-update re-pulls the current pinned tag; set TRACK_LATEST=0 to disable
     - backup and restore are handled by PBS and PVE snapshots
     - take a PVE snapshot before manual updates: pct snapshot <CT_ID> pre-update-\$(date +%Y%m%d)
 EOF2
@@ -469,9 +475,9 @@ update_app() {
   done
 
   local old_tag repo new_image tmp_env tmp_quadlet
-  [[ -n "$new_tag" ]] || die "Usage: uptime-kuma-maint.sh update <tag|latest>"
-  [[ "$new_tag" == "latest" || "$new_tag" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9._-]+)?$ ]] \
-    || die "Invalid tag: $new_tag"
+  [[ -n "$new_tag" ]] || die "Usage: uptime-kuma-maint.sh update <tag>"
+  [[ "$new_tag" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9._-]+)?$ ]] \
+    || die "Invalid tag: $new_tag — pinned version required (e.g. 2.3.0), ':latest' is not permitted."
 
   old_tag="$(current_tag)"
   repo="$(current_repo)"
@@ -482,6 +488,68 @@ update_app() {
 
   echo "  Current tag: $old_tag"
   echo "  Target  tag: $new_tag"
+
+  # Guard: verify MariaDB data directory ownership before pulling anything.
+  # Uptime Kuma's embedded MariaDB runs as UID 1000. If a previous image update
+  # stomped ownership to root, MariaDB cannot start after this update either.
+  # Catch it here before making things worse.
+  local mariadb_dir="${APP_DIR}/data/mariadb"
+  if [[ -d "$mariadb_dir" ]]; then
+    local dir_uid
+    dir_uid="$(stat -c '%u' "$mariadb_dir" 2>/dev/null || echo "unknown")"
+    if [[ "$dir_uid" != "1000" ]]; then
+      echo ""
+      echo "  WARNING: MariaDB data directory is owned by UID ${dir_uid}, expected 1000."
+      echo "  This means a previous image update stomped the ownership."
+      echo "  MariaDB will fail to start after this update unless ownership is fixed first."
+      echo ""
+      echo "  Fix with:"
+      echo "    chown -R 1000:1000 ${APP_DIR}/data/mariadb ${APP_DIR}/data/run"
+      echo ""
+      if [[ "$skip_confirm" -eq 0 ]]; then
+        read -r -p "  Fix ownership now and continue? [y/N]: " own_confirm
+        case "$own_confirm" in
+          [yY][eE][sS]|[yY])
+            chown -R 1000:1000 "${APP_DIR}/data/mariadb" "${APP_DIR}/data/run" 2>/dev/null || true
+            echo "  Ownership fixed."
+            ;;
+          *) echo "  Aborted."; rm -f "$tmp_env" "$tmp_quadlet"; exit 0 ;;
+        esac
+      else
+        echo "  --yes flag set — fixing ownership automatically."
+        chown -R 1000:1000 "${APP_DIR}/data/mariadb" "${APP_DIR}/data/run" 2>/dev/null || true
+      fi
+    fi
+  fi
+
+  # Guard: embedded-mariadb installs are sensitive to image changes between tags.
+  # A newer image may fail to start MariaDB silently and fall back to a fresh
+  # SQLite database, making the app appear to lose all data. Warn before pull.
+  local db_config="${APP_DIR}/data/db-config.json"
+  if [[ -f "$db_config" ]]; then
+    local db_type
+    db_type="$(grep -o '"type"[[:space:]]*:[[:space:]]*"[^"]*"' "$db_config" \
+      | grep -o '"[^"]*"$' | tr -d '"' || echo "unknown")"
+    if [[ "$db_type" == "embedded-mariadb" ]]; then
+      echo ""
+      echo "  WARNING: This install uses embedded-mariadb as its database backend."
+      echo "  Some image updates silently fail to start MariaDB and fall back to"
+      echo "  a fresh SQLite database, making the app appear to lose all data."
+      echo "  Your data would NOT be gone — but the new image may not be compatible."
+      echo ""
+      echo "  Take a PBS snapshot or pct snapshot before continuing."
+      echo ""
+      if [[ "$skip_confirm" -eq 0 ]]; then
+        read -r -p "  Proceed with embedded-mariadb install? [y/N]: " db_confirm
+        case "$db_confirm" in
+          [yY][eE][sS]|[yY]) ;;
+          *) echo "  Aborted."; rm -f "$tmp_env" "$tmp_quadlet"; exit 0 ;;
+        esac
+      else
+        echo "  --yes flag set — proceeding with embedded-mariadb install."
+      fi
+    fi
+  fi
 
   if [[ "$skip_confirm" -eq 0 ]]; then
     echo ""
@@ -545,8 +613,9 @@ auto_update_app() {
     return 0
   fi
 
-  echo "  Auto-update policy: TRACK_LATEST=1 -> following latest"
-  update_app --yes latest
+  echo "  Auto-update policy: TRACK_LATEST=1 — re-pulling current pinned tag $(current_tag)"
+  echo "  NOTE: ':latest' is not permitted; auto-update re-applies the pinned tag to catch digest changes."
+  update_app --yes "$(current_tag)"
 }
 
 need_root
@@ -757,7 +826,7 @@ MOTD
 
   cat > /etc/update-motd.d/30-app <<'MOTD'
 #!/bin/sh
-running=\$(podman ps --filter name=uptime-kuma --format '{{.Names}}' 2>/dev/null | wc -l)
+running=\$(podman ps --filter name=^uptime-kuma$ --format '{{.Names}}' 2>/dev/null | wc -l)
 svc_status=\$(systemctl is-active uptime-kuma.service 2>/dev/null || echo "unknown")
 ip=\$(ip -4 -o addr show scope global 2>/dev/null | awk '{print \$4}' | cut -d/ -f1 | head -n1)
 fqdn=\"\$(awk -F= '/^APP_FQDN=/{print \$2}' /opt/uptime-kuma/.env 2>/dev/null | tail -n1)\"
@@ -814,7 +883,7 @@ echo "    Policy:  AUTO_UPDATE=${AUTO_UPDATE} TRACK_LATEST=${TRACK_LATEST}"
 echo ""
 echo "    pct exec $CT_ID -- systemctl status uptime-kuma.service"
 echo "    pct exec $CT_ID -- journalctl -u uptime-kuma.service --no-pager -n 50"
-echo "    pct exec $CT_ID -- /usr/local/bin/uptime-kuma-maint.sh update <tag|latest>"
+echo "    pct exec $CT_ID -- /usr/local/bin/uptime-kuma-maint.sh update <tag>  # e.g. 2.3.0 — no :latest"
 echo "    pct exec $CT_ID -- /usr/local/bin/uptime-kuma-maint.sh auto-update"
 echo "    pct exec $CT_ID -- /usr/local/bin/uptime-kuma-maint.sh version"
 echo "    Backup/restore: use PBS or PVE snapshots"
