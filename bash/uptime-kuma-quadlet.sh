@@ -324,12 +324,13 @@ pct exec "$CT_ID" -- bash -lc "
 # Uptime Kuma's embedded MariaDB runs as UID 1000 inside the container.
 # The mariadb/ and run/ subdirectories must be owned by 1000:1000 or MariaDB
 # cannot write its data files or PID socket — even when the container runs as root.
-# If ownership is stomped (e.g. by a :latest image with a different internal UID),
-# fix with: chown -R 1000:1000 /opt/uptime-kuma/data/mariadb /opt/uptime-kuma/data/run
+# Upstream guidance is to own the entire data/ tree as 1000:1000. If ownership
+# is stomped (e.g. by a :latest image with a different internal UID), fix with:
+# chown -R 1000:1000 /opt/uptime-kuma/data
 pct exec "$CT_ID" -- bash -lc "
   set -euo pipefail
   install -d -m 0755 '${APP_DIR}'
-  install -d -m 0755 '${APP_DIR}/data'
+  install -d -m 0755 -o 1000 -g 1000 '${APP_DIR}/data'
   install -d -m 0755 -o 1000 -g 1000 '${APP_DIR}/data/mariadb'
   install -d -m 0755 -o 1000 -g 1000 '${APP_DIR}/data/run'
 "
@@ -504,20 +505,20 @@ update_app() {
       echo "  MariaDB will fail to start after this update unless ownership is fixed first."
       echo ""
       echo "  Fix with:"
-      echo "    chown -R 1000:1000 ${APP_DIR}/data/mariadb ${APP_DIR}/data/run"
+      echo "    chown -R 1000:1000 ${APP_DIR}/data"
       echo ""
       if [[ "$skip_confirm" -eq 0 ]]; then
         read -r -p "  Fix ownership now and continue? [y/N]: " own_confirm
         case "$own_confirm" in
           [yY][eE][sS]|[yY])
-            chown -R 1000:1000 "${APP_DIR}/data/mariadb" "${APP_DIR}/data/run" 2>/dev/null || true
+            chown -R 1000:1000 "${APP_DIR}/data" 2>/dev/null || true
             echo "  Ownership fixed."
             ;;
           *) echo "  Aborted."; rm -f "$tmp_env" "$tmp_quadlet"; exit 0 ;;
         esac
       else
         echo "  --yes flag set — fixing ownership automatically."
-        chown -R 1000:1000 "${APP_DIR}/data/mariadb" "${APP_DIR}/data/run" 2>/dev/null || true
+        chown -R 1000:1000 "${APP_DIR}/data" 2>/dev/null || true
       fi
     fi
   fi
