@@ -37,8 +37,10 @@
 ## Networking & Monitoring
 <details>
   <summary>NPM on Podman, optional Cloudflared</summary>
-  <p>Runs Nginx Proxy Manager on Podman, with optional Cloudflared.</p>
+  <p>Podman Compose</p>
   <pre><code>bash &lt;(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/bash/npm-podman.sh)</code></pre>
+  <p>systemd + Quadlet</p>
+  <pre><code>bash &lt;(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/bash/npm-quadlet.sh)</code></pre>
 </details>
 
 <details>
