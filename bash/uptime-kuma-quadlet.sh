@@ -38,7 +38,7 @@ QUADLET_SERVICE="uptime-kuma.service"
 # ── Custom configs created by this script ─────────────────────────────────────
 #   /etc/containers/systemd/uptime-kuma.container  (Quadlet unit — source of truth)
 #   /opt/uptime-kuma/.env                          (runtime state — read by maint script)
-#   /opt/uptime-kuma/data/                         (persistent data — SQLite DB, uploads)
+#   /opt/uptime-kuma/data/                         (persistent data — DB backend + uploads; backend selected at first-run setup)
 #   /usr/local/bin/uptime-kuma-maint.sh            (maintenance helper)
 #   /etc/systemd/system/uptime-kuma-update.service
 #   /etc/systemd/system/uptime-kuma-update.timer
@@ -331,9 +331,10 @@ pct exec "$CT_ID" -- bash -lc "
   set -euo pipefail
   install -d -m 0755 '${APP_DIR}'
   install -d -m 0755 -o 1000 -g 1000 '${APP_DIR}/data'
-  install -d -m 0755 -o 1000 -g 1000 '${APP_DIR}/data/mariadb'
-  install -d -m 0755 -o 1000 -g 1000 '${APP_DIR}/data/run'
 "
+# Do NOT pre-create data/mariadb or data/run — embedded MariaDB runs mysql_install_db
+# only when it finds those directories absent. Pre-creating them causes MariaDB to skip
+# initialization entirely, resulting in "Table mysql.db doesn't exist" on first start.
 
 # ── Quadlet unit file ─────────────────────────────────────────────────────────
 # Rootful Quadlet: /etc/containers/systemd/ — no linger, no --user flags needed.
@@ -352,9 +353,10 @@ Wants=network-online.target
 [Container]
 Image=${APP_IMAGE}
 ContainerName=uptime-kuma
-PublishPort=${APP_PORT}:3001
+Network=host
 Environment=TZ=${APP_TZ}
-Volume=${APP_DIR}/data:/app/data:Z
+Environment=UPTIME_KUMA_PORT=${APP_PORT}
+Volume=${APP_DIR}/data:/app/data
 LogDriver=journald
 
 [Service]
@@ -679,7 +681,7 @@ else
 fi
 
 UK_HEALTHY=0
-for i in $(seq 1 60); do
+for i in $(seq 1 90); do
   HTTP_CODE="$(pct exec "$CT_ID" -- sh -lc "curl -s -o /dev/null -w '%{http_code}' --max-time 3 http://127.0.0.1:${APP_PORT}/ 2>/dev/null" 2>/dev/null || echo 000)"
   case "$HTTP_CODE" in
     200|301|302|401|403)
