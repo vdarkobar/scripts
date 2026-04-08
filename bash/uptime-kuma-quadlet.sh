@@ -22,10 +22,6 @@ APP_IMAGE_REPO="docker.io/louislam/uptime-kuma"
 APP_TAG="2.2.1"                      # pinned default; do not default to :latest
 DEBIAN_VERSION=13
 
-# Optional features / policy
-AUTO_UPDATE=0                        # 1 = enable timer-driven maintenance/update runs
-TRACK_LATEST=0                       # 1 = enable re-pull of pinned tag on auto-update runs
-
 # Behavior
 CLEANUP_ON_FAIL=1
 
@@ -40,8 +36,6 @@ QUADLET_SERVICE="uptime-kuma.service"
 #   /opt/uptime-kuma/.env                          (runtime state — read by maint script)
 #   /opt/uptime-kuma/data/                         (persistent data — DB backend + uploads; backend selected at first-run setup)
 #   /usr/local/bin/uptime-kuma-maint.sh            (maintenance helper)
-#   /etc/systemd/system/uptime-kuma-update.service
-#   /etc/systemd/system/uptime-kuma-update.timer
 #   /etc/update-motd.d/00-header
 #   /etc/update-motd.d/10-sysinfo
 #   /etc/update-motd.d/30-app
@@ -57,8 +51,7 @@ QUADLET_SERVICE="uptime-kuma.service"
 [[ "$DEBIAN_VERSION" =~ ^[0-9]+$ ]] || { echo "  ERROR: DEBIAN_VERSION must be numeric." >&2; exit 1; }
 [[ "$APP_PORT" =~ ^[0-9]+$ ]] || { echo "  ERROR: APP_PORT must be numeric." >&2; exit 1; }
 (( APP_PORT >= 1 && APP_PORT <= 65535 )) || { echo "  ERROR: APP_PORT must be between 1 and 65535." >&2; exit 1; }
-[[ "$AUTO_UPDATE" =~ ^[01]$ ]] || { echo "  ERROR: AUTO_UPDATE must be 0 or 1." >&2; exit 1; }
-[[ "$TRACK_LATEST" =~ ^[01]$ ]] || { echo "  ERROR: TRACK_LATEST must be 0 or 1." >&2; exit 1; }
+[[ "$CLEANUP_ON_FAIL" =~ ^[01]$ ]] || { echo "  ERROR: CLEANUP_ON_FAIL must be 0 or 1." >&2; exit 1; }
 [[ -n "$APP_IMAGE_REPO" && ! "$APP_IMAGE_REPO" =~ [[:space:]] ]] || {
   echo "  ERROR: APP_IMAGE_REPO must be non-empty and contain no spaces." >&2
   exit 1
@@ -133,8 +126,6 @@ cat <<EOF2
   Timezone:          $APP_TZ
   FQDN:              $([ -n "$APP_FQDN" ] && echo "$APP_FQDN" || echo "(local only)")
   Tags:              $TAGS
-  Auto-update:       $([ "$AUTO_UPDATE" -eq 1 ] && echo "enabled" || echo "disabled")
-  Auto re-pull:      $([ "$TRACK_LATEST" -eq 1 ] && echo "enabled" || echo "disabled")
   Cleanup on fail:   $CLEANUP_ON_FAIL
   ────────────────────────────────────────
   To change defaults, press Enter and
@@ -383,8 +374,6 @@ APP_IMAGE=${APP_IMAGE}
 APP_PORT=${APP_PORT}
 APP_TZ=${APP_TZ}
 APP_FQDN=${APP_FQDN}
-AUTO_UPDATE=${AUTO_UPDATE}
-TRACK_LATEST=${TRACK_LATEST}
 EOF2
   chmod 0600 '${APP_DIR}/.env'
 "
@@ -410,13 +399,11 @@ usage() {
   ───────────────────────
   Usage:
     $0 update <tag>       # e.g. 2.3.0 — pinned version required, no :latest
-    $0 auto-update
     $0 version
 
   Notes:
     - update pulls the pinned tag, updates the Quadlet unit, and restarts the service
     - :latest is not permitted — always specify an explicit version tag
-    - auto-update re-pulls the current pinned tag; set TRACK_LATEST=0 to disable
     - backup and restore are handled by PBS and PVE snapshots
     - take a PVE snapshot before manual updates: pct snapshot <CT_ID> pre-update-\$(date +%Y%m%d)
 EOF2
@@ -445,15 +432,6 @@ app_port() {
   port="$(awk -F= '/^APP_PORT=/{print $2}' "$ENV_FILE" | tail -n1 | tr -d '[:space:]')"
   [[ "$port" =~ ^[0-9]+$ ]] && printf '%s' "$port" || printf '3001'
 }
-
-env_flag() {
-  local key="$1" raw
-  raw="$(awk -F= -v key="$key" '$1==key{print $2}' "$ENV_FILE" | tail -n1 | tr -d '[:space:]')"
-  [[ "$raw" =~ ^[01]$ ]] && printf '%s' "$raw" || printf '0'
-}
-
-auto_update_enabled() { [[ "$(env_flag AUTO_UPDATE)" == "1" ]]; }
-track_latest_enabled() { [[ "$(env_flag TRACK_LATEST)" == "1" ]]; }
 
 wait_for_app() {
   local port code
@@ -605,31 +583,12 @@ update_app() {
   echo "  OK: Uptime Kuma updated to $new_tag"
 }
 
-auto_update_app() {
-  if ! auto_update_enabled; then
-    echo "  Auto-update disabled in ${ENV_FILE}; nothing to do."
-    return 0
-  fi
-
-  if ! track_latest_enabled; then
-    echo "  TRACK_LATEST=0 — tag is pinned; skipping scheduled update."
-    return 0
-  fi
-
-  echo "  Auto-update policy: TRACK_LATEST=1 — re-pulling current pinned tag $(current_tag)"
-  echo "  NOTE: ':latest' is not permitted; auto-update re-applies the pinned tag to catch digest changes."
-  update_app --yes "$(current_tag)"
-}
-
 need_root
 cmd="${1:-}"
 case "$cmd" in
   update)      shift; update_app "$@" ;;
-  auto-update) auto_update_app ;;
   version)
     echo "Configured image: $(current_image)"
-    echo "AUTO_UPDATE=$(env_flag AUTO_UPDATE)"
-    echo "TRACK_LATEST=$(env_flag TRACK_LATEST)"
     ;;
   ""|-h|--help) usage ;;
   *) usage; die "Unknown command: $cmd" ;;
@@ -706,44 +665,6 @@ if (( VERIFY_FAIL == 1 )); then
   echo "  FATAL: Core verification failed — CT $CT_ID is preserved but the install is incomplete." >&2
   echo "  Inspect the container and fix manually, or destroy and re-run." >&2
   exit 1
-fi
-
-# ── Auto-update timer (policy-driven) ─────────────────────────────────────────
-pct exec "$CT_ID" -- bash -lc '
-  set -euo pipefail
-  cat > /etc/systemd/system/uptime-kuma-update.service <<EOF2
-[Unit]
-Description=Uptime Kuma auto-update maintenance run
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=oneshot
-ExecStart=/usr/local/bin/uptime-kuma-maint.sh auto-update
-EOF2
-
-  cat > /etc/systemd/system/uptime-kuma-update.timer <<EOF2
-[Unit]
-Description=Uptime Kuma auto-update timer
-
-[Timer]
-OnCalendar=*-*-01 05:30:00
-OnCalendar=*-*-15 05:30:00
-Persistent=true
-RandomizedDelaySec=300
-
-[Install]
-WantedBy=timers.target
-EOF2
-
-  systemctl daemon-reload
-'
-if [[ "$AUTO_UPDATE" -eq 1 ]]; then
-  pct exec "$CT_ID" -- bash -lc 'systemctl enable --now uptime-kuma-update.timer'
-  echo "  Auto-update timer enabled"
-else
-  pct exec "$CT_ID" -- bash -lc 'systemctl disable --now uptime-kuma-update.timer >/dev/null 2>&1 || true'
-  echo "  Auto-update timer installed but disabled"
 fi
 
 # ── Unattended upgrades ───────────────────────────────────────────────────────
@@ -838,8 +759,7 @@ port=\"\${port:-3001}\"
 printf '  Container: uptime-kuma (%s running)\n' \"\$running\"
 printf '  Service:   uptime-kuma.service (%s)\n' \"\$svc_status\"
 printf '  Logs:      journalctl -u uptime-kuma.service -f\n'
-printf '  Maintain:  /usr/local/bin/uptime-kuma-maint.sh [update|auto-update|version]\n'
-printf '  Updates:   systemctl status uptime-kuma-update.timer\n'
+printf '  Maintain:  /usr/local/bin/uptime-kuma-maint.sh [update|version]\n'
 if [ -n \"\$fqdn\" ]; then
   printf '  Web UI:    https://%s\n' \"\$fqdn\"
 fi
@@ -882,12 +802,10 @@ if [[ -n "$APP_FQDN" ]]; then
 fi
 echo "    Image:   ${APP_IMAGE}"
 echo "    Quadlet: ${QUADLET_FILE}"
-echo "    Policy:  AUTO_UPDATE=${AUTO_UPDATE} TRACK_LATEST=${TRACK_LATEST}"
 echo ""
 echo "    pct exec $CT_ID -- systemctl status uptime-kuma.service"
 echo "    pct exec $CT_ID -- journalctl -u uptime-kuma.service --no-pager -n 50"
 echo "    pct exec $CT_ID -- /usr/local/bin/uptime-kuma-maint.sh update <tag>  # e.g. 2.3.0 — no :latest"
-echo "    pct exec $CT_ID -- /usr/local/bin/uptime-kuma-maint.sh auto-update"
 echo "    pct exec $CT_ID -- /usr/local/bin/uptime-kuma-maint.sh version"
 echo "    Backup/restore: use PBS or PVE snapshots"
 echo ""
