@@ -174,7 +174,7 @@ cat <<EOF
 
 EOF
 
-SCRIPT_URL="https://raw.githubusercontent.com/vdarkobar/scripts/main/bash/matrix-podman.sh"
+SCRIPT_URL="https://github.com/vdarkobar/scripts/blob/main/bash/matrix-podman.sh"
 SCRIPT_LOCAL="/root/matrix-podman.sh"
 SCRIPT_SELF="$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")"
 
