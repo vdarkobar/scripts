@@ -43,7 +43,9 @@ SKIP_DOMAIN_VALIDATION=1
 NPM_HOST_IP=""
 
 # Extra packages to install (space-separated or array)
-EXTRA_PACKAGES=()
+EXTRA_PACKAGES=(
+  qemu-guest-agent
+)
 
 # Behavior
 CLEANUP_ON_FAIL=1

@@ -39,7 +39,9 @@ INITIAL_ADMIN_PASSWORD=""            # min 8 characters
 AUTO_UPDATE=0
 
 # Extra packages to install (space-separated or array)
-EXTRA_PACKAGES=()
+EXTRA_PACKAGES=(
+  qemu-guest-agent
+)
 
 # Behavior
 CLEANUP_ON_FAIL=1

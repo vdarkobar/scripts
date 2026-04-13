@@ -43,7 +43,9 @@ PIHOLE_CACHE_SIZE=10000               # DNS cache entries (positive integer)
 # Do not attempt to set it here.
 
 # Extra packages to install (space-separated or array)
-EXTRA_PACKAGES=()
+EXTRA_PACKAGES=(
+  qemu-guest-agent
+)
 
 # Behavior
 DISABLE_IPV6=1                        # 1 = disable IPv6 in sysctl

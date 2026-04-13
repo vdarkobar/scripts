@@ -32,7 +32,9 @@ AUTO_UPDATE=0                        # 1 = enable timer-driven maintenance/updat
 TRACK_LATEST=0                       # 1 = auto-update follows ghcr.io/seriousm4x/upsnap:latest
 
 # Extra packages to install (space-separated or array)
-EXTRA_PACKAGES=()
+EXTRA_PACKAGES=(
+  qemu-guest-agent
+)
 
 # Behavior
 CLEANUP_ON_FAIL=1

@@ -23,7 +23,9 @@ DEBIAN_VERSION=13
 # Then reload: pct exec <CT_ID> -- systemctl reload unbound
 
 # Extra packages to install (space-separated or array)
-EXTRA_PACKAGES=()
+EXTRA_PACKAGES=(
+  qemu-guest-agent
+)
 
 # Behavior
 CLEANUP_ON_FAIL=1                    # 1 = destroy CT on error, 0 = keep for debugging

@@ -30,7 +30,9 @@ KEEP_BACKUPS=5                      # config-only backups kept by kavita-maint.s
 DISABLE_IPV6=0                      # 1 = append IPv6 disable sysctls inside CT
 
 # Extra packages to install (space-separated or array)
-EXTRA_PACKAGES=()
+EXTRA_PACKAGES=(
+  qemu-guest-agent
+)
 
 # Behavior
 CLEANUP_ON_FAIL=1                   # 1 = destroy CT on error, 0 = keep for debugging

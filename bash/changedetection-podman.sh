@@ -30,7 +30,9 @@ TRACK_LATEST=0                       # 1 = auto-update follows :latest instead o
 BROWSER_SYS_ADMIN=1                  # pragmatic default for Chrome in LXC/Podman; try 0 first if tightening
 
 # Extra packages to install (space-separated or array)
-EXTRA_PACKAGES=()
+EXTRA_PACKAGES=(
+  qemu-guest-agent
+)
 
 # Behavior
 CLEANUP_ON_FAIL=1

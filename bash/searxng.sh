@@ -26,7 +26,9 @@ DEBIAN_VERSION=13        # Trixie required — valkey is not in Bookworm main
 DEBIAN_CODENAME="trixie" # must match DEBIAN_VERSION
 
 # Extra packages to install (space-separated or array)
-EXTRA_PACKAGES=()
+EXTRA_PACKAGES=(
+  qemu-guest-agent
+)
 
 # Behavior
 CLEANUP_ON_FAIL=1

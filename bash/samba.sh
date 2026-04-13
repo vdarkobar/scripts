@@ -34,7 +34,9 @@ SHARE_STORAGE="rootfs"              # rootfs | <zfs-pool-name> | /host/path
 DISABLE_IPV6=0
 
 # Extra packages to install (space-separated or array)
-EXTRA_PACKAGES=()
+EXTRA_PACKAGES=(
+  qemu-guest-agent
+)
 
 # Behavior
 CLEANUP_ON_FAIL=1  # 1 = destroy CT on error, 0 = keep for debugging

@@ -35,7 +35,9 @@ TRACK_LATEST=0                       # 1 = auto-update follows :latest for Synap
 KEEP_BACKUPS=7
 
 # Extra packages to install (space-separated or array)
-EXTRA_PACKAGES=()
+EXTRA_PACKAGES=(
+  qemu-guest-agent
+)
 
 # Behavior
 CLEANUP_ON_FAIL=1

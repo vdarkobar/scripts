@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+﻿#!/usr/bin/env bash
 set -Eeo pipefail
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -29,7 +29,9 @@ PBS_UI_ADMIN_AUTHID="${PBS_UI_ADMIN_USER}@${PBS_UI_ADMIN_REALM}"
 SSH_PUBKEY=""                        # optional; cloud mode only. if empty, prompt during install
 
 # Extra packages to install (space-separated or array)
-EXTRA_PACKAGES=()
+EXTRA_PACKAGES=(
+  qemu-guest-agent
+)
 
 # Behavior
 CLEANUP_ON_FAIL=1                     # local mode only: 1 = destroy created CT on error, 0 = keep for debugging
