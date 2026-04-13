@@ -20,11 +20,12 @@ PUBLIC_FQDN=""                       # e.g. search.example.com — sets base_url
 TAGS="searxng;podman;lxc"
 
 # Images / versions
-# SearXNG uses date-based tags, e.g. 2025.8.1-3d96414
+# SearXNG uses date-based tags, e.g. 2026.4.13-ee66b070a
 # Verify and pin a specific tag from: https://hub.docker.com/r/searxng/searxng/tags
 # GHCR alternative: ghcr.io/searxng/searxng (avoids DockerHub pull-rate limits)
 SEARXNG_IMAGE_REPO="docker.io/searxng/searxng"
-SEARXNG_TAG="latest"                 # IMPORTANT: replace with a pinned date-based tag
+SEARXNG_TAG="2026.4.13-ee66b070a"    # pin a date-based tag from Docker Hub
+                                     # ignored when AUTO_UPDATE=1 (tracks :latest instead)
 # Valkey is always deployed — the limiter requires it regardless of public/local mode.
 VALKEY_IMAGE_REPO="docker.io/valkey/valkey"
 VALKEY_TAG="9"
@@ -39,10 +40,12 @@ ENABLE_IMAGE_PROXY=1                 # 1 = proxy images through SearXNG (uses me
 OUTGOING_TIMEOUT=4.0                 # seconds before giving up on an upstream search engine
 OUTGOING_MAX_TIMEOUT=10.0            # hard ceiling for upstream request timeouts
 
-# Optional features / policy
-AUTO_UPDATE=0                        # 1 = enable timer-driven update runs
-TRACK_LATEST=0                       # 1 = auto-update follows :latest
-KEEP_BACKUPS=7
+# Auto-update policy
+# AUTO_UPDATE=0 (default): installs the pinned SEARXNG_TAG, timer disabled, manual
+#   updates via searxng-maint.sh update <tag>
+# AUTO_UPDATE=1: ignores SEARXNG_TAG, installs and tracks :latest, timer enabled —
+#   the timer re-pulls :latest and restarts on schedule
+AUTO_UPDATE=0
 
 # Extra packages to install (space-separated or array)
 EXTRA_PACKAGES=(
@@ -54,8 +57,12 @@ CLEANUP_ON_FAIL=1
 
 # Derived
 APP_DIR="/opt/searxng"
-BACKUP_DIR="/opt/searxng-backups"
-SEARXNG_IMAGE="${SEARXNG_IMAGE_REPO}:${SEARXNG_TAG}"
+# Resolve effective image: AUTO_UPDATE=1 overrides the pinned tag with :latest
+if [[ "$AUTO_UPDATE" -eq 1 ]]; then
+  SEARXNG_IMAGE="${SEARXNG_IMAGE_REPO}:latest"
+else
+  SEARXNG_IMAGE="${SEARXNG_IMAGE_REPO}:${SEARXNG_TAG}"
+fi
 VALKEY_IMAGE="${VALKEY_IMAGE_REPO}:${VALKEY_TAG}"
 BASE_URL=""
 [[ -n "$PUBLIC_FQDN" ]] && BASE_URL="https://${PUBLIC_FQDN}/"
@@ -72,7 +79,6 @@ PUBLIC_INSTANCE=0
 #   /opt/searxng/config/limiter.toml         (bot detection config)
 #   /opt/searxng/cache/                     (favicon DB and SearXNG persistent cache)
 #   /opt/searxng/valkey/                    (Valkey data — rate-limit counters)
-#   /opt/searxng-backups/                   (operational backups)
 #   /usr/local/bin/searxng-maint.sh         (maintenance helper)
 #   /etc/sysctl.d/99-valkey-overcommit.conf (HOST -- vm.overcommit_memory)
 #   /etc/systemd/system/searxng-stack.service
@@ -89,9 +95,7 @@ PUBLIC_INSTANCE=0
 [[ "$DEBIAN_VERSION" =~ ^[0-9]+$ ]] || { echo "  ERROR: DEBIAN_VERSION must be numeric." >&2; exit 1; }
 [[ "$APP_PORT" =~ ^[0-9]+$ ]] || { echo "  ERROR: APP_PORT must be numeric." >&2; exit 1; }
 (( APP_PORT >= 1 && APP_PORT <= 65535 )) || { echo "  ERROR: APP_PORT must be between 1 and 65535." >&2; exit 1; }
-[[ "$KEEP_BACKUPS" =~ ^[0-9]+$ ]] || { echo "  ERROR: KEEP_BACKUPS must be numeric." >&2; exit 1; }
 [[ "$AUTO_UPDATE" =~ ^[01]$ ]] || { echo "  ERROR: AUTO_UPDATE must be 0 or 1." >&2; exit 1; }
-[[ "$TRACK_LATEST" =~ ^[01]$ ]] || { echo "  ERROR: TRACK_LATEST must be 0 or 1." >&2; exit 1; }
 [[ "$ENABLE_IMAGE_PROXY" =~ ^[01]$ ]] || { echo "  ERROR: ENABLE_IMAGE_PROXY must be 0 or 1." >&2; exit 1; }
 [[ "$SEARCH_SAFE_SEARCH" =~ ^[012]$ ]] || { echo "  ERROR: SEARCH_SAFE_SEARCH must be 0, 1, or 2." >&2; exit 1; }
 [[ -n "$SEARXNG_TAG" && "$SEARXNG_TAG" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || {
@@ -186,9 +190,7 @@ cat <<EOF2
   Limiter + Valkey:  always (Valkey ${VALKEY_TAG})
   public_instance:   $([ "$PUBLIC_INSTANCE" -eq 1 ] && echo "true (link_token enabled)" || echo "false (local/private)")
   Outgoing timeout:  ${OUTGOING_TIMEOUT}s / max ${OUTGOING_MAX_TIMEOUT}s
-  Auto-update:       $([ "$AUTO_UPDATE" -eq 1 ] && echo "enabled" || echo "disabled")
-  Track latest:      $([ "$TRACK_LATEST" -eq 1 ] && echo "enabled" || echo "disabled")
-  Keep backups:      $KEEP_BACKUPS
+  Auto-update:       $([ "$AUTO_UPDATE" -eq 1 ] && echo "enabled (:latest)" || echo "disabled (pinned $SEARXNG_TAG)")
   Cleanup on fail:   $CLEANUP_ON_FAIL
   ────────────────────────────────────────
   To change defaults, press Enter and
@@ -393,7 +395,7 @@ echo "  Detected Valkey bind-mount ownership: ${VALKEY_UID}:${VALKEY_GID}"
 # is needed for those paths. Directories just need to exist.
 pct exec "$CT_ID" -- bash -lc "
   set -euo pipefail
-  install -d -m 0755 '${APP_DIR}' '${BACKUP_DIR}'
+  install -d -m 0755 '${APP_DIR}'
   install -d -m 0755 '${APP_DIR}/config' '${APP_DIR}/cache'
 "
 
@@ -551,28 +553,21 @@ PUBLIC_FQDN=${PUBLIC_FQDN}
 PUBLIC_INSTANCE=${PUBLIC_INSTANCE}
 SEARXNG_BASE_URL=${BASE_URL}
 SEARXNG_SECRET=${SEARXNG_SECRET}
-KEEP_BACKUPS=${KEEP_BACKUPS}
 AUTO_UPDATE=${AUTO_UPDATE}
-TRACK_LATEST=${TRACK_LATEST}
 EOF2
   chmod 0600 '${APP_DIR}/.env'
 "
 
 # ── Maintenance script ────────────────────────────────────────────────────────
-# Backup scope:
-#   .env, docker-compose.yml, config/settings.yml, cache/
-#   + valkey/ (Valkey is always deployed; holds rate-limit counters only)
 # PBS handles the full CT-level backup independently of this helper.
 pct exec "$CT_ID" -- bash -lc 'cat > /usr/local/bin/searxng-maint.sh && chmod 0755 /usr/local/bin/searxng-maint.sh' <<'MAINT'
 #!/usr/bin/env bash
 set -Eeo pipefail
 
 APP_DIR="${APP_DIR:-/opt/searxng}"
-BACKUP_DIR="${BACKUP_DIR:-/opt/searxng-backups}"
 SERVICE="searxng-stack.service"
 ENV_FILE="${APP_DIR}/.env"
 COMPOSE_FILE="${APP_DIR}/docker-compose.yml"
-KEEP_BACKUPS="${KEEP_BACKUPS:-7}"
 
 need_root() { [[ $EUID -eq 0 ]] || { echo "  ERROR: Run as root." >&2; exit 1; }; }
 die() { echo "  ERROR: $*" >&2; exit 1; }
@@ -584,15 +579,13 @@ usage() {
   Usage: $0 <command>
 
   Commands:
-    backup                    Stop stack, archive config + cache + valkey, restart
-    list                      List available backup archives
-    restore  <file>           Stop stack, restore archive, restart
-    update   <tag|latest>     Pull a new SearXNG tag and recreate container
-    auto-update               Run update according to AUTO_UPDATE/TRACK_LATEST in .env
-    version                   Show configured images and policy flags
+    update   <tag>        Pin a specific version (e.g. 2026.4.13-ee66b070a), disables auto-update
+    auto-update           Re-pull :latest and restart (only if AUTO_UPDATE=1)
+    version               Show configured images and policy flags
 
-  Backup scope:
-    .env, docker-compose.yml, config/settings.yml, cache/, valkey/
+  Notes:
+    - update switches to a pinned tag and sets AUTO_UPDATE=0
+    - auto-update is called by the systemd timer when AUTO_UPDATE=1
   Note: PBS handles the full CT-level backup independently of this helper.
 EOF2
 }
@@ -600,19 +593,8 @@ EOF2
 [[ -f "$ENV_FILE" ]] || die "Missing .env file: $ENV_FILE"
 [[ -f "$COMPOSE_FILE" ]] || die "Missing compose file: $COMPOSE_FILE"
 
-env_keep_backups="$(awk -F= '/^KEEP_BACKUPS=/{print $2}' "$ENV_FILE" | tail -n1)"
-if [[ "$env_keep_backups" =~ ^[0-9]+$ ]]; then
-  KEEP_BACKUPS="$env_keep_backups"
-fi
-
 current_image() {
   awk -F= '/^SEARXNG_IMAGE=/{print $2}' "$ENV_FILE" | tail -n1
-}
-
-current_tag() {
-  local img
-  img="$(current_image)"
-  echo "${img##*:}"
 }
 
 current_repo() {
@@ -625,91 +607,22 @@ env_flag() {
   [[ "$raw" =~ ^[01]$ ]] && printf '%s' "$raw" || printf '0'
 }
 
-auto_update_enabled()  { [[ "$(env_flag AUTO_UPDATE)" == "1" ]]; }
-track_latest_enabled() { [[ "$(env_flag TRACK_LATEST)" == "1" ]]; }
-
-resolve_auto_tag() {
-  if track_latest_enabled; then
-    printf '%s\n' latest
-  else
-    current_tag
-  fi
-}
-
-backup_stack() {
-  local ts out started=0
-  ts="$(date +%Y%m%d-%H%M%S)"
-  out="$BACKUP_DIR/searxng-backup-$ts.tar.gz"
-
-  mkdir -p "$BACKUP_DIR"
-
-  if systemctl is-active --quiet "$SERVICE"; then
-    started=1
-    echo "  Stopping SearXNG stack for consistent backup ..."
-    systemctl stop "$SERVICE"
-  fi
-
-  trap 'if [[ $started -eq 1 ]]; then systemctl start "$SERVICE" || true; fi' RETURN
-
-  echo "  Creating backup: $out"
-  tar -C / -czf "$out" \
-    opt/searxng/.env \
-    opt/searxng/docker-compose.yml \
-    opt/searxng/config \
-    opt/searxng/cache \
-    opt/searxng/valkey
-
-  if [[ "$KEEP_BACKUPS" =~ ^[0-9]+$ ]] && (( KEEP_BACKUPS > 0 )); then
-    ls -1t "$BACKUP_DIR"/searxng-backup-*.tar.gz 2>/dev/null \
-      | awk -v keep="$KEEP_BACKUPS" 'NR>keep' \
-      | xargs -r rm -f --
-  fi
-
-  echo "  OK: $out"
-}
-
-restore_stack() {
-  local backup="$1"
-  [[ -n "$backup" ]] || die "Usage: searxng-maint.sh restore <backup.tar.gz>"
-  [[ -f "$backup" ]] || die "Backup not found: $backup"
-
-  echo "  Stopping SearXNG stack ..."
-  systemctl stop "$SERVICE" 2>/dev/null || true
-
-  echo "  Removing current persistent state ..."
-  rm -rf \
-    "$APP_DIR/config" \
-    "$APP_DIR/cache" \
-    "$APP_DIR/valkey" \
-    "$APP_DIR/.env" \
-    "$APP_DIR/docker-compose.yml"
-
-  echo "  Restoring backup ..."
-  tar -C / -xzf "$backup"
-
-  echo "  Starting SearXNG stack ..."
-  systemctl start "$SERVICE"
-  echo "  OK: restore completed."
-}
-
+# update <tag> — switch to a pinned version, disable auto-update
 update_searxng() {
   local new_tag="$1"
-  local old_image new_image repo tmp_env old_tag
-  [[ -n "$new_tag" ]] || die "Usage: searxng-maint.sh update <tag|latest>"
+  local old_image new_image repo tmp_env
+  [[ -n "$new_tag" ]] || die "Usage: searxng-maint.sh update <tag>"
+  [[ "$new_tag" == "latest" ]] && die "Use auto-update for :latest; update requires a pinned tag."
   [[ "$new_tag" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die "Invalid SearXNG tag: $new_tag"
 
-  old_image="$(current_image)"
-  old_tag="$(current_tag)"
   repo="$(current_repo)"
-  [[ -n "$old_image" ]] || die "Could not read current SEARXNG_IMAGE from .env"
   [[ -n "$repo" ]] || die "Could not read SEARXNG_IMAGE_REPO from .env"
   new_image="${repo}:${new_tag}"
   tmp_env="$(mktemp)"
 
-  echo "  Current SearXNG tag: $old_tag"
-  echo "  Target  SearXNG tag: $new_tag"
+  echo "  Current image: $(current_image)"
+  echo "  Target  image: $new_image"
 
-  backup_stack
   cp -a "$ENV_FILE" "$tmp_env"
 
   cleanup() { rm -f "$tmp_env"; }
@@ -718,6 +631,7 @@ update_searxng() {
     cp -a "$tmp_env" "$ENV_FILE"
     cd "$APP_DIR"
     /usr/bin/podman-compose up -d --force-recreate searxng || true
+    rm -f "$tmp_env"
   }
   trap rollback ERR
 
@@ -727,6 +641,7 @@ update_searxng() {
   sed -i \
     -e "s|^SEARXNG_TAG=.*|SEARXNG_TAG=$new_tag|" \
     -e "s|^SEARXNG_IMAGE=.*|SEARXNG_IMAGE=$new_image|" \
+    -e "s|^AUTO_UPDATE=.*|AUTO_UPDATE=0|" \
     "$ENV_FILE"
 
   echo "  Recreating SearXNG container ..."
@@ -734,46 +649,78 @@ update_searxng() {
   /usr/bin/podman-compose up -d --force-recreate searxng
 
   echo "  Waiting for SearXNG to become available ..."
-  local port
-  port="$(awk -F= '/^APP_PORT=/{print $2}' "$ENV_FILE" | tail -n1)"
-  port="${port:-8080}"
   # The limiter is always active — skip HTTP check, check container instead.
   sleep 5
   if podman ps --format "{{.Names}}" 2>/dev/null | grep -q "^searxng$"; then
     echo "  SearXNG container is running (HTTP check skipped — limiter blocks localhost curl)"
   else
+    trap - ERR
+    rollback
     die "SearXNG container is not running after update."
   fi
 
   trap - ERR
   cleanup
-  echo "  OK: SearXNG updated to $new_tag"
+
+  # Disable the timer since we just pinned a tag
+  systemctl disable --now searxng-update.timer >/dev/null 2>&1 || true
+  echo "  OK: SearXNG pinned to $new_tag (auto-update disabled)"
 }
 
+# auto-update — re-pull :latest and restart (timer-driven)
 auto_update_searxng() {
-  local target_tag
-
-  if ! auto_update_enabled; then
+  if [[ "$(env_flag AUTO_UPDATE)" != "1" ]]; then
     echo "  Auto-update disabled in ${ENV_FILE}; nothing to do."
     return 0
   fi
 
-  target_tag="$(resolve_auto_tag)"
-  if track_latest_enabled; then
-    echo "  Auto-update policy: TRACK_LATEST=1 -> following latest"
+  local repo image
+  repo="$(current_repo)"
+  [[ -n "$repo" ]] || die "Could not read SEARXNG_IMAGE_REPO from .env"
+  image="${repo}:latest"
+
+  local tmp_env
+  tmp_env="$(mktemp)"
+
+  cp -a "$ENV_FILE" "$tmp_env"
+
+  cleanup() { rm -f "$tmp_env"; }
+  rollback() {
+    echo "  !! Auto-update failed -- rolling back .env and container ..." >&2
+    cp -a "$tmp_env" "$ENV_FILE"
+    cd "$APP_DIR"
+    /usr/bin/podman-compose up -d --force-recreate searxng || true
+    rm -f "$tmp_env"
+  }
+  trap rollback ERR
+
+  echo "  Auto-update: pulling ${image} ..."
+  podman pull "$image"
+
+  sed -i "s|^SEARXNG_IMAGE=.*|SEARXNG_IMAGE=$image|" "$ENV_FILE"
+
+  echo "  Recreating SearXNG container ..."
+  cd "$APP_DIR"
+  /usr/bin/podman-compose up -d --force-recreate searxng
+
+  echo "  Waiting for SearXNG to become available ..."
+  sleep 5
+  if podman ps --format "{{.Names}}" 2>/dev/null | grep -q "^searxng$"; then
+    echo "  SearXNG container is running (HTTP check skipped — limiter blocks localhost curl)"
   else
-    echo "  Auto-update policy: TRACK_LATEST=0 -> reapplying configured tag $(current_tag)"
+    trap - ERR
+    rollback
+    die "SearXNG container is not running after auto-update."
   fi
 
-  update_searxng "$target_tag"
+  trap - ERR
+  cleanup
+  echo "  OK: SearXNG auto-updated to latest"
 }
 
 need_root
 cmd="${1:-}"
 case "$cmd" in
-  backup)      backup_stack ;;
-  list)        ls -1t "$BACKUP_DIR"/searxng-backup-*.tar.gz 2>/dev/null || true ;;
-  restore)     shift; restore_stack "${1:-}" ;;
   update)      shift; update_searxng "${1:-}" ;;
   auto-update) auto_update_searxng ;;
   version)
@@ -781,7 +728,6 @@ case "$cmd" in
     echo "Configured Valkey image:  $(awk -F= '/^VALKEY_IMAGE=/{print $2}' "$ENV_FILE" | tail -n1)"
     echo "PUBLIC_INSTANCE=$(env_flag PUBLIC_INSTANCE)"
     echo "AUTO_UPDATE=$(env_flag AUTO_UPDATE)"
-    echo "TRACK_LATEST=$(env_flag TRACK_LATEST)"
     ;;
   ""|-h|--help) usage ;;
   *) usage; die "Unknown command: $cmd" ;;
@@ -1001,9 +947,8 @@ printf '  Mode:      ${MODE_LABEL}\n'
 printf '  Stack:     /opt/searxng (%s containers running)\n' "\$running"
 printf '  Service:   %s\n' "\$service_active"
 printf '  Image:     %s\n' "\${configured_image:-n/a}"
-printf '  Backup:    /opt/searxng-backups\n'
 printf '  Compose:   cd /opt/searxng && podman-compose [up -d|down|logs|ps]\n'
-printf '  Maintain:  searxng-maint.sh [backup|list|restore|update|version]\n'
+printf '  Maintain:  searxng-maint.sh [update|version]\n'
 printf '  Web UI:    http://%s:${APP_PORT}/\n' "\${ip:-n/a}"
 [ -n '${PUBLIC_FQDN}' ] && printf '  Public:    https://${PUBLIC_FQDN}/\n' || true
 MOTD_APP
@@ -1065,12 +1010,9 @@ echo "    ${APP_DIR}/cache/               (favicon DB, request cache)"
 echo "    ${APP_DIR}/valkey/              (Valkey rate-limit counters)"
 echo ""
 echo "  Maintenance:"
-echo "    Policy: AUTO_UPDATE=${AUTO_UPDATE} TRACK_LATEST=${TRACK_LATEST}"
-echo "    pct exec $CT_ID -- searxng-maint.sh backup"
-echo "    pct exec $CT_ID -- searxng-maint.sh list"
-echo "    pct exec $CT_ID -- searxng-maint.sh update <tag|latest>"
-echo "    pct exec $CT_ID -- searxng-maint.sh restore /opt/searxng-backups/<backup.tar.gz>"
-echo "    pct exec $CT_ID -- searxng-maint.sh auto-update"
+echo "    Policy: AUTO_UPDATE=${AUTO_UPDATE}"
+echo "    pct exec $CT_ID -- /usr/local/bin/searxng-maint.sh update <tag>"
+echo "    pct exec $CT_ID -- /usr/local/bin/searxng-maint.sh auto-update"
 if [[ -n "$PUBLIC_FQDN" ]]; then
   echo ""
   echo "  Reverse proxy (NPM):"
