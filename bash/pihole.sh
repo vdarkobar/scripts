@@ -3,17 +3,6 @@ set -Eeo pipefail
 
 # ── Config ────────────────────────────────────────────────────────────────────
 CT_ID=""                             # empty = auto-assign via pvesh; set e.g. CT_ID=120 to pin
-if [[ -n "$CT_ID" ]]; then
-  [[ "$CT_ID" =~ ^[0-9]+$ ]] && (( CT_ID >= 100 && CT_ID <= 999999999 )) \
-    || { echo "  ERROR: CT_ID must be an integer >= 100." >&2; exit 1; }
-  if pct status "$CT_ID" >/dev/null 2>&1 || qm status "$CT_ID" >/dev/null 2>&1; then
-    echo "  ERROR: CT_ID $CT_ID is already in use on this node." >&2
-    exit 1
-  fi
-else
-  CT_ID="$(pvesh get /cluster/nextid)"
-  [[ -n "$CT_ID" ]] || { echo "  ERROR: Could not obtain next CT ID." >&2; exit 1; }
-fi
 HN="pihole"
 CPU=1
 RAM=512
@@ -145,7 +134,18 @@ for cmd in pvesh pveam pct curl python3 ip awk sort paste; do
   command -v "$cmd" >/dev/null 2>&1 || { echo "  ERROR: Missing required command: $cmd" >&2; exit 1; }
 done
 
-[[ -n "$CT_ID" ]] || { echo "  ERROR: Could not obtain next CT ID." >&2; exit 1; }
+if [[ -n "$CT_ID" ]]; then
+  [[ "$CT_ID" =~ ^[0-9]+$ ]] && (( CT_ID >= 100 && CT_ID <= 999999999 )) \
+    || { echo "  ERROR: CT_ID must be an integer >= 100." >&2; exit 1; }
+  if pct status "$CT_ID" >/dev/null 2>&1 || qm status "$CT_ID" >/dev/null 2>&1; then
+    echo "  ERROR: CT_ID $CT_ID is already in use on this node." >&2
+    exit 1
+  fi
+else
+  CT_ID="$(pvesh get /cluster/nextid)"
+  [[ -n "$CT_ID" ]] || { echo "  ERROR: Could not obtain next CT ID." >&2; exit 1; }
+fi
+
 
 if [[ "$DEBIAN_VERSION" -ge 13 ]]; then
   PVC_VER="$(dpkg-query -W -f='${Version}' pve-container 2>/dev/null | cut -d. -f1-2 || echo "0.0")"

@@ -3,17 +3,6 @@ set -Eeo pipefail
 
 # ── Config ────────────────────────────────────────────────────────────────────
 CT_ID=""                             # empty = auto-assign via pvesh; set e.g. CT_ID=120 to pin
-if [[ -n "$CT_ID" ]]; then
-  [[ "$CT_ID" =~ ^[0-9]+$ ]] && (( CT_ID >= 100 && CT_ID <= 999999999 )) \
-    || { echo "  ERROR: CT_ID must be an integer >= 100." >&2; exit 1; }
-  if pct status "$CT_ID" >/dev/null 2>&1 || qm status "$CT_ID" >/dev/null 2>&1; then
-    echo "  ERROR: CT_ID $CT_ID is already in use on this node." >&2
-    exit 1
-  fi
-else
-  CT_ID="$(pvesh get /cluster/nextid)"
-  [[ -n "$CT_ID" ]] || { echo "  ERROR: Could not obtain next CT ID." >&2; exit 1; }
-fi
 HN="matrix"
 CPU=4
 RAM=4096
@@ -78,7 +67,6 @@ ELEMENT_FQDN="chat.${MATRIX_DOMAIN}"
 #   /etc/sysctl.d/99-hardening.conf
 
 # ── Config validation ─────────────────────────────────────────────────────────
-[[ -n "$CT_ID" ]] || { echo "  ERROR: Could not obtain next CT ID." >&2; exit 1; }
 [[ "$DEBIAN_VERSION" =~ ^[0-9]+$ ]] || { echo "  ERROR: DEBIAN_VERSION must be numeric." >&2; exit 1; }
 [[ "$SYNAPSE_PORT" =~ ^[0-9]+$ ]] || { echo "  ERROR: SYNAPSE_PORT must be numeric." >&2; exit 1; }
 (( SYNAPSE_PORT >= 1 && SYNAPSE_PORT <= 65535 )) || { echo "  ERROR: SYNAPSE_PORT must be between 1 and 65535." >&2; exit 1; }
@@ -130,6 +118,18 @@ trap 'rc=$?;
 for cmd in pvesh pveam pct pvesm curl python3 ip awk sort paste; do
   command -v "$cmd" >/dev/null 2>&1 || { echo "  ERROR: Missing required command: $cmd" >&2; exit 1; }
 done
+
+if [[ -n "$CT_ID" ]]; then
+  [[ "$CT_ID" =~ ^[0-9]+$ ]] && (( CT_ID >= 100 && CT_ID <= 999999999 )) \
+    || { echo "  ERROR: CT_ID must be an integer >= 100." >&2; exit 1; }
+  if pct status "$CT_ID" >/dev/null 2>&1 || qm status "$CT_ID" >/dev/null 2>&1; then
+    echo "  ERROR: CT_ID $CT_ID is already in use on this node." >&2
+    exit 1
+  fi
+else
+  CT_ID="$(pvesh get /cluster/nextid)"
+  [[ -n "$CT_ID" ]] || { echo "  ERROR: Could not obtain next CT ID." >&2; exit 1; }
+fi
 
 # ── Discover available resources ──────────────────────────────────────────────
 AVAIL_TMPL_STORES="$(pvesh get /storage --output-format json 2>/dev/null \

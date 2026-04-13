@@ -3,17 +3,6 @@ set -Eeo pipefail
 
 # ── Config ────────────────────────────────────────────────────────────────────
 CT_ID=""                             # empty = auto-assign via pvesh; set e.g. CT_ID=120 to pin
-if [[ -n "$CT_ID" ]]; then
-  [[ "$CT_ID" =~ ^[0-9]+$ ]] && (( CT_ID >= 100 && CT_ID <= 999999999 )) \
-    || { echo "  ERROR: CT_ID must be an integer >= 100." >&2; exit 1; }
-  if pct status "$CT_ID" >/dev/null 2>&1 || qm status "$CT_ID" >/dev/null 2>&1; then
-    echo "  ERROR: CT_ID $CT_ID is already in use on this node." >&2
-    exit 1
-  fi
-else
-  CT_ID="$(pvesh get /cluster/nextid)"
-  [[ -n "$CT_ID" ]] || { echo "  ERROR: Could not obtain next CT ID." >&2; exit 1; }
-fi
 HN="stirling-pdf"
 CPU=2
 RAM=4096
@@ -78,7 +67,6 @@ fi
 #   /etc/sysctl.d/99-hardening.conf
 
 # ── Config validation ─────────────────────────────────────────────────────────
-[[ -n "$CT_ID" ]] || { echo "  ERROR: Could not obtain next CT ID." >&2; exit 1; }
 [[ "$CPU" =~ ^[0-9]+$ ]] && (( CPU >= 1 && CPU <= 128 )) || { echo "  ERROR: CPU must be between 1 and 128." >&2; exit 1; }
 [[ "$RAM" =~ ^[0-9]+$ ]] && (( RAM >= 512 )) || { echo "  ERROR: RAM must be at least 512 MB." >&2; exit 1; }
 [[ "$DISK" =~ ^[0-9]+$ ]] && (( DISK >= 2 )) || { echo "  ERROR: DISK must be at least 2 GB." >&2; exit 1; }
@@ -124,6 +112,18 @@ trap 'rc=$?;
 for cmd in pvesh pveam pct pvesm curl python3 ip awk sort paste; do
   command -v "$cmd" >/dev/null 2>&1 || { echo "  ERROR: Missing required command: $cmd" >&2; exit 1; }
 done
+
+if [[ -n "$CT_ID" ]]; then
+  [[ "$CT_ID" =~ ^[0-9]+$ ]] && (( CT_ID >= 100 && CT_ID <= 999999999 )) \
+    || { echo "  ERROR: CT_ID must be an integer >= 100." >&2; exit 1; }
+  if pct status "$CT_ID" >/dev/null 2>&1 || qm status "$CT_ID" >/dev/null 2>&1; then
+    echo "  ERROR: CT_ID $CT_ID is already in use on this node." >&2
+    exit 1
+  fi
+else
+  CT_ID="$(pvesh get /cluster/nextid)"
+  [[ -n "$CT_ID" ]] || { echo "  ERROR: Could not obtain next CT ID." >&2; exit 1; }
+fi
 
 # ── Discover available resources ──────────────────────────────────────────────
 AVAIL_TMPL_STORES="$(pvesh get /storage --output-format json 2>/dev/null \

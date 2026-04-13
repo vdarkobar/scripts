@@ -6,16 +6,6 @@ INSTALL_MODE="local"                 # local | cloud
 
 # Local / LXC mode (used only when INSTALL_MODE=local)
 CT_ID=""                             # empty = auto-assign via pvesh; set e.g. CT_ID=120 to pin
-if [[ -n "$CT_ID" ]]; then
-  [[ "$CT_ID" =~ ^[0-9]+$ ]] && (( CT_ID >= 100 && CT_ID <= 999999999 )) \
-    || { echo "  ERROR: CT_ID must be an integer >= 100." >&2; exit 1; }
-  if pct status "$CT_ID" >/dev/null 2>&1 || qm status "$CT_ID" >/dev/null 2>&1; then
-    echo "  ERROR: CT_ID $CT_ID is already in use on this node." >&2
-    exit 1
-  fi
-else
-  CT_ID="$(pvesh get /cluster/nextid 2>/dev/null || true)"
-fi
 HN="pbs"
 CPU=2
 RAM=2048
@@ -114,10 +104,6 @@ trap 'rc=$?;
 [[ -e "/usr/share/zoneinfo/${APP_TZ}" ]] \
   || { echo "  ERROR: APP_TZ not found in /usr/share/zoneinfo: ${APP_TZ}" >&2; exit 1; }
 
-if [[ "${INSTALL_MODE}" == "local" ]]; then
-  [[ -n "${CT_ID}" ]] || { echo "  ERROR: Could not obtain next CT ID." >&2; exit 1; }
-fi
-
 # ── Preflight — root & mode detection ─────────────────────────────────────────
 [[ "$(id -u)" -eq 0 ]] || { echo "  ERROR: Run as root." >&2; exit 1; }
 
@@ -141,6 +127,18 @@ if [[ "${INSTALL_MODE}" == "local" ]]; then
   for cmd in pvesh pveam pct pvesm python3 ip awk sort paste; do
     command -v "$cmd" >/dev/null 2>&1 || { echo "  ERROR: Missing required command: $cmd" >&2; exit 1; }
   done
+
+  if [[ -n "$CT_ID" ]]; then
+    [[ "$CT_ID" =~ ^[0-9]+$ ]] && (( CT_ID >= 100 && CT_ID <= 999999999 )) \
+      || { echo "  ERROR: CT_ID must be an integer >= 100." >&2; exit 1; }
+    if pct status "$CT_ID" >/dev/null 2>&1 || qm status "$CT_ID" >/dev/null 2>&1; then
+      echo "  ERROR: CT_ID $CT_ID is already in use on this node." >&2
+      exit 1
+    fi
+  else
+    CT_ID="$(pvesh get /cluster/nextid 2>/dev/null || true)"
+    [[ -n "$CT_ID" ]] || { echo "  ERROR: Could not obtain next CT ID." >&2; exit 1; }
+  fi
 else
   for cmd in apt-get wget awk ip; do
     command -v "$cmd" >/dev/null 2>&1 || { echo "  ERROR: Missing required command: $cmd" >&2; exit 1; }
