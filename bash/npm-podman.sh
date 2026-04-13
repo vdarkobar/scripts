@@ -2,7 +2,7 @@
 set -Eeo pipefail
 
 # ── Config ────────────────────────────────────────────────────────────────────
-CT_ID=""                             # assigned after preflight validates pvesh
+CT_ID=""                             # empty = auto-assign via pvesh; set e.g. CT_ID=120 to pin
 HN="npm"
 CPU=4
 RAM=4096
@@ -122,8 +122,17 @@ for cmd in pvesh pveam pct pvesm curl python3 ip awk sort paste readlink cp chmo
   command -v "$cmd" >/dev/null 2>&1 || { echo "  ERROR: Missing required command: $cmd" >&2; exit 1; }
 done
 
-CT_ID="$(pvesh get /cluster/nextid)"
-[[ -n "$CT_ID" ]] || { echo "  ERROR: Could not obtain next CT ID." >&2; exit 1; }
+if [[ -n "$CT_ID" ]]; then
+  [[ "$CT_ID" =~ ^[0-9]+$ ]] && (( CT_ID >= 100 && CT_ID <= 999999999 )) \
+    || { echo "  ERROR: CT_ID must be an integer >= 100." >&2; exit 1; }
+  if pct status "$CT_ID" >/dev/null 2>&1 || qm status "$CT_ID" >/dev/null 2>&1; then
+    echo "  ERROR: CT_ID $CT_ID is already in use on this node." >&2
+    exit 1
+  fi
+else
+  CT_ID="$(pvesh get /cluster/nextid)"
+  [[ -n "$CT_ID" ]] || { echo "  ERROR: Could not obtain next CT ID." >&2; exit 1; }
+fi
 
 # ── Discover available resources ──────────────────────────────────────────────
 AVAIL_TMPL_STORES="$(pvesh get /storage --output-format json 2>/dev/null \

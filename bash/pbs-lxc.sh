@@ -5,7 +5,17 @@ set -Eeo pipefail
 INSTALL_MODE="local"                 # local | cloud
 
 # Local / LXC mode (used only when INSTALL_MODE=local)
-CT_ID="$(pvesh get /cluster/nextid 2>/dev/null || true)"
+CT_ID=""                             # empty = auto-assign via pvesh; set e.g. CT_ID=120 to pin
+if [[ -n "$CT_ID" ]]; then
+  [[ "$CT_ID" =~ ^[0-9]+$ ]] && (( CT_ID >= 100 && CT_ID <= 999999999 )) \
+    || { echo "  ERROR: CT_ID must be an integer >= 100." >&2; exit 1; }
+  if pct status "$CT_ID" >/dev/null 2>&1 || qm status "$CT_ID" >/dev/null 2>&1; then
+    echo "  ERROR: CT_ID $CT_ID is already in use on this node." >&2
+    exit 1
+  fi
+else
+  CT_ID="$(pvesh get /cluster/nextid 2>/dev/null || true)"
+fi
 HN="pbs"
 CPU=2
 RAM=2048
