@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+﻿#!/usr/bin/env bash
 set -Eeo pipefail
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -41,6 +41,9 @@ PIHOLE_CACHE_SIZE=10000               # DNS cache entries (positive integer)
 # Note: Pi-hole v6 web UI port is managed via /etc/pihole/pihole.toml after
 # install (webserver.port). Default: HTTP 80, HTTPS 443 with self-signed cert.
 # Do not attempt to set it here.
+
+# Extra packages to install (space-separated or array)
+EXTRA_PACKAGES=()
 
 # Behavior
 DISABLE_IPV6=1                        # 1 = disable IPv6 in sysctl
@@ -524,6 +527,15 @@ EOF
 
   systemctl enable --now unattended-upgrades
 '
+
+# ── Extra packages ────────────────────────────────────────────────────────────
+if [[ "${#EXTRA_PACKAGES[@]}" -gt 0 ]]; then
+  pct exec "$CT_ID" -- bash -lc "
+    set -euo pipefail
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get install -y ${EXTRA_PACKAGES[*]}
+  "
+fi
 
 # ── Sysctl hardening ──────────────────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc '

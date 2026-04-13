@@ -16,6 +16,11 @@ APP_TZ="Europe/Berlin"
 TAGS="debian;lxc"
 DEBIAN_VERSION=13
 
+# Extra packages to install (space-separated or array)
+EXTRA_PACKAGES=(
+  qemu-guest-agent
+)
+
 # Behavior
 DISABLE_IPV6=0                      # 1 = also disable IPv6 via sysctl hardening
 CLEANUP_ON_FAIL=1                   # 1 = destroy CT on error, 0 = keep for debugging
@@ -278,6 +283,15 @@ EOF2
 
   systemctl enable --now unattended-upgrades
 '
+
+# ── Extra packages ────────────────────────────────────────────────────────────
+if [[ "${#EXTRA_PACKAGES[@]}" -gt 0 ]]; then
+  pct exec "$CT_ID" -- bash -lc "
+    set -euo pipefail
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get install -y ${EXTRA_PACKAGES[*]}
+  "
+fi
 
 # ── Sysctl hardening ──────────────────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc "

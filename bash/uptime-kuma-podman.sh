@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+﻿#!/usr/bin/env bash
 set -Eeo pipefail
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -25,6 +25,9 @@ DEBIAN_VERSION=13
 # Optional features / policy
 AUTO_UPDATE=0                        # 1 = enable timer-driven maintenance/update runs
 TRACK_LATEST=0                       # 1 = auto-update follows louislam/uptime-kuma:latest
+
+# Extra packages to install (space-separated or array)
+EXTRA_PACKAGES=()
 
 # Behavior
 CLEANUP_ON_FAIL=1
@@ -678,6 +681,15 @@ EOF2
 
   systemctl enable --now unattended-upgrades
 '
+
+# ── Extra packages ────────────────────────────────────────────────────────────
+if [[ "${#EXTRA_PACKAGES[@]}" -gt 0 ]]; then
+  pct exec "$CT_ID" -- bash -lc "
+    set -euo pipefail
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get install -y ${EXTRA_PACKAGES[*]}
+  "
+fi
 
 # ── Sysctl hardening ──────────────────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc '

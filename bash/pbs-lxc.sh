@@ -28,6 +28,9 @@ PBS_UI_ADMIN_REALM="pbs"
 PBS_UI_ADMIN_AUTHID="${PBS_UI_ADMIN_USER}@${PBS_UI_ADMIN_REALM}"
 SSH_PUBKEY=""                        # optional; cloud mode only. if empty, prompt during install
 
+# Extra packages to install (space-separated or array)
+EXTRA_PACKAGES=()
+
 # Behavior
 CLEANUP_ON_FAIL=1                     # local mode only: 1 = destroy created CT on error, 0 = keep for debugging
 
@@ -464,6 +467,15 @@ EOF2
 
     systemctl enable --now unattended-upgrades
   '
+fi
+
+# ── Local mode — extra packages ──────────────────────────────────────────────
+if [[ "${INSTALL_MODE}" == "local" && "${#EXTRA_PACKAGES[@]}" -gt 0 ]]; then
+  pct exec "$CT_ID" -- bash -lc "
+    set -euo pipefail
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get install -y ${EXTRA_PACKAGES[*]}
+  "
 fi
 
 # ── Local mode — sysctl hardening ────────────────────────────────────────────

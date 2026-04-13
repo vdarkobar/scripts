@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+﻿#!/usr/bin/env bash
 set -Eeo pipefail
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -28,6 +28,9 @@ DEBIAN_VERSION=13
 ENABLE_AUTO_UPDATE=0                # 1 = enable monthly kavita-update.timer
 KEEP_BACKUPS=5                      # config-only backups kept by kavita-maint.sh
 DISABLE_IPV6=0                      # 1 = append IPv6 disable sysctls inside CT
+
+# Extra packages to install (space-separated or array)
+EXTRA_PACKAGES=()
 
 # Behavior
 CLEANUP_ON_FAIL=1                   # 1 = destroy CT on error, 0 = keep for debugging
@@ -655,6 +658,15 @@ APT::Periodic::AutocleanInterval "7";
 EOF
   systemctl enable --now unattended-upgrades >/dev/null 2>&1 || true
 '
+
+# ── Extra packages ────────────────────────────────────────────────────────────
+if [[ "${#EXTRA_PACKAGES[@]}" -gt 0 ]]; then
+  pct exec "$CT_ID" -- bash -lc "
+    set -euo pipefail
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get install -y ${EXTRA_PACKAGES[*]}
+  "
+fi
 
 # ── Sysctl hardening ──────────────────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc '

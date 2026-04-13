@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+﻿#!/usr/bin/env bash
 set -Eeo pipefail
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -29,6 +29,9 @@ TRACK_LATEST=0                       # 1 = auto-update overrides APP_TAG with la
                                      # version (e.g. 0.46.2-fat); when APP_TAG is already a
                                      # floating tag like latest-fat, both modes re-pull the
                                      # same image
+
+# Extra packages to install (space-separated or array)
+EXTRA_PACKAGES=()
 
 # Behavior
 CLEANUP_ON_FAIL=1
@@ -698,6 +701,15 @@ APT::Periodic::AutocleanInterval "7";
 EOF2
   systemctl enable --now unattended-upgrades
 '
+
+# ── Extra packages ────────────────────────────────────────────────────────────
+if [[ "${#EXTRA_PACKAGES[@]}" -gt 0 ]]; then
+  pct exec "$CT_ID" -- bash -lc "
+    set -euo pipefail
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get install -y ${EXTRA_PACKAGES[*]}
+  "
+fi
 
 # ── Sysctl hardening ──────────────────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc '

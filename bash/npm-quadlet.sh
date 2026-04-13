@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+﻿#!/usr/bin/env bash
 set -Eeo pipefail
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -37,6 +37,9 @@ INITIAL_ADMIN_PASSWORD=""            # min 8 characters
 # AUTO_UPDATE=1: ignores APP_TAG, installs and tracks :latest, timer enabled —
 #   the timer re-pulls :latest and restarts on schedule
 AUTO_UPDATE=0
+
+# Extra packages to install (space-separated or array)
+EXTRA_PACKAGES=()
 
 # Behavior
 CLEANUP_ON_FAIL=1
@@ -846,6 +849,15 @@ EOF2
 
   systemctl enable --now unattended-upgrades
 '
+
+# ── Extra packages ────────────────────────────────────────────────────────────
+if [[ "${#EXTRA_PACKAGES[@]}" -gt 0 ]]; then
+  pct exec "$CT_ID" -- bash -lc "
+    set -euo pipefail
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get install -y ${EXTRA_PACKAGES[*]}
+  "
+fi
 
 # ── Sysctl hardening ──────────────────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc '
