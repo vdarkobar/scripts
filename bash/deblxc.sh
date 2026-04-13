@@ -101,7 +101,7 @@ cat <<EOF2
 
 EOF2
 
-SCRIPT_URL="https://raw.githubusercontent.com/vdarkobar/scripts/main/deblxc.sh"
+SCRIPT_URL="https://raw.githubusercontent.com/vdarkobar/scripts/main/bash/deblxc.sh"
 SCRIPT_LOCAL="/root/deblxc.sh"
 SCRIPT_SOURCE="${BASH_SOURCE[0]:-}"
 
