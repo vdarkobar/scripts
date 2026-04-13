@@ -1,9 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "Bash(ls -la /d/GitHub/scripts/bash/*.sh)",
-      "Bash(grep -l \"pct exec\" /d/GitHub/scripts/bash/*.sh)",
-      "Bash(powershell -Command ':*)"
-    ]
-  }
-}
