@@ -649,14 +649,25 @@ update_searxng() {
   /usr/bin/podman-compose up -d --force-recreate searxng
 
   echo "  Waiting for SearXNG to become available ..."
-  # The limiter is always active — skip HTTP check, check container instead.
-  sleep 5
-  if podman ps --format "{{.Names}}" 2>/dev/null | grep -q "^searxng$"; then
-    echo "  SearXNG container is running (HTTP check skipped — limiter blocks localhost curl)"
+  # The limiter is always active — skip HTTP check, check container stays running.
+  # Loop for 60s to catch pod-recreation issues where the container starts then
+  # exits shortly after (e.g. pod lifecycle confusion on --force-recreate).
+  local ready=0 i
+  for i in $(seq 1 12); do
+    sleep 5
+    if podman ps --format "{{.Names}}" 2>/dev/null | grep -q "^searxng$"; then
+      ready=1
+    else
+      ready=0
+      break
+    fi
+  done
+  if [[ $ready -eq 1 ]]; then
+    echo "  SearXNG container stable after 60s (HTTP check skipped — limiter blocks localhost curl)"
   else
     trap - ERR
     rollback
-    die "SearXNG container is not running after update."
+    die "SearXNG container did not stay running after update."
   fi
 
   trap - ERR
@@ -704,13 +715,25 @@ auto_update_searxng() {
   /usr/bin/podman-compose up -d --force-recreate searxng
 
   echo "  Waiting for SearXNG to become available ..."
-  sleep 5
-  if podman ps --format "{{.Names}}" 2>/dev/null | grep -q "^searxng$"; then
-    echo "  SearXNG container is running (HTTP check skipped — limiter blocks localhost curl)"
+  # The limiter is always active — skip HTTP check, check container stays running.
+  # Loop for 60s to catch pod-recreation issues where the container starts then
+  # exits shortly after (e.g. pod lifecycle confusion on --force-recreate).
+  local ready=0 i
+  for i in $(seq 1 12); do
+    sleep 5
+    if podman ps --format "{{.Names}}" 2>/dev/null | grep -q "^searxng$"; then
+      ready=1
+    else
+      ready=0
+      break
+    fi
+  done
+  if [[ $ready -eq 1 ]]; then
+    echo "  SearXNG container stable after 60s (HTTP check skipped — limiter blocks localhost curl)"
   else
     trap - ERR
     rollback
-    die "SearXNG container is not running after auto-update."
+    die "SearXNG container did not stay running after auto-update."
   fi
 
   trap - ERR
@@ -749,7 +772,7 @@ Type=oneshot
 RemainAfterExit=yes
 WorkingDirectory=/opt/searxng
 ExecStart=/usr/bin/podman-compose up -d
-ExecStop=/usr/bin/podman-compose down
+ExecStop=/usr/bin/podman-compose stop
 TimeoutStopSec=60
 
 [Install]
