@@ -25,6 +25,9 @@
 # ─────────────────────────────────────────────────────────────────────────────
 
 hostname: REPLACE-HOSTNAME
+# If no FQDN is planned, DELETE the next line entirely — do not leave it blank.
+# YAML null / empty string are not the same as "absent"; only removing the key
+# makes cloud-init fall back to deriving the FQDN from 'hostname:' cleanly.
 fqdn: REPLACE-FQDN
 
 # manage_etc_hosts: localhost
