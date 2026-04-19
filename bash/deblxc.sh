@@ -19,6 +19,7 @@ DEBIAN_VERSION=13
 # Extra packages to install (space-separated or array)
 EXTRA_PACKAGES=(
   qemu-guest-agent
+  curl
 )
 
 # Behavior
