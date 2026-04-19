@@ -17,6 +17,12 @@
 </details>
 
 <details>
+  <summary>Vault</summary>
+  <p>Creates ...</p>
+  <pre><code>bash &lt;(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/bash/vault.sh)</code></pre>
+</details>
+
+<details>
   <summary>PBS</summary>
   <p>Proxmox Backup Server on Debian LXC.</p>
   <pre><code>bash &lt;(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/bash/pbs-lxc.sh)</code></pre>
