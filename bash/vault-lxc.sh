@@ -363,6 +363,7 @@ PCT_OPTIONS=(
   -onboot 1
   -ostype debian
   -unprivileged 1
+  -features "nesting=1"
   -tags "$TAGS"
   -net0 "$NET0"
 )
