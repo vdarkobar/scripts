@@ -364,12 +364,17 @@ PCT_OPTIONS=(
   -ostype debian
   -unprivileged 1
   -features "nesting=1"
+  -tty 2
+  -console 1
   -tags "$TAGS"
   -net0 "$NET0"
 )
 
 pct create "$CT_ID" "${TEMPLATE_STORAGE}:vztmpl/${TEMPLATE}" "${PCT_OPTIONS[@]}"
 CREATED=1
+
+# Ensure PVE GUI console and pct console attach to tty login properly.
+pct set "$CT_ID" --cmode tty
 
 # ── Start & wait for IPv4 ─────────────────────────────────────────────────────
 pct start "$CT_ID"
@@ -1037,13 +1042,22 @@ echo "  SSH port:     $SSH_PORT"
 echo "  Root locked:  $([ "$LOCK_ROOT_PASSWORD" -eq 1 ] && echo yes || echo no)"
 echo "  Key helper:   $VAULT_HELPER_PATH (inside CT)"
 echo ""
+echo "  Console login:"
+echo "    PVE GUI Console or: pct console $CT_ID"
+echo "    Login as:           $ADMIN_USER"
+echo "    Auth:               local password set during install"
+echo ""
 echo "  Inbound SSH to this vault CT is locked until a public key is added to:"
 echo "    /home/$ADMIN_USER/.ssh/authorized_keys"
 echo ""
 echo "  Next steps:"
-echo "    1) pct enter $CT_ID"
-echo "    2) su - $ADMIN_USER"
+echo "    1) Open PVE GUI Console (or run: pct console $CT_ID)"
+echo "    2) Log in as $ADMIN_USER"
 echo "    3) Paste an inbound login key into ~/.ssh/authorized_keys"
 echo "    4) vault-key add cloud-example 203.0.113.10 debian"
 echo "    5) vault-key export cloud-example"
+echo ""
+echo "  Fallback if needed:"
+echo "    pct enter $CT_ID"
+echo "    su - $ADMIN_USER"
 echo ""
