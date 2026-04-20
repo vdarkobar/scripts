@@ -991,11 +991,7 @@ EOF2
 #!/bin/sh
 printf '\n'
 printf '  Vault key helper:\n'
-printf '    su - $ADMIN_USER\n'
 printf '    vault-key help\n'
-printf '    vault-key add cloud-example 203.0.113.10 debian\n'
-printf '    vault-key export cloud-example\n'
-printf '    vault-key list\n'
 printf '\n'
 printf '  Inbound SSH stays locked until you add a key to:\n'
 printf '    /home/$ADMIN_USER/.ssh/authorized_keys\n'
