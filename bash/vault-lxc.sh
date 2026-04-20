@@ -360,7 +360,7 @@ PCT_OPTIONS=(
   -cores "$CPU"
   -memory "$RAM"
   -rootfs "${CONTAINER_STORAGE}:${DISK}"
-  -onboot 1
+  -onboot 0
   -ostype debian
   -unprivileged 1
   -features "nesting=1"
