@@ -1919,16 +1919,18 @@ pct exec "$CT_ID" -- bash -lc '
 
 # ── Proxmox UI description ────────────────────────────────────────────────────
 # Minimal at-a-glance description: a one-line header outside <details>, and
-# inside <details> just the two copy-paste artifacts operators actually use —
-# a ready-to-execute manual CA install block (mirroring trust-bundle byte-for-
-# byte) and the ca-sign wrapper source. Both pull their payloads verbatim
-# from the CT so the description stays authoritative after any in-CT change.
-# Everything else (fingerprint, audit log path, defaults) is surfaced by
-# `vault-ca help` and the post-install bootstrap summary.
+# inside <details> a sequenced, command-first walkthrough — workstation
+# setup first (authorize key, install ca-sign), then per-target onboarding,
+# then daily use. The ca-sign wrapper source is kept at the bottom as a
+# paste-fallback for air-gapped workstations that can't SSH to the vault.
+# CA pubkey and wrapper source are both fetched from the CT so the
+# description stays authoritative after any in-CT change. Everything else
+# (fingerprint, audit log path, defaults) is surfaced by \`vault-ca help\`
+# and the post-install bootstrap summary.
 CA_PUB_CONTENT="$(pct exec "$CT_ID" -- cat "${CA_PUB}")"
 CA_SIGN_CONTENT="$(pct exec "$CT_ID" -- cat "${VAULT_CA_WRAPPER}")"
 
-# Heredoc is unquoted on purpose: ${VARS} expand once, and \` gives literal
+# Heredoc is unquoted on purpose: \${VARS} expand once, and \` gives literal
 # backticks for the markdown code fences. The interpolated wrapper content
 # is NOT re-parsed — any \$VAR or \$(...) inside it stays literal. The
 # inner heredoc delimiters PUBKEY_EOF / CONF_EOF are plain text at this
@@ -1936,12 +1938,52 @@ CA_SIGN_CONTENT="$(pct exec "$CT_ID" -- cat "${VAULT_CA_WRAPPER}")"
 # on a target.
 VAULT_CA_DESC="$(cat <<EOF_DESC
 Vault-CA LXC (${CT_IP}) — ssh${SSH_PORT_ARG} ${ADMIN_USER}@${CT_IP}
-<details><summary>CA install commands &amp; ca-sign wrapper</summary>
+<details><summary>Setup &amp; onboarding commands</summary>
 
-**Install CA trust on a target** — run as root on each target. Mirrors
-\`vault-ca trust-bundle\` (same files, same modes, same sshd drop-in, same
-validation and reload).
-Automated shortcut: \`${SSH_CMD_STR} ${ADMIN_USER}@${CT_IP} vault-ca trust-bundle | ssh root@target 'bash -s'\`
+### 1. Authorize your workstation key on the vault (one time)
+
+Run on your workstation — prints your pubkey, copy it:
+\`\`\`bash
+cat ~/.ssh/id_ed25519.pub
+\`\`\`
+
+Run on the PVE host — open the vault console:
+\`\`\`bash
+pct console ${CT_ID}
+\`\`\`
+
+Log in as \`${ADMIN_USER}\` (password set during deploy), then inside the console:
+\`\`\`bash
+mkdir -p ~/.ssh && chmod 700 ~/.ssh
+nano ~/.ssh/authorized_keys        # paste the pubkey line, save
+chmod 600 ~/.ssh/authorized_keys
+exit
+\`\`\`
+
+Exit the console with \`Ctrl-]\`. Verify from your workstation:
+\`\`\`bash
+${SSH_CMD_STR} ${ADMIN_USER}@${CT_IP} hostname
+\`\`\`
+
+Should succeed without a password prompt.
+
+### 2. Install ca-sign on your workstation (one time)
+
+\`\`\`bash
+mkdir -p ~/.local/bin
+${SSH_CMD_STR} ${ADMIN_USER}@${CT_IP} vault-ca client-wrapper > ~/.local/bin/ca-sign
+chmod +x ~/.local/bin/ca-sign
+echo \$PATH | tr ':' '\n' | grep -q "\$HOME/.local/bin" \\
+  || echo 'export PATH="\$HOME/.local/bin:\$PATH"' >> ~/.bashrc
+source ~/.bashrc
+ca-sign --help
+\`\`\`
+
+### 3. Onboard each target (one time, per target)
+
+Get a root shell on the target (SSH, \`pct console\`, or physical console), then
+paste the block below. This is self-contained — the CA pubkey is baked in, no
+network call to the vault. Mirrors \`vault-ca trust-bundle\` byte-for-byte.
 
 \`\`\`bash
 cat > /etc/ssh/ssh-ca-user.pub <<'PUBKEY_EOF'
@@ -1961,7 +2003,22 @@ CONF_EOF
 sshd -t && { systemctl reload ssh 2>/dev/null || systemctl restart ssh; }
 \`\`\`
 
-**ca-sign wrapper** — save on your workstation as \`~/.local/bin/ca-sign\` and \`chmod +x\`
+Automated alternative (if the workstation can SSH to both vault and target):
+\`\`\`bash
+${SSH_CMD_STR} ${ADMIN_USER}@${CT_IP} vault-ca trust-bundle | ssh root@<target-ip> 'bash -s'
+\`\`\`
+
+### 4. Daily use
+
+\`\`\`bash
+ca-sign                    # fetch fresh 8h certificate
+ssh root@<target-ip>       # OpenSSH picks up the cert automatically
+\`\`\`
+
+### Appendix — ca-sign wrapper source
+
+Fallback for workstations that cannot SSH to the vault. Save as
+\`~/.local/bin/ca-sign\` and \`chmod +x\`. Otherwise use step 2 above.
 
 \`\`\`bash
 ${CA_SIGN_CONTENT}
