@@ -196,6 +196,22 @@ fi
 [[ "$ADMIN_USER" != "root" ]] || { echo "  ERROR: ADMIN_USER must not be root." >&2; exit 1; }
 [[ "$ADMIN_USER" != "sshca" ]] || { echo "  ERROR: ADMIN_USER must not be 'sshca' (reserved for CA owner)." >&2; exit 1; }
 
+# ADMIN_SHELL and ADMIN_COMMENT are interpolated into 'bash -lc "..."'
+# blocks below — often inside single-quoted strings passed through another
+# shell. A stray quote, newline, or backslash would break the generated
+# command. Not a remote-exploit concern in normal use, but the config
+# section is explicitly operator-editable, so validate defensively.
+[[ "$ADMIN_SHELL" =~ ^/[A-Za-z0-9._/+:-]+$ ]] \
+  || { echo "  ERROR: ADMIN_SHELL must be an absolute path matching ^/[A-Za-z0-9._/+:-]+$: $ADMIN_SHELL" >&2; exit 1; }
+if [[ "$ADMIN_COMMENT" == *\'*  \
+   || "$ADMIN_COMMENT" == *\"*  \
+   || "$ADMIN_COMMENT" == *\\*  \
+   || "$ADMIN_COMMENT" == *$'\n'* \
+   || "$ADMIN_COMMENT" == *$'\r'* ]]; then
+  echo "  ERROR: ADMIN_COMMENT must not contain quotes, backslashes, or newlines." >&2
+  exit 1
+fi
+
 # ADMIN_SSH_PUBKEY: resolve (file-or-literal), sanity-check, and validate.
 # Produces ADMIN_PUBKEY_LINE, consumed later by the seeding step. Empty
 # when ADMIN_SSH_PUBKEY is empty — that keeps the console-paste flow.
@@ -534,13 +550,14 @@ pct exec "$CT_ID" -- bash -lc '
 
 # ── Base + vault-ca packages ──────────────────────────────────────────────────
 # openssh-server is deliberately KEPT — this is a login host. openssh-client
-# is needed for the 'trust' and 'krl deploy' verbs. man-db stays for on-box
-# ssh/ssh-keygen/sshd_config references when debugging at 2am.
+# is needed for the 'trust' and 'krl deploy' verbs. man-db + manpages stay
+# on-box so ssh(1), ssh-keygen(1), sshd_config(5) are available when
+# debugging at 2am without outbound network access.
 pct exec "$CT_ID" -- bash -lc '
   set -euo pipefail
   export DEBIAN_FRONTEND=noninteractive
   apt-get install -y --no-install-recommends \
-    openssh-server openssh-client sudo ca-certificates
+    openssh-server openssh-client sudo ca-certificates man-db manpages
 '
 
 # ── Remove unnecessary services (postfix only; keep SSH) ──────────────────────
@@ -709,7 +726,10 @@ pct exec "$CT_ID" -- bash -lc '
   install -d -m 0755 -o root  -g root  /usr/local/lib/vault-ca
   install -d -m 0755 -o root  -g root  /usr/local/share/vault-ca
   install -d -m 0755 -o root  -g root  /etc/vault-ca
-  # Audit log: append-only by anyone who can resolve sshca (only root + sshca can write)
+  # Audit log: operational logging, not tamper-resistant forensic logging.
+  # sshca owns it so the signer can append without sudo. This means the same
+  # account that holds the CA private key can also rewrite its own trail;
+  # accept that trade-off here and rely on PBS snapshots for off-box audit.
   : >> /var/log/vault-ca.log
   chown sshca:adm /var/log/vault-ca.log
   chmod 0640 /var/log/vault-ca.log
@@ -1194,6 +1214,7 @@ cmd_fingerprint() {
 _emit_trust_script() {
   [[ -f "$CA_PUB" ]] || die "CA not initialised (no ${CA_PUB})"
   local ca_pub_b64
+  # Debian/coreutils assumption: base64 supports -w0 (no line-wrap).
   ca_pub_b64="$(base64 -w0 "$CA_PUB")"
   local stamp; stamp="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
@@ -1211,7 +1232,14 @@ TRUST_HEADER
 TRUST_PUB="/etc/ssh/ssh-ca-user.pub"
 TRUST_CONF="/etc/ssh/sshd_config.d/20-ssh-ca.conf"
 TRUST_KRL="/etc/ssh/ssh-ca-krl"
+SSHD_MAIN="/etc/ssh/sshd_config"
 SUFFIX=".vault-ca.pre-$(date +%s)"
+
+# Sentinel wrapping any Include line we add. On untrust/rollback we only
+# touch lines between these markers — we never rewrite pre-existing Include
+# lines the operator or distro put there.
+INCLUDE_BEGIN="# BEGIN vault-ca Include (added by trust-bundle)"
+INCLUDE_END="# END vault-ca Include"
 
 # Run a command with root privileges. If already root, exec directly (works
 # on minimal images without sudo installed). Otherwise use sudo -n so the
@@ -1239,7 +1267,8 @@ if RUN test -f "$TRUST_PUB"; then
   fi
 fi
 
-# Back up anything we might touch.
+# Back up anything we might touch. sshd_config is backed up separately
+# because we only modify it when the Include directive is missing.
 BACKED_UP=()
 for f in "$TRUST_PUB" "$TRUST_CONF" "$TRUST_KRL"; do
   if RUN test -f "$f"; then
@@ -1247,6 +1276,37 @@ for f in "$TRUST_PUB" "$TRUST_CONF" "$TRUST_KRL"; do
     BACKED_UP+=("$f")
   fi
 done
+
+# Decide whether we need to touch sshd_config. A drop-in at
+# /etc/ssh/sshd_config.d/20-ssh-ca.conf is ONLY honoured if sshd_config
+# contains a matching 'Include /etc/ssh/sshd_config.d/*.conf' directive.
+# Without it, the installer can pass 'sshd -t', reload ssh, and still
+# leave CA auth inactive — so this check is mandatory, not cosmetic.
+SSHD_MAIN_BACKED_UP=0
+INCLUDE_ADDED=0
+if RUN test -f "$SSHD_MAIN"; then
+  # Match any Include line pointing at sshd_config.d with a *.conf glob
+  # (the only form that will actually pick up our 20-ssh-ca.conf drop-in).
+  # Absolute or relative path both count; commented (#-prefixed) lines
+  # don't. A narrower Include (one specific file, no glob) is treated as
+  # "no matching Include" — adding our own then results in two Include
+  # directives, which sshd accepts fine.
+  if ! RUN grep -Eq '^[[:space:]]*Include[[:space:]]+(/etc/ssh/)?sshd_config\.d/\*\.conf([[:space:]]|$)' "$SSHD_MAIN"; then
+    RUN cp -p "$SSHD_MAIN" "${SSHD_MAIN}${SUFFIX}"
+    SSHD_MAIN_BACKED_UP=1
+    # Append the Include line wrapped in sentinels so untrust/rollback can
+    # remove exactly what we added without touching anything else.
+    RUN tee -a "$SSHD_MAIN" >/dev/null <<INCLUDE
+${INCLUDE_BEGIN}
+Include /etc/ssh/sshd_config.d/*.conf
+${INCLUDE_END}
+INCLUDE
+    INCLUDE_ADDED=1
+  fi
+else
+  echo "  ERROR: $SSHD_MAIN not found — is openssh-server installed?" >&2
+  exit 1
+fi
 
 _rollback_fired=0
 rollback() {
@@ -1261,6 +1321,9 @@ rollback() {
       RUN mv "${f}${SUFFIX}" "$f" 2>/dev/null || true
     fi
   done
+  if (( SSHD_MAIN_BACKED_UP )) && RUN test -f "${SSHD_MAIN}${SUFFIX}"; then
+    RUN mv "${SSHD_MAIN}${SUFFIX}" "$SSHD_MAIN" 2>/dev/null || true
+  fi
 }
 
 # Any unhandled error after this point fires rollback and exits.
@@ -1293,6 +1356,7 @@ if ! RUN sshd -t 2>&1; then
   exit 1
 fi
 
+# Debian target assumption: OpenSSH service name is 'ssh' here, not 'sshd'.
 RUN systemctl reload ssh 2>/dev/null || RUN systemctl restart ssh
 
 # Success: disarm trap and prune backups.
@@ -1300,7 +1364,13 @@ trap - ERR
 for f in "${BACKED_UP[@]}"; do
   RUN rm -f "${f}${SUFFIX}" 2>/dev/null || true
 done
+if (( SSHD_MAIN_BACKED_UP )); then
+  RUN rm -f "${SSHD_MAIN}${SUFFIX}" 2>/dev/null || true
+fi
 
+if (( INCLUDE_ADDED )); then
+  echo "  Added 'Include /etc/ssh/sshd_config.d/*.conf' to $SSHD_MAIN"
+fi
 echo "  CA trust applied on $(hostname -s 2>/dev/null || hostname)"
 TRUST_BODY
 }
@@ -1308,6 +1378,7 @@ TRUST_BODY
 _emit_untrust_script() {
   [[ -f "$CA_PUB" ]] || die "CA not initialised (no ${CA_PUB})"
   local ca_pub_b64
+  # Debian/coreutils assumption: base64 supports -w0 (no line-wrap).
   ca_pub_b64="$(base64 -w0 "$CA_PUB")"
   local stamp; stamp="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
@@ -1324,7 +1395,11 @@ UNTRUST_HEADER
 TRUST_PUB="/etc/ssh/ssh-ca-user.pub"
 TRUST_CONF="/etc/ssh/sshd_config.d/20-ssh-ca.conf"
 TRUST_KRL="/etc/ssh/ssh-ca-krl"
+SSHD_MAIN="/etc/ssh/sshd_config"
 SUFFIX=".vault-ca.pre-$(date +%s)"
+
+INCLUDE_BEGIN="# BEGIN vault-ca Include (added by trust-bundle)"
+INCLUDE_END="# END vault-ca Include"
 
 RUN() {
   if [[ $EUID -eq 0 ]]; then
@@ -1355,6 +1430,25 @@ for f in "$TRUST_PUB" "$TRUST_CONF" "$TRUST_KRL"; do
   fi
 done
 
+# If trust-bundle added an Include block on this target, remove it. We
+# match only the sentinel-wrapped block — any Include the operator or
+# distro put there stands untouched.
+SSHD_MAIN_BACKED_UP=0
+INCLUDE_REMOVED=0
+if RUN test -f "$SSHD_MAIN" \
+   && RUN grep -qxF "$INCLUDE_BEGIN" "$SSHD_MAIN" 2>/dev/null; then
+  RUN cp -p "$SSHD_MAIN" "${SSHD_MAIN}${SUFFIX}"
+  SSHD_MAIN_BACKED_UP=1
+  # sed /BEGIN/,/END/d removes the sentinels and everything between them.
+  # Use a tempfile + mv instead of sed -i to preserve mode/owner precisely.
+  tmp_sshd="$(RUN mktemp "${SSHD_MAIN}.vault-ca.XXXXXX")"
+  RUN sh -c "sed '\|$INCLUDE_BEGIN|,\|$INCLUDE_END|d' \"\$1\" > \"\$2\"" _ "$SSHD_MAIN" "$tmp_sshd"
+  RUN chmod --reference="$SSHD_MAIN" "$tmp_sshd"
+  RUN chown --reference="$SSHD_MAIN" "$tmp_sshd"
+  RUN mv "$tmp_sshd" "$SSHD_MAIN"
+  INCLUDE_REMOVED=1
+fi
+
 _rollback_fired=0
 rollback() {
   (( _rollback_fired )) && return
@@ -1365,6 +1459,9 @@ rollback() {
   for f in "${BACKED_UP[@]}"; do
     RUN mv "${f}${SUFFIX}" "$f" 2>/dev/null || true
   done
+  if (( SSHD_MAIN_BACKED_UP )) && RUN test -f "${SSHD_MAIN}${SUFFIX}"; then
+    RUN mv "${SSHD_MAIN}${SUFFIX}" "$SSHD_MAIN" 2>/dev/null || true
+  fi
 }
 
 trap 'rollback; exit 1' ERR
@@ -1377,19 +1474,27 @@ if ! RUN sshd -t 2>&1; then
   exit 1
 fi
 
+# Debian target assumption: OpenSSH service name is 'ssh' here, not 'sshd'.
 RUN systemctl reload ssh 2>/dev/null || RUN systemctl restart ssh
 
 trap - ERR
 for f in "${BACKED_UP[@]}"; do
   RUN rm -f "${f}${SUFFIX}" 2>/dev/null || true
 done
+if (( SSHD_MAIN_BACKED_UP )); then
+  RUN rm -f "${SSHD_MAIN}${SUFFIX}" 2>/dev/null || true
+fi
 
+if (( INCLUDE_REMOVED )); then
+  echo "  Removed vault-ca Include block from $SSHD_MAIN"
+fi
 echo "  CA trust removed on $(hostname -s 2>/dev/null || hostname)"
 UNTRUST_BODY
 }
 
 _emit_krl_script() {
   local krl_b64
+  # Debian/coreutils assumption: base64 supports -w0 (no line-wrap).
   krl_b64="$(sudo -n -u sshca "$KRL_BIN" cat-krl | base64 -w0)"
   local stamp; stamp="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
@@ -1447,6 +1552,7 @@ if ! RUN sshd -t 2>&1; then
   exit 1
 fi
 
+# Debian target assumption: OpenSSH service name is 'ssh' here, not 'sshd'.
 RUN systemctl reload ssh 2>/dev/null || RUN systemctl restart ssh
 
 trap - ERR
@@ -1788,7 +1894,11 @@ SSHD_SRC="${HOST_TMPDIR}/10-vault-ca-hardening.conf"
 pct exec "$CT_ID" -- bash -lc "
   set -euo pipefail
   mkdir -p /etc/ssh/sshd_config.d
-  if ! grep -Eq '^[[:space:]]*Include[[:space:]]+/etc/ssh/sshd_config\.d/[^[:space:]]+\.conf([[:space:]]|\$)' /etc/ssh/sshd_config; then
+  # Require a *.conf glob — same rule trust-bundle enforces on targets.
+  # A narrower Include (single specific file) would silently orphan our
+  # drop-in, so treat it as 'no matching Include' and append our own;
+  # sshd accepts multiple Include directives fine.
+  if ! grep -Eq '^[[:space:]]*Include[[:space:]]+(/etc/ssh/)?sshd_config\.d/\*\.conf([[:space:]]|\$)' /etc/ssh/sshd_config; then
     printf '\nInclude /etc/ssh/sshd_config.d/*.conf\n' >> /etc/ssh/sshd_config
   fi
 "
@@ -1845,7 +1955,28 @@ pct exec "$CT_ID" -- bash -lc "
     printf '%s\n' \"\$probe_out\" | sed 's/^/    /' >&2
     exit 1
   fi
-  echo '  Verification: sshd active, CA initialised, admin->sshca sudo path OK.'
+
+  # Smoke-test the generated helper outputs admins will actually use.
+  # Each invocation exercises a different render path:
+  #   help            — placeholder substitution (__SSH_CMD__ / __VAULT_USER__ / __VAULT_HOST__)
+  #   show-ca-pub     — CA_PUB readable, ownership/mode intact
+  #   client-wrapper  — WRAPPER_SRC installed and readable
+  #   trust-bundle    — CA_PUB → base64 → script template
+  #   krl-bundle      — sudo -u sshca → KRL_BIN cat-krl → base64 → script template
+  # A failure here means an operator-facing command is broken at deploy time,
+  # which is a better readiness signal than static lint.
+  '${VAULT_CA_BIN}' help >/dev/null \
+    || { echo '  ERROR: vault-ca help failed.' >&2; exit 1; }
+  '${VAULT_CA_BIN}' show-ca-pub >/dev/null \
+    || { echo '  ERROR: vault-ca show-ca-pub failed.' >&2; exit 1; }
+  '${VAULT_CA_BIN}' client-wrapper >/dev/null \
+    || { echo '  ERROR: vault-ca client-wrapper failed.' >&2; exit 1; }
+  '${VAULT_CA_BIN}' trust-bundle >/dev/null \
+    || { echo '  ERROR: vault-ca trust-bundle failed.' >&2; exit 1; }
+  '${VAULT_CA_BIN}' krl-bundle >/dev/null \
+    || { echo '  ERROR: vault-ca krl-bundle failed.' >&2; exit 1; }
+
+  echo '  Verification: sshd active, CA initialised, admin->sshca sudo path OK, helper outputs render.'
 "
 
 # ── Cleanup packages ──────────────────────────────────────────────────────────
@@ -1922,21 +2053,24 @@ pct exec "$CT_ID" -- bash -lc '
 # Minimal at-a-glance description: a one-line header outside <details>, and
 # inside <details> a sequenced, command-first walkthrough — workstation
 # setup first (authorize key, install ca-sign), then per-target onboarding,
-# then daily use. The ca-sign wrapper source is kept at the bottom as a
-# paste-fallback for air-gapped workstations that can't SSH to the vault.
-# CA pubkey and wrapper source are both fetched from the CT so the
-# description stays authoritative after any in-CT change. Everything else
-# (fingerprint, audit log path, defaults) is surfaced by \`vault-ca help\`
-# and the post-install bootstrap summary.
-CA_PUB_CONTENT="$(pct exec "$CT_ID" -- cat "${CA_PUB}")"
+# then daily use. The trust installer and ca-sign wrapper source are kept
+# at the bottom as paste-fallbacks for isolated workstations/targets.
+# All three (CA pubkey, trust installer, wrapper) are fetched from the CT
+# so the description stays authoritative after any in-CT change — in
+# particular, the embedded trust installer is byte-for-byte the output of
+# `vault-ca trust-bundle`, so the documented fallback matches the real
+# installer (backup, FORCE gate, sshd_config Include handling, rollback).
+# Everything else (fingerprint, audit log path, defaults) is surfaced by
+# \`vault-ca help\` and the post-install bootstrap summary.
 CA_SIGN_CONTENT="$(pct exec "$CT_ID" -- cat "${VAULT_CA_WRAPPER}")"
+TRUST_BUNDLE_CONTENT="$(pct exec "$CT_ID" -- "${VAULT_CA_BIN}" trust-bundle)"
 
 # Heredoc is unquoted on purpose: \${VARS} expand once, and \` gives literal
-# backticks for the markdown code fences. The interpolated wrapper content
-# is NOT re-parsed — any \$VAR or \$(...) inside it stays literal. The
-# inner heredoc delimiters PUBKEY_EOF / CONF_EOF are plain text at this
-# layer; they only become active when the user pastes the block into bash
-# on a target.
+# backticks for the markdown code fences. The interpolated wrapper and
+# trust-bundle contents are NOT re-parsed — any \$VAR or \$(...) inside
+# them stays literal as variable content. (Trust-bundle itself contains
+# heredoc delimiters like TRUST_BODY / CONF; those are inert at this
+# layer and only become active when the user pastes the block on a target.)
 VAULT_CA_DESC="$(cat <<EOF_DESC
 Vault-CA LXC (${CT_IP}) — ssh${SSH_PORT_ARG} ${ADMIN_USER}@${CT_IP}
 <details><summary>Setup &amp; onboarding commands</summary>
@@ -1967,7 +2101,7 @@ chmod 600 ~/.ssh/authorized_keys
 exit
 \`\`\`
 
-Exit the console with \`Ctrl-]\`. Verify from your workstation:
+Exit the console with \`Ctrl-a q\`. Verify from your workstation:
 \`\`\`bash
 ${SSH_CMD_STR} ${ADMIN_USER}@${CT_IP} hostname
 \`\`\`
@@ -1998,32 +2132,27 @@ ${SSH_CMD_STR} ${ADMIN_USER}@${CT_IP} vault-ca trust-bundle | ssh root@<target-i
 **Fallback — manual paste.** Use when the workstation can't SSH to the target
 (isolated network, no sshd yet, bootstrapping from console, etc.). Get a root
 shell on the target (SSH, \`pct console\`, or physical console), then paste the
-block below. Self-contained — the CA pubkey is baked in, no network call to
-the vault. Mirrors \`vault-ca trust-bundle\` byte-for-byte.
-
-\`\`\`bash
-cat > /etc/ssh/ssh-ca-user.pub <<'PUBKEY_EOF'
-${CA_PUB_CONTENT}
-PUBKEY_EOF
-chmod 0644 /etc/ssh/ssh-ca-user.pub
-
-touch /etc/ssh/ssh-ca-krl
-chmod 0644 /etc/ssh/ssh-ca-krl
-
-install -d -m 0755 /etc/ssh/sshd_config.d
-cat > /etc/ssh/sshd_config.d/20-ssh-ca.conf <<'CONF_EOF'
-TrustedUserCAKeys /etc/ssh/ssh-ca-user.pub
-RevokedKeys /etc/ssh/ssh-ca-krl
-CONF_EOF
-
-sshd -t && { systemctl reload ssh 2>/dev/null || systemctl restart ssh; }
-\`\`\`
+**Trust installer** from the appendix below. The installer is byte-for-byte
+equivalent to what \`vault-ca trust-bundle\` emits over SSH — the CA pubkey is
+baked in, it backs up what it touches, refuses to clobber a different CA
+(unless \`FORCE=1\`), adds the \`Include\` line to \`sshd_config\` if missing,
+and rolls back on any failure.
 
 ### 4. Daily use
 
 \`\`\`bash
 ca-sign                    # fetch fresh 8h certificate
 ssh root@<target-ip>       # OpenSSH picks up the cert automatically
+\`\`\`
+
+### Appendix — Trust installer (fallback for step 3)
+
+Paste this into a root shell on the target. Equivalent to running
+\`${SSH_CMD_STR} ${ADMIN_USER}@${CT_IP} vault-ca trust-bundle | ssh root@<target> 'bash -s'\`
+from a workstation that can reach both sides.
+
+\`\`\`bash
+${TRUST_BUNDLE_CONTENT}
 \`\`\`
 
 ### Appendix — ca-sign wrapper source
