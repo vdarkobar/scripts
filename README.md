@@ -17,6 +17,12 @@
 </details>
 
 <details>
+  <summary>Vault CA</summary>
+  <p>Adds SSH key management for cloud servers.</p>
+  <pre><code>bash &lt;(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/bash/vault-ca.sh)</code></pre>
+</details>
+
+<details>
   <summary>Vault</summary>
   <p>Adds SSH key management for cloud servers.</p>
   <pre><code>bash &lt;(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/bash/vault-lxc.sh)</code></pre>
