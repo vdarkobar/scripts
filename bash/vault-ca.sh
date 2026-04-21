@@ -1041,7 +1041,9 @@ cmd_list() {
   else
     # No jq: filter then tail, same intent. Use -F for a literal match on
     # the compact JSON key/value the signer emits — not a content match.
-    grep -F '"event":"sign"' "$AUDIT_LOG" | tail -n "$num"
+    # '|| true' neutralises grep's exit 1 when no sign events exist yet,
+    # which would otherwise abort the pipeline under 'set -o pipefail'.
+    { grep -F '"event":"sign"' "$AUDIT_LOG" || true; } | tail -n "$num"
   fi
 }
 
@@ -1504,9 +1506,16 @@ cat > "$WRAPPER_SRC_FILE" <<'WRAPPER_EOF'
 #   -h, --help                show this help
 #
 # Environment overrides:
-#   VAULT_CA_HOST     hostname of the vault (default: __VAULT_HOST__)
+#   VAULT_CA_HOST     vault address — hostname or IP (default: __VAULT_HOST__,
+#                     the CT's IP baked in at install time so first-time
+#                     bootstrap does not depend on DNS)
 #   VAULT_CA_USER     admin user on the vault (default: __VAULT_USER__)
 #   VAULT_CA_PORT     SSH port (default: 22)
+#
+# Note:
+#   On DHCP networks the baked-in IP can drift. Reserve the CT IP on your
+#   DHCP server, or add a DNS record for the vault and export
+#   VAULT_CA_HOST=<dns-name> in your shell profile.
 #
 # Writes:
 #   <key>-cert.pub next to the private key. OpenSSH picks it up automatically
