@@ -1611,7 +1611,7 @@ cat > "$WRAPPER_SRC_FILE" <<'WRAPPER_EOF'
 #   chmod +x ~/.local/bin/ca-sign
 #
 # Usage:
-#   ca-sign                                    # defaults: ~/.ssh/id_ed25519, +8h, host label
+#   ca-sign                                    # defaults: ~/.ssh/id_ed25519, __DEFAULT_VALIDITY__, host label
 #   ca-sign -k ~/.ssh/work_ed25519             # different key
 #   ca-sign -V +4h -n root,admin               # custom validity + principals
 #   ca-sign -k ~/.ssh/id_ed25519 -l laptop-a -V +12h -n ubuntu,root
@@ -1620,7 +1620,7 @@ cat > "$WRAPPER_SRC_FILE" <<'WRAPPER_EOF'
 #   -k, --key <path>          private-key path (default: $HOME/.ssh/id_ed25519)
 #                             (you may pass the .pub path; the private path is inferred)
 #   -l, --label <str>         short identity label baked into the cert (default: hostname -s)
-#   -V, --validity <spec>     e.g. +8h, +30m, +7d (default: +8h; max enforced by vault)
+#   -V, --validity <spec>     e.g. +8h, +30m, +7d (default: __DEFAULT_VALIDITY__; max enforced by vault)
 #   -n, --principals <list>   comma-separated login names (default: vault's default)
 #   -h, --help                show this help
 #
@@ -1647,7 +1647,7 @@ VAULT_PORT="${VAULT_CA_PORT:-__VAULT_PORT__}"
 
 KEY_PATH="$HOME/.ssh/id_ed25519"
 LABEL="$(hostname -s 2>/dev/null || hostname)"
-VALIDITY="+8h"
+VALIDITY="__DEFAULT_VALIDITY__"
 PRINCIPALS=""
 
 usage() { sed -n '2,/^set -euo/ p' "$0" | sed 's/^# \{0,1\}//; /^set -euo/ d'; exit 0; }
@@ -1721,6 +1721,7 @@ sed -i \
   -e "s|__VAULT_USER__|${ADMIN_USER}|g" \
   -e "s|__VAULT_PORT__|${SSH_PORT}|g" \
   -e "s|__SSH_CMD__|${SSH_CMD_STR}|g" \
+  -e "s|__DEFAULT_VALIDITY__|${CA_DEFAULT_VALIDITY}|g" \
   "$WRAPPER_SRC_FILE"
 
 pct push "$CT_ID" "$WRAPPER_SRC_FILE" "$VAULT_CA_WRAPPER" --perms 0755
@@ -1947,6 +1948,12 @@ Run on your workstation — prints your pubkey, copy it:
 cat ~/.ssh/id_ed25519.pub
 \`\`\`
 
+If no key exists yet (or \`ssh-keygen\` is missing), create one first:
+\`\`\`bash
+apt install openssh-client
+ssh-keygen -t ed25519 -N "" -f ~/.ssh/id_ed25519
+\`\`\`
+
 Run on the PVE host — open the vault console:
 \`\`\`bash
 pct console ${CT_ID}
@@ -1981,9 +1988,18 @@ ca-sign --help
 
 ### 3. Onboard each target (one time, per target)
 
-Get a root shell on the target (SSH, \`pct console\`, or physical console), then
-paste the block below. This is self-contained — the CA pubkey is baked in, no
-network call to the vault. Mirrors \`vault-ca trust-bundle\` byte-for-byte.
+**Preferred — automated one-liner.** Run from your workstation. Requires SSH
+access to both the vault (as \`${ADMIN_USER}\`, set up in step 1) and the target
+(as \`root\`). Replace \`<target-ip>\` with the actual target:
+\`\`\`bash
+${SSH_CMD_STR} ${ADMIN_USER}@${CT_IP} vault-ca trust-bundle | ssh root@<target-ip> 'bash -s'
+\`\`\`
+
+**Fallback — manual paste.** Use when the workstation can't SSH to the target
+(isolated network, no sshd yet, bootstrapping from console, etc.). Get a root
+shell on the target (SSH, \`pct console\`, or physical console), then paste the
+block below. Self-contained — the CA pubkey is baked in, no network call to
+the vault. Mirrors \`vault-ca trust-bundle\` byte-for-byte.
 
 \`\`\`bash
 cat > /etc/ssh/ssh-ca-user.pub <<'PUBKEY_EOF'
@@ -2001,11 +2017,6 @@ RevokedKeys /etc/ssh/ssh-ca-krl
 CONF_EOF
 
 sshd -t && { systemctl reload ssh 2>/dev/null || systemctl restart ssh; }
-\`\`\`
-
-Automated alternative (if the workstation can SSH to both vault and target):
-\`\`\`bash
-${SSH_CMD_STR} ${ADMIN_USER}@${CT_IP} vault-ca trust-bundle | ssh root@<target-ip> 'bash -s'
 \`\`\`
 
 ### 4. Daily use
