@@ -18,7 +18,7 @@
 
 <details>
   <summary>Vault CA</summary>
-  <p>Adds SSH key management for cloud servers.</p>
+  <p>Adds SSH certificate authority for homelab servers.</p>
   <pre><code>bash &lt;(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/bash/vault-ca.sh)</code></pre>
 </details>
 
