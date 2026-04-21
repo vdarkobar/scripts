@@ -1918,22 +1918,58 @@ pct exec "$CT_ID" -- bash -lc '
 '
 
 # ── Proxmox UI description ────────────────────────────────────────────────────
-CA_FPR_LINE="$(pct exec "$CT_ID" -- bash -lc "ssh-keygen -l -E sha256 -f '${CA_PUB}' 2>/dev/null" | head -n1)"
-VAULT_CA_DESC="Vault-CA LXC (${CT_IP}) — ssh${SSH_PORT_ARG} ${ADMIN_USER}@${CT_IP}
-<details><summary>Details</summary>Debian ${DEBIAN_VERSION} SSH Certificate Authority
-Admin user: ${ADMIN_USER}
-SSH port: ${SSH_PORT}
-CA owner: sshca system user (CA key at ${CA_KEY})
-CA fingerprint: ${CA_FPR_LINE}
-Default validity: ${CA_DEFAULT_VALIDITY} (max $(( CA_MAX_VALIDITY_SEC / 3600 ))h)
-Default principals: ${CA_DEFAULT_PRINCIPALS}
-Helper: ${VAULT_CA_BIN}
-Audit log: ${AUDIT_LOG}
-Workstation wrapper: ssh${SSH_PORT_ARG} ${ADMIN_USER}@${CT_IP} vault-ca client-wrapper
-$( [[ -n "$ADMIN_PUBKEY_LINE" ]] \
-     && echo "Inbound SSH: pubkey pre-seeded in /home/${ADMIN_USER}/.ssh/authorized_keys" \
-     || echo "Inbound SSH: locked until a key is added to /home/${ADMIN_USER}/.ssh/authorized_keys" )
-Created by vault-ca.sh</details>"
+# Minimal at-a-glance description: a one-line header outside <details>, and
+# inside <details> just the two copy-paste artifacts operators actually use —
+# a ready-to-execute manual CA install block (mirroring trust-bundle byte-for-
+# byte) and the ca-sign wrapper source. Both pull their payloads verbatim
+# from the CT so the description stays authoritative after any in-CT change.
+# Everything else (fingerprint, audit log path, defaults) is surfaced by
+# `vault-ca help` and the post-install bootstrap summary.
+CA_PUB_CONTENT="$(pct exec "$CT_ID" -- cat "${CA_PUB}")"
+CA_SIGN_CONTENT="$(pct exec "$CT_ID" -- cat "${VAULT_CA_WRAPPER}")"
+
+# Heredoc is unquoted on purpose: ${VARS} expand once, and \` gives literal
+# backticks for the markdown code fences. The interpolated wrapper content
+# is NOT re-parsed — any \$VAR or \$(...) inside it stays literal. The
+# inner heredoc delimiters PUBKEY_EOF / CONF_EOF are plain text at this
+# layer; they only become active when the user pastes the block into bash
+# on a target.
+VAULT_CA_DESC="$(cat <<EOF_DESC
+Vault-CA LXC (${CT_IP}) — ssh${SSH_PORT_ARG} ${ADMIN_USER}@${CT_IP}
+<details><summary>CA install commands &amp; ca-sign wrapper</summary>
+
+**Install CA trust on a target** — run as root on each target. Mirrors
+\`vault-ca trust-bundle\` (same files, same modes, same sshd drop-in, same
+validation and reload).
+Automated shortcut: \`${SSH_CMD_STR} ${ADMIN_USER}@${CT_IP} vault-ca trust-bundle | ssh root@target 'bash -s'\`
+
+\`\`\`bash
+cat > /etc/ssh/ssh-ca-user.pub <<'PUBKEY_EOF'
+${CA_PUB_CONTENT}
+PUBKEY_EOF
+chmod 0644 /etc/ssh/ssh-ca-user.pub
+
+touch /etc/ssh/ssh-ca-krl
+chmod 0644 /etc/ssh/ssh-ca-krl
+
+install -d -m 0755 /etc/ssh/sshd_config.d
+cat > /etc/ssh/sshd_config.d/20-ssh-ca.conf <<'CONF_EOF'
+TrustedUserCAKeys /etc/ssh/ssh-ca-user.pub
+RevokedKeys /etc/ssh/ssh-ca-krl
+CONF_EOF
+
+sshd -t && { systemctl reload ssh 2>/dev/null || systemctl restart ssh; }
+\`\`\`
+
+**ca-sign wrapper** — save on your workstation as \`~/.local/bin/ca-sign\` and \`chmod +x\`
+
+\`\`\`bash
+${CA_SIGN_CONTENT}
+\`\`\`
+
+</details>
+EOF_DESC
+)"
 pct set "$CT_ID" --description "$VAULT_CA_DESC"
 
 # ── Protect container ─────────────────────────────────────────────────────────
