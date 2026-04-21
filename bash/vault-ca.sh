@@ -238,7 +238,7 @@ cat <<EOF2
   CA default principals: $CA_DEFAULT_PRINCIPALS
   ────────────────────────────────────────
   After this script runs:
-    • CA keypair is generated on first boot (sshca user owns it).
+    • CA keypair is generated during provisioning (sshca user owns it).
     • Admin can sign certs via 'vault-ca sign ...'.
     • Inbound SSH stays locked until you add a key to:
         /home/$ADMIN_USER/.ssh/authorized_keys
@@ -333,7 +333,7 @@ fi
 
 ADMIN_PASSWORD=""
 while true; do
-  read -r -s -p "  Set local login/sudo password for ${ADMIN_USER}: " PW1; echo
+  read -r -s -p "  Set local console/login password for ${ADMIN_USER}: " PW1; echo
   [[ -n "$PW1" ]] || { echo "  Password cannot be blank."; continue; }
   [[ "$PW1" != *" "* ]] || { echo "  Password cannot contain spaces."; continue; }
   [[ "$PW1" != *:* ]] || { echo "  Password cannot contain a colon (chpasswd uses user:password)."; continue; }
@@ -689,8 +689,10 @@ ssh-keygen -l -f "$PUBKEY_PATH" >/dev/null 2>&1 \
   || { echo "  ERROR: $PUBKEY_PATH is not a valid SSH public key" >&2; exit 1; }
 FPR="$(ssh-keygen -l -E sha256 -f "$PUBKEY_PATH" | awk '{print $2}')"
 
-# Reject already-signed certificates — we sign raw pubkeys only.
-if grep -qE '^(ssh|ecdsa)-[a-z0-9-]+-cert-v[0-9]+@openssh\.com ' "$PUBKEY_PATH"; then
+# Reject already-signed certificates — we sign raw pubkeys only. The
+# (sk-)? prefix accepts FIDO/U2F-backed cert algorithms like
+# sk-ssh-ed25519-cert-v01@openssh.com and sk-ecdsa-sha2-nistp256-cert-v01@openssh.com.
+if grep -qE '^(sk-)?(ssh|ecdsa)-[a-z0-9-]+-cert-v[0-9]+@openssh\.com ' "$PUBKEY_PATH"; then
   echo "  ERROR: input is already a certificate; sign raw pubkeys only" >&2
   exit 1
 fi
@@ -913,20 +915,20 @@ Sign options:
 
 Examples (from your workstation):
   # One-time setup: install the client wrapper.
-  ssh admin@vault vault-ca client-wrapper > ~/.local/bin/ca-sign && chmod +x ~/.local/bin/ca-sign
+  ssh __VAULT_USER__@__VAULT_HOST__ vault-ca client-wrapper > ~/.local/bin/ca-sign && chmod +x ~/.local/bin/ca-sign
 
   # Sign a cert valid for +8h with default principals (root,admin).
   ca-sign
 
   # Trust the CA on a target (works even when vault has no outbound SSH):
-  ssh admin@vault vault-ca trust-bundle | ssh root@web1.lab 'bash -s'
+  ssh __VAULT_USER__@__VAULT_HOST__ vault-ca trust-bundle | ssh root@web1.lab 'bash -s'
 
   # Overwrite an existing different CA trust on a target:
-  ssh admin@vault vault-ca trust-bundle | ssh root@web1.lab 'FORCE=1 bash -s'
+  ssh __VAULT_USER__@__VAULT_HOST__ vault-ca trust-bundle | ssh root@web1.lab 'FORCE=1 bash -s'
 
   # Revoke serial 42 and push the updated KRL out:
-  ssh admin@vault vault-ca revoke 42
-  ssh admin@vault vault-ca krl-bundle | ssh root@web1.lab 'bash -s'
+  ssh __VAULT_USER__@__VAULT_HOST__ vault-ca revoke 42
+  ssh __VAULT_USER__@__VAULT_HOST__ vault-ca krl-bundle | ssh root@web1.lab 'bash -s'
 USAGE
 }
 
@@ -937,9 +939,10 @@ cmd_init() {
     ssh-keygen -l -f "${CA_DIR}/ca_user_key.pub" 2>/dev/null | sed 's/^/  /'
     return 0
   fi
-  # Need root to run ssh-keygen as sshca
+  # Need root to run ssh-keygen as sshca. admin has no sudo on this host,
+  # so the escalation path is from the PVE host (pct exec/pct enter).
   if [[ $EUID -ne 0 ]]; then
-    die "init must be run as root (e.g. via 'sudo vault-ca init')"
+    die "init must be run as root — from the PVE host: 'pct exec <CTID> -- vault-ca init', or 'pct enter <CTID>' then run as root"
   fi
   install -d -m 0750 -o sshca -g sshca "$CA_DIR"
   sudo -n -u sshca ssh-keygen -q -t ed25519 \
@@ -1026,13 +1029,19 @@ cmd_list() {
     {
       printf '  %-20s %-12s %-42s %-16s %-8s %-6s %s\n' \
         "TIME" "OPERATOR" "IDENTITY" "PRINCIPALS" "VALIDITY" "SERIAL" "FINGERPRINT"
-      tail -n "$num" "$AUDIT_LOG" | jq -r '
+      # Filter to sign events FIRST, then take the last N. tail-then-filter
+      # would return fewer than N when revokes/unrevokes are interleaved.
+      jq -r '
         select(.event == "sign") |
         [.ts, .operator, .identity, .principals, .validity, .serial, .fingerprint] | @tsv
-      ' | awk -F'\t' '{ printf "  %-20s %-12s %-42s %-16s %-8s %-6s %s\n", $1, $2, $3, $4, $5, $6, $7 }'
+      ' "$AUDIT_LOG" \
+        | tail -n "$num" \
+        | awk -F'\t' '{ printf "  %-20s %-12s %-42s %-16s %-8s %-6s %s\n", $1, $2, $3, $4, $5, $6, $7 }'
     }
   else
-    tail -n "$num" "$AUDIT_LOG"
+    # No jq: filter then tail, same intent. Use -F for a literal match on
+    # the compact JSON key/value the signer emits — not a content match.
+    grep -F '"event":"sign"' "$AUDIT_LOG" | tail -n "$num"
   fi
 }
 
@@ -1056,7 +1065,7 @@ cmd_fingerprint() {
 # The vault builds a self-contained installer script with the CA pubkey (or
 # KRL) base64-baked in. From the workstation:
 #
-#   ssh admin@vault vault-ca trust-bundle | ssh root@target 'bash -s'
+#   ssh __VAULT_USER__@__VAULT_HOST__ vault-ca trust-bundle | ssh root@target 'bash -s'
 #
 # …which requires no outbound SSH on the vault. The 'trust'/'untrust'/'krl
 # deploy' verbs are thin convenience wrappers that pipe the bundle to ssh
@@ -1072,7 +1081,7 @@ _emit_trust_script() {
 #!/usr/bin/env bash
 # vault-ca trust installer — generated ${stamp}
 # Run with: ssh root@target 'bash -s' < this-script
-#           (or pipe from: ssh admin@vault vault-ca trust-bundle | ssh root@target 'bash -s')
+#           (or pipe from: ssh __VAULT_USER__@__VAULT_HOST__ vault-ca trust-bundle | ssh root@target 'bash -s')
 # Env:  FORCE=1  overwrite an existing different CA pubkey on the target.
 set -Eeuo pipefail
 CA_PUB_B64='${ca_pub_b64}'
@@ -1345,7 +1354,7 @@ cmd_trust() {
   local target="${1:-}" port=""
   [[ -n "$target" ]] || die "Usage: vault-ca trust <user@host> [--port N]
   Or pipe a bundle from your workstation (no outbound SSH needed on vault):
-    ssh admin@vault vault-ca trust-bundle | ssh <user@host> 'bash -s'"
+    ssh __VAULT_USER__@__VAULT_HOST__ vault-ca trust-bundle | ssh <user@host> 'bash -s'"
   shift
   while (( $# > 0 )); do
     case "$1" in
@@ -1361,7 +1370,7 @@ cmd_untrust() {
   local target="${1:-}" port=""
   [[ -n "$target" ]] || die "Usage: vault-ca untrust <user@host> [--port N]
   Or pipe a bundle from your workstation (no outbound SSH needed on vault):
-    ssh admin@vault vault-ca untrust-bundle | ssh <user@host> 'bash -s'"
+    ssh __VAULT_USER__@__VAULT_HOST__ vault-ca untrust-bundle | ssh <user@host> 'bash -s'"
   shift
   while (( $# > 0 )); do
     case "$1" in
@@ -1371,6 +1380,22 @@ cmd_untrust() {
   done
   [[ -n "$port" ]] && { [[ "$port" =~ ^[0-9]+$ ]] || die "invalid --port"; }
   _pipe_bundle_to_target _emit_untrust_script "$target" "$port"
+}
+
+cmd_krl_deploy() {
+  local target="${1:-}" port=""
+  [[ -n "$target" ]] || die "Usage: vault-ca krl deploy <user@host> [--port N]
+  Or pipe a bundle from your workstation (no outbound SSH needed on vault):
+    ssh __VAULT_USER__@__VAULT_HOST__ vault-ca krl-bundle | ssh <user@host> 'bash -s'"
+  shift
+  while (( $# > 0 )); do
+    case "$1" in
+      --port) port="$2"; shift 2 ;;
+      *) die "unknown option: $1" ;;
+    esac
+  done
+  [[ -n "$port" ]] && { [[ "$port" =~ ^[0-9]+$ ]] || die "invalid --port"; }
+  _pipe_bundle_to_target _emit_krl_script "$target" "$port"
 }
 
 # ── client-wrapper ────────────────────────────────────────────────────────────
@@ -1387,7 +1412,7 @@ cmd_revoke() {
   local operator; operator="$(operator_name)"
   sudo -n -u sshca "$KRL_BIN" add-serial "$serial" "$operator"
   echo "  Deploy to targets (from workstation):"
-  echo "    ssh admin@$(hostname -s 2>/dev/null || hostname) vault-ca krl-bundle | ssh <user@host> 'bash -s'"
+  echo "    ssh __VAULT_USER__@__VAULT_HOST__ vault-ca krl-bundle | ssh <user@host> 'bash -s'"
 }
 
 cmd_unrevoke() {
@@ -1396,6 +1421,8 @@ cmd_unrevoke() {
   [[ "$serial" =~ ^[0-9]+$ ]] || die "serial must be numeric"
   local operator; operator="$(operator_name)"
   sudo -n -u sshca "$KRL_BIN" unrevoke-serial "$serial" "$operator"
+  echo "  Deploy to targets (from workstation):"
+  echo "    ssh __VAULT_USER__@__VAULT_HOST__ vault-ca krl-bundle | ssh <user@host> 'bash -s'"
 }
 
 cmd_krl_show() {
@@ -1435,14 +1462,23 @@ case "$cmd" in
 esac
 VAULTCA_EOF
 
+# Substitute placeholders with this vault's actual IP and admin user so
+# help text, redeploy reminders, and error messages in the in-CT helper
+# show copy-paste-ready commands rather than a placeholder hostname.
+# Same rationale as the workstation wrapper: avoid a DNS dependency.
+sed -i \
+  -e "s|__VAULT_HOST__|${CT_IP}|g" \
+  -e "s|__VAULT_USER__|${ADMIN_USER}|g" \
+  "$VAULT_CA_SRC"
+
 pct push "$CT_ID" "$VAULT_CA_SRC" "$VAULT_CA_BIN" --perms 0755
 pct exec "$CT_ID" -- chown root:root "$VAULT_CA_BIN"
 
 # ── Vault-CA: build workstation wrapper (ca-sign) on host, push into CT ───────
 # Stored at /usr/local/share/vault-ca/ca-sign on the vault, fetched by admins
-# via `ssh admin@vault-ca vault-ca client-wrapper > ~/.local/bin/ca-sign`.
-# The wrapper is templated at creation time with the actual vault hostname
-# and admin user (placeholders __VAULT_HOST__ / __VAULT_USER__).
+# via `ssh <admin>@<vault-ip> vault-ca client-wrapper > ~/.local/bin/ca-sign`.
+# The wrapper is templated at creation time with the actual vault IP and
+# admin user (placeholders __VAULT_HOST__ / __VAULT_USER__).
 WRAPPER_SRC_FILE="${HOST_TMPDIR}/ca-sign"
 
 cat > "$WRAPPER_SRC_FILE" <<'WRAPPER_EOF'
@@ -1530,8 +1566,10 @@ trap 'rm -f "$TMP"' EXIT
 ssh -p "$VAULT_PORT" -o BatchMode=yes "$VAULT_USER@$VAULT_HOST" \
     "${remote_args[@]}" < "$PUB" > "$TMP"
 
-# Sanity check: response must look like a certificate.
-if ! head -n1 "$TMP" | grep -qE '^(ssh|ecdsa)-[a-z0-9-]+-cert-v[0-9]+@openssh\.com '; then
+# Sanity check: response must look like a certificate. The (sk-)? prefix
+# accepts FIDO/U2F-backed cert algorithms (sk-ssh-ed25519-cert-v01@openssh.com,
+# sk-ecdsa-sha2-nistp256-cert-v01@openssh.com).
+if ! head -n1 "$TMP" | grep -qE '^(sk-)?(ssh|ecdsa)-[a-z0-9-]+-cert-v[0-9]+@openssh\.com '; then
   echo "ERROR: vault response was not a certificate:" >&2
   sed 's/^/  /' "$TMP" >&2
   exit 1
@@ -1544,11 +1582,14 @@ ssh-keygen -L -f "$CERT" \
   | sed 's/^/  /'
 WRAPPER_EOF
 
-# Substitute placeholders with this vault's actual hostname and admin user.
-# Using '|' as the sed delimiter so hostnames or admin names with '/' don't
-# break the pattern. Both values are already validated.
+# Substitute placeholders with this vault's actual IP and admin user.
+# We use CT_IP rather than HN so first bootstrap does not depend on
+# DNS resolving the vault hostname from the workstation; users can
+# still override at runtime via VAULT_CA_HOST / VAULT_CA_USER env vars.
+# Using '|' as the sed delimiter so values with '/' don't break the pattern.
+# Both values are already validated.
 sed -i \
-  -e "s|__VAULT_HOST__|${HN}|g" \
+  -e "s|__VAULT_HOST__|${CT_IP}|g" \
   -e "s|__VAULT_USER__|${ADMIN_USER}|g" \
   "$WRAPPER_SRC_FILE"
 
@@ -1716,16 +1757,16 @@ printf '  CA pubkey:       vault-ca show-ca-pub\n'
 printf '  CA fingerprint:  vault-ca fingerprint\n'
 printf '\n'
 printf '  Workstation wrapper (run on your workstation):\n'
-printf '    ssh $ADMIN_USER@\$(hostname -s) vault-ca client-wrapper \\\\\n'
+printf '    ssh $ADMIN_USER@${CT_IP} vault-ca client-wrapper \\\\\n'
 printf '        > ~/.local/bin/ca-sign && chmod +x ~/.local/bin/ca-sign\n'
 printf '\n'
 printf '  Trust the CA on a target (from workstation — preferred):\n'
-printf '    ssh $ADMIN_USER@\$(hostname -s) vault-ca trust-bundle \\\\\n'
+printf '    ssh $ADMIN_USER@${CT_IP} vault-ca trust-bundle \\\\\n'
 printf '        | ssh root@target.lab '\\''bash -s'\\''\n'
 printf '\n'
 printf '  Revoke a cert and push the updated KRL:\n'
-printf '    ssh $ADMIN_USER@\$(hostname -s) vault-ca revoke <serial>\n'
-printf '    ssh $ADMIN_USER@\$(hostname -s) vault-ca krl-bundle \\\\\n'
+printf '    ssh $ADMIN_USER@${CT_IP} vault-ca revoke <serial>\n'
+printf '    ssh $ADMIN_USER@${CT_IP} vault-ca krl-bundle \\\\\n'
 printf '        | ssh root@target.lab '\\''bash -s'\\''\n'
 printf '\n'
 printf '  Inbound SSH to this vault-ca CT is pubkey-only and locked until\n'
