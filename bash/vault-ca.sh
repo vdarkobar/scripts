@@ -44,6 +44,17 @@ ADMIN_GROUPS=()                      # intentionally empty: admin must NOT be in
                                      # /var/lib/ssh-ca/ca_user_key directly and
                                      # defeat the CA owner split.
 
+# Optional: pre-seed admin's inbound SSH authorized_keys at deploy time.
+# When set, you can SSH in immediately instead of `pct console`-ing to paste
+# a key. Accepts either form:
+#   ADMIN_SSH_PUBKEY="ssh-ed25519 AAAAC3Nz... you@workstation"
+#   ADMIN_SSH_PUBKEY="/root/workstation_ed25519.pub"   # absolute path (or ~/…)
+# Leave empty to keep the default behavior: sshd is still hardened to
+# pubkey-only + AllowUsers ${ADMIN_USER}, and you add a key later via
+# `pct console <CT_ID>` (step 1 of the bootstrap summary).
+# Only the first non-empty, non-comment line is used. Private keys are rejected.
+ADMIN_SSH_PUBKEY=""
+
 # SSH service on the vault-ca CT itself
 SSH_PORT=22
 SSH_LISTEN_ADDRESS=""                # blank = all addresses
@@ -95,6 +106,11 @@ CLEANUP_ON_FAIL=1                    # 1 = destroy CT on error, 0 = keep for deb
 #   /var/log/vault-ca.log
 
 # ── Trap cleanup ──────────────────────────────────────────────────────────────
+# SEED_SRC is a transient host-side tempfile used to stage ADMIN_SSH_PUBKEY
+# for `pct push`. Declared up front so both traps can clean it up even if
+# the push fails before we reach its own rm.
+SEED_SRC=""
+
 trap 'rc=$?;
   trap - ERR
   echo "  ERROR: failed (rc=$rc) near line ${BASH_LINENO[0]:-?}" >&2
@@ -104,6 +120,7 @@ trap 'rc=$?;
     pct stop "${CT_ID}" >/dev/null 2>&1 || true
     pct destroy "${CT_ID}" >/dev/null 2>&1 || true
   fi
+  [[ -n "${SEED_SRC:-}"    && -e "${SEED_SRC}"    ]] && rm -f "${SEED_SRC}"    || true
   [[ -n "${HOST_TMPDIR:-}" && -d "${HOST_TMPDIR}" ]] && rm -rf "${HOST_TMPDIR}" || true
   exit "$rc"
 ' ERR
@@ -116,6 +133,7 @@ trap 'rc=$?;
     pct stop "${CT_ID}" >/dev/null 2>&1 || true
     pct destroy "${CT_ID}" >/dev/null 2>&1 || true
   fi
+  [[ -n "${SEED_SRC:-}"    && -e "${SEED_SRC}"    ]] && rm -f "${SEED_SRC}"    || true
   [[ -n "${HOST_TMPDIR:-}" && -d "${HOST_TMPDIR}" ]] && rm -rf "${HOST_TMPDIR}" || true
   exit "$rc"
 ' INT TERM
@@ -123,7 +141,7 @@ trap 'rc=$?;
 # ── Preflight — root & commands ───────────────────────────────────────────────
 [[ "$(id -u)" -eq 0 ]] || { echo "  ERROR: Run as root on the Proxmox host." >&2; exit 1; }
 
-for cmd in pvesh pveam pct qm pvesm curl python3 ip awk grep sed sort paste seq mktemp; do
+for cmd in pvesh pveam pct qm pvesm curl python3 ip awk grep sed sort paste seq mktemp ssh-keygen; do
   command -v "$cmd" >/dev/null 2>&1 || { echo "  ERROR: Missing required command: $cmd" >&2; exit 1; }
 done
 
@@ -178,8 +196,68 @@ fi
 [[ "$ADMIN_USER" != "root" ]] || { echo "  ERROR: ADMIN_USER must not be root." >&2; exit 1; }
 [[ "$ADMIN_USER" != "sshca" ]] || { echo "  ERROR: ADMIN_USER must not be 'sshca' (reserved for CA owner)." >&2; exit 1; }
 
+# ADMIN_SSH_PUBKEY: resolve (file-or-literal), sanity-check, and validate.
+# Produces ADMIN_PUBKEY_LINE, consumed later by the seeding step. Empty
+# when ADMIN_SSH_PUBKEY is empty — that keeps the console-paste flow.
+ADMIN_PUBKEY_LINE=""
+if [[ -n "$ADMIN_SSH_PUBKEY" ]]; then
+  if [[ "$ADMIN_SSH_PUBKEY" == /* || "$ADMIN_SSH_PUBKEY" == "~/"* ]]; then
+    # Path form. Expand a leading ~/ against $HOME, falling back to /root
+    # for environments where HOME is unset (rare, but this runs as root).
+    _home="${HOME:-/root}"
+    _keysrc="${ADMIN_SSH_PUBKEY/#\~\//$_home/}"
+    unset _home
+    [[ -r "$_keysrc" ]] \
+      || { echo "  ERROR: ADMIN_SSH_PUBKEY file not readable: $_keysrc" >&2; exit 1; }
+    if grep -qE "BEGIN [A-Z ]*PRIVATE KEY" "$_keysrc"; then
+      echo "  ERROR: ADMIN_SSH_PUBKEY points at a private key: $_keysrc" >&2
+      echo "         Use the matching .pub file instead." >&2
+      exit 1
+    fi
+    ADMIN_PUBKEY_LINE="$(awk 'NF && !/^[[:space:]]*#/ {print; exit}' "$_keysrc")"
+    unset _keysrc
+  else
+    # Literal form. Take the first non-empty, non-comment line.
+    if printf '%s' "$ADMIN_SSH_PUBKEY" | grep -qE "BEGIN [A-Z ]*PRIVATE KEY"; then
+      echo "  ERROR: ADMIN_SSH_PUBKEY looks like a private key. Use the .pub instead." >&2
+      exit 1
+    fi
+    ADMIN_PUBKEY_LINE="$(printf '%s\n' "$ADMIN_SSH_PUBKEY" \
+                         | awk 'NF && !/^[[:space:]]*#/ {print; exit}')"
+  fi
+
+  [[ -n "$ADMIN_PUBKEY_LINE" ]] \
+    || { echo "  ERROR: ADMIN_SSH_PUBKEY produced no usable key line." >&2; exit 1; }
+
+  # Authoritative check: ssh-keygen -l rejects anything that isn't a valid
+  # authorized_keys/.pub single-line entry.
+  _keytmp="$(mktemp)"
+  printf '%s\n' "$ADMIN_PUBKEY_LINE" > "$_keytmp"
+  if ! ssh-keygen -l -f "$_keytmp" >/dev/null 2>&1; then
+    rm -f "$_keytmp"
+    echo "  ERROR: ADMIN_SSH_PUBKEY is not a valid OpenSSH public key." >&2
+    exit 1
+  fi
+  rm -f "$_keytmp"
+fi
+
 [[ "$SSH_PORT" =~ ^[0-9]+$ ]] && (( SSH_PORT >= 1 && SSH_PORT <= 65535 )) \
   || { echo "  ERROR: SSH_PORT must be between 1 and 65535." >&2; exit 1; }
+
+# Default-port examples stay clean (no bare '-p 22' noise); custom ports get
+# an explicit '-p N' wherever the script prints an ssh command for the user.
+# Two forms are used:
+#   SSH_PORT_ARG — leading-space flag fragment, concatenated after 'ssh' in
+#                  host-side printed strings ("ssh${SSH_PORT_ARG} admin@...").
+#   SSH_CMD_STR  — full command prefix ('ssh' or 'ssh -p N'), substituted
+#                  into embedded templates via the __SSH_CMD__ placeholder.
+if (( SSH_PORT == 22 )); then
+  SSH_PORT_ARG=""
+  SSH_CMD_STR="ssh"
+else
+  SSH_PORT_ARG=" -p $SSH_PORT"
+  SSH_CMD_STR="ssh -p $SSH_PORT"
+fi
 
 [[ "$ALLOW_TCP_FORWARDING" =~ ^[01]$ ]]   || { echo "  ERROR: ALLOW_TCP_FORWARDING must be 0 or 1." >&2; exit 1; }
 [[ "$ALLOW_AGENT_FORWARDING" =~ ^[01]$ ]] || { echo "  ERROR: ALLOW_AGENT_FORWARDING must be 0 or 1." >&2; exit 1; }
@@ -206,6 +284,17 @@ AVAIL_CT_STORES="$(pvesh get /storage --output-format json 2>/dev/null \
   | python3 -c "import sys,json; print(', '.join(sorted(s['storage'] for s in json.load(sys.stdin) if 'rootdir' in s.get('content',''))))" 2>/dev/null || echo "n/a")"
 
 # ── Show defaults & confirm ───────────────────────────────────────────────────
+# Reflect ADMIN_SSH_PUBKEY state in both the summary table and the
+# "after this script runs" bullet list so the confirmation screen matches
+# what will actually happen.
+if [[ -n "$ADMIN_PUBKEY_LINE" ]]; then
+  ADMIN_KEY_SUMMARY="pre-seeded (1 key)"
+  ADMIN_KEY_NOTE_LEAD="Inbound SSH will accept the pre-seeded admin key at:"
+else
+  ADMIN_KEY_SUMMARY="<not set> (add one via 'pct console' after deploy)"
+  ADMIN_KEY_NOTE_LEAD="Inbound SSH stays locked until you add a key to:"
+fi
+
 cat <<EOF2
 
   Vault-CA LXC Creator — Configuration
@@ -224,6 +313,7 @@ cat <<EOF2
   ────────────────────────────────────────
   Admin user:          $ADMIN_USER
   Admin shell:         $ADMIN_SHELL
+  Admin SSH key:       $ADMIN_KEY_SUMMARY
   SSH port:            $SSH_PORT
   SSH listen address:  ${SSH_LISTEN_ADDRESS:-<all>}
   TCP forwarding:      $([ "$ALLOW_TCP_FORWARDING" -eq 1 ] && echo 'yes' || echo 'no')
@@ -240,7 +330,7 @@ cat <<EOF2
   After this script runs:
     • CA keypair is generated during provisioning (sshca user owns it).
     • Admin can sign certs via 'vault-ca sign ...'.
-    • Inbound SSH stays locked until you add a key to:
+    • $ADMIN_KEY_NOTE_LEAD
         /home/$ADMIN_USER/.ssh/authorized_keys
     • pct enter remains available as a fallback.
 
@@ -579,6 +669,34 @@ pct exec "$CT_ID" -- bash -lc "
   chmod 0700 \"\$ADMIN_HOME/.ssh\"
 "
 
+# Seed ADMIN_SSH_PUBKEY if provided. pct push avoids shell-quoting the key.
+# Idempotent: grep -qxF skips the append when the line is already present.
+# SEED_SRC is declared near the trap handlers so a failure in pct push or
+# pct exec still gets the host-side tempfile cleaned up.
+if [[ -n "$ADMIN_PUBKEY_LINE" ]]; then
+  SEED_SRC="$(mktemp)"
+  printf '%s\n' "$ADMIN_PUBKEY_LINE" > "$SEED_SRC"
+  pct push "$CT_ID" "$SEED_SRC" "/tmp/admin_seed.pub" --perms 0600
+  rm -f "$SEED_SRC"
+  SEED_SRC=""
+  pct exec "$CT_ID" -- bash -lc "
+    set -euo pipefail
+    ADMIN_GROUP=\"\$(id -gn '${ADMIN_USER}')\"
+    ADMIN_HOME=\"\$(getent passwd '${ADMIN_USER}' | awk -F: '{print \$6}')\"
+    AK=\"\$ADMIN_HOME/.ssh/authorized_keys\"
+    SEED_LINE=\"\$(cat /tmp/admin_seed.pub)\"
+    if ! grep -qxF \"\$SEED_LINE\" \"\$AK\" 2>/dev/null; then
+      printf '%s\n' \"\$SEED_LINE\" >> \"\$AK\"
+      echo '  Seeded admin pubkey into authorized_keys'
+    else
+      echo '  Admin pubkey already present in authorized_keys (skip)'
+    fi
+    rm -f /tmp/admin_seed.pub
+    chown '${ADMIN_USER}':\"\$ADMIN_GROUP\" \"\$AK\"
+    chmod 0600 \"\$AK\"
+  "
+fi
+
 # ── Vault-CA: sshca system user + CA directory ────────────────────────────────
 pct exec "$CT_ID" -- bash -lc '
   set -euo pipefail
@@ -915,20 +1033,20 @@ Sign options:
 
 Examples (from your workstation):
   # One-time setup: install the client wrapper.
-  ssh __VAULT_USER__@__VAULT_HOST__ vault-ca client-wrapper > ~/.local/bin/ca-sign && chmod +x ~/.local/bin/ca-sign
+  __SSH_CMD__ __VAULT_USER__@__VAULT_HOST__ vault-ca client-wrapper > ~/.local/bin/ca-sign && chmod +x ~/.local/bin/ca-sign
 
   # Sign a cert valid for +8h with default principals (root,admin).
   ca-sign
 
   # Trust the CA on a target (works even when vault has no outbound SSH):
-  ssh __VAULT_USER__@__VAULT_HOST__ vault-ca trust-bundle | ssh root@web1.lab 'bash -s'
+  __SSH_CMD__ __VAULT_USER__@__VAULT_HOST__ vault-ca trust-bundle | ssh root@web1.lab 'bash -s'
 
   # Overwrite an existing different CA trust on a target:
-  ssh __VAULT_USER__@__VAULT_HOST__ vault-ca trust-bundle | ssh root@web1.lab 'FORCE=1 bash -s'
+  __SSH_CMD__ __VAULT_USER__@__VAULT_HOST__ vault-ca trust-bundle | ssh root@web1.lab 'FORCE=1 bash -s'
 
   # Revoke serial 42 and push the updated KRL out:
-  ssh __VAULT_USER__@__VAULT_HOST__ vault-ca revoke 42
-  ssh __VAULT_USER__@__VAULT_HOST__ vault-ca krl-bundle | ssh root@web1.lab 'bash -s'
+  __SSH_CMD__ __VAULT_USER__@__VAULT_HOST__ vault-ca revoke 42
+  __SSH_CMD__ __VAULT_USER__@__VAULT_HOST__ vault-ca krl-bundle | ssh root@web1.lab 'bash -s'
 USAGE
 }
 
@@ -1067,7 +1185,7 @@ cmd_fingerprint() {
 # The vault builds a self-contained installer script with the CA pubkey (or
 # KRL) base64-baked in. From the workstation:
 #
-#   ssh __VAULT_USER__@__VAULT_HOST__ vault-ca trust-bundle | ssh root@target 'bash -s'
+#   __SSH_CMD__ __VAULT_USER__@__VAULT_HOST__ vault-ca trust-bundle | ssh root@target 'bash -s'
 #
 # …which requires no outbound SSH on the vault. The 'trust'/'untrust'/'krl
 # deploy' verbs are thin convenience wrappers that pipe the bundle to ssh
@@ -1083,7 +1201,7 @@ _emit_trust_script() {
 #!/usr/bin/env bash
 # vault-ca trust installer — generated ${stamp}
 # Run with: ssh root@target 'bash -s' < this-script
-#           (or pipe from: ssh __VAULT_USER__@__VAULT_HOST__ vault-ca trust-bundle | ssh root@target 'bash -s')
+#           (or pipe from: __SSH_CMD__ __VAULT_USER__@__VAULT_HOST__ vault-ca trust-bundle | ssh root@target 'bash -s')
 # Env:  FORCE=1  overwrite an existing different CA pubkey on the target.
 set -Eeuo pipefail
 CA_PUB_B64='${ca_pub_b64}'
@@ -1356,7 +1474,7 @@ cmd_trust() {
   local target="${1:-}" port=""
   [[ -n "$target" ]] || die "Usage: vault-ca trust <user@host> [--port N]
   Or pipe a bundle from your workstation (no outbound SSH needed on vault):
-    ssh __VAULT_USER__@__VAULT_HOST__ vault-ca trust-bundle | ssh <user@host> 'bash -s'"
+    __SSH_CMD__ __VAULT_USER__@__VAULT_HOST__ vault-ca trust-bundle | ssh <user@host> 'bash -s'"
   shift
   while (( $# > 0 )); do
     case "$1" in
@@ -1372,7 +1490,7 @@ cmd_untrust() {
   local target="${1:-}" port=""
   [[ -n "$target" ]] || die "Usage: vault-ca untrust <user@host> [--port N]
   Or pipe a bundle from your workstation (no outbound SSH needed on vault):
-    ssh __VAULT_USER__@__VAULT_HOST__ vault-ca untrust-bundle | ssh <user@host> 'bash -s'"
+    __SSH_CMD__ __VAULT_USER__@__VAULT_HOST__ vault-ca untrust-bundle | ssh <user@host> 'bash -s'"
   shift
   while (( $# > 0 )); do
     case "$1" in
@@ -1388,7 +1506,7 @@ cmd_krl_deploy() {
   local target="${1:-}" port=""
   [[ -n "$target" ]] || die "Usage: vault-ca krl deploy <user@host> [--port N]
   Or pipe a bundle from your workstation (no outbound SSH needed on vault):
-    ssh __VAULT_USER__@__VAULT_HOST__ vault-ca krl-bundle | ssh <user@host> 'bash -s'"
+    __SSH_CMD__ __VAULT_USER__@__VAULT_HOST__ vault-ca krl-bundle | ssh <user@host> 'bash -s'"
   shift
   while (( $# > 0 )); do
     case "$1" in
@@ -1414,7 +1532,7 @@ cmd_revoke() {
   local operator; operator="$(operator_name)"
   sudo -n -u sshca "$KRL_BIN" add-serial "$serial" "$operator"
   echo "  Deploy to targets (from workstation):"
-  echo "    ssh __VAULT_USER__@__VAULT_HOST__ vault-ca krl-bundle | ssh <user@host> 'bash -s'"
+  echo "    __SSH_CMD__ __VAULT_USER__@__VAULT_HOST__ vault-ca krl-bundle | ssh <user@host> 'bash -s'"
 }
 
 cmd_unrevoke() {
@@ -1424,7 +1542,7 @@ cmd_unrevoke() {
   local operator; operator="$(operator_name)"
   sudo -n -u sshca "$KRL_BIN" unrevoke-serial "$serial" "$operator"
   echo "  Deploy to targets (from workstation):"
-  echo "    ssh __VAULT_USER__@__VAULT_HOST__ vault-ca krl-bundle | ssh <user@host> 'bash -s'"
+  echo "    __SSH_CMD__ __VAULT_USER__@__VAULT_HOST__ vault-ca krl-bundle | ssh <user@host> 'bash -s'"
 }
 
 cmd_krl_show() {
@@ -1471,6 +1589,7 @@ VAULTCA_EOF
 sed -i \
   -e "s|__VAULT_HOST__|${CT_IP}|g" \
   -e "s|__VAULT_USER__|${ADMIN_USER}|g" \
+  -e "s|__SSH_CMD__|${SSH_CMD_STR}|g" \
   "$VAULT_CA_SRC"
 
 pct push "$CT_ID" "$VAULT_CA_SRC" "$VAULT_CA_BIN" --perms 0755
@@ -1488,7 +1607,7 @@ cat > "$WRAPPER_SRC_FILE" <<'WRAPPER_EOF'
 # ca-sign — request a fresh SSH user certificate from the vault-ca service.
 #
 # Installation (on your workstation):
-#   ssh __VAULT_USER__@__VAULT_HOST__ vault-ca client-wrapper > ~/.local/bin/ca-sign
+#   __SSH_CMD__ __VAULT_USER__@__VAULT_HOST__ vault-ca client-wrapper > ~/.local/bin/ca-sign
 #   chmod +x ~/.local/bin/ca-sign
 #
 # Usage:
@@ -1510,7 +1629,7 @@ cat > "$WRAPPER_SRC_FILE" <<'WRAPPER_EOF'
 #                     the CT's IP baked in at install time so first-time
 #                     bootstrap does not depend on DNS)
 #   VAULT_CA_USER     admin user on the vault (default: __VAULT_USER__)
-#   VAULT_CA_PORT     SSH port (default: 22)
+#   VAULT_CA_PORT     SSH port (default: __VAULT_PORT__)
 #
 # Note:
 #   On DHCP networks the baked-in IP can drift. Reserve the CT IP on your
@@ -1524,7 +1643,7 @@ set -euo pipefail
 
 VAULT_HOST="${VAULT_CA_HOST:-__VAULT_HOST__}"
 VAULT_USER="${VAULT_CA_USER:-__VAULT_USER__}"
-VAULT_PORT="${VAULT_CA_PORT:-22}"
+VAULT_PORT="${VAULT_CA_PORT:-__VAULT_PORT__}"
 
 KEY_PATH="$HOME/.ssh/id_ed25519"
 LABEL="$(hostname -s 2>/dev/null || hostname)"
@@ -1594,12 +1713,14 @@ WRAPPER_EOF
 # Substitute placeholders with this vault's actual IP and admin user.
 # We use CT_IP rather than HN so first bootstrap does not depend on
 # DNS resolving the vault hostname from the workstation; users can
-# still override at runtime via VAULT_CA_HOST / VAULT_CA_USER env vars.
+# still override at runtime via VAULT_CA_HOST / VAULT_CA_USER / VAULT_CA_PORT.
 # Using '|' as the sed delimiter so values with '/' don't break the pattern.
 # Both values are already validated.
 sed -i \
   -e "s|__VAULT_HOST__|${CT_IP}|g" \
   -e "s|__VAULT_USER__|${ADMIN_USER}|g" \
+  -e "s|__VAULT_PORT__|${SSH_PORT}|g" \
+  -e "s|__SSH_CMD__|${SSH_CMD_STR}|g" \
   "$WRAPPER_SRC_FILE"
 
 pct push "$CT_ID" "$WRAPPER_SRC_FILE" "$VAULT_CA_WRAPPER" --perms 0755
@@ -1766,20 +1887,20 @@ printf '  CA pubkey:       vault-ca show-ca-pub\n'
 printf '  CA fingerprint:  vault-ca fingerprint\n'
 printf '\n'
 printf '  Workstation wrapper (run on your workstation):\n'
-printf '    ssh $ADMIN_USER@${CT_IP} vault-ca client-wrapper \\\\\n'
+printf '    ssh${SSH_PORT_ARG} $ADMIN_USER@${CT_IP} vault-ca client-wrapper \\\\\n'
 printf '        > ~/.local/bin/ca-sign && chmod +x ~/.local/bin/ca-sign\n'
 printf '\n'
 printf '  Trust the CA on a target (from workstation — preferred):\n'
-printf '    ssh $ADMIN_USER@${CT_IP} vault-ca trust-bundle \\\\\n'
+printf '    ssh${SSH_PORT_ARG} $ADMIN_USER@${CT_IP} vault-ca trust-bundle \\\\\n'
 printf '        | ssh root@target.lab '\\''bash -s'\\''\n'
 printf '\n'
 printf '  Revoke a cert and push the updated KRL:\n'
-printf '    ssh $ADMIN_USER@${CT_IP} vault-ca revoke <serial>\n'
-printf '    ssh $ADMIN_USER@${CT_IP} vault-ca krl-bundle \\\\\n'
+printf '    ssh${SSH_PORT_ARG} $ADMIN_USER@${CT_IP} vault-ca revoke <serial>\n'
+printf '    ssh${SSH_PORT_ARG} $ADMIN_USER@${CT_IP} vault-ca krl-bundle \\\\\n'
 printf '        | ssh root@target.lab '\\''bash -s'\\''\n'
 printf '\n'
-printf '  Inbound SSH to this vault-ca CT is pubkey-only and locked until\n'
-printf '  you add a key to /home/$ADMIN_USER/.ssh/authorized_keys.\n'
+printf '  Inbound SSH to this vault-ca CT is pubkey-only.\n'
+printf '  Authorized keys: /home/$ADMIN_USER/.ssh/authorized_keys\n'
 EOF2
 
   cat > /etc/update-motd.d/99-footer <<'EOF2'
@@ -1798,7 +1919,7 @@ pct exec "$CT_ID" -- bash -lc '
 
 # ── Proxmox UI description ────────────────────────────────────────────────────
 CA_FPR_LINE="$(pct exec "$CT_ID" -- bash -lc "ssh-keygen -l -E sha256 -f '${CA_PUB}' 2>/dev/null" | head -n1)"
-VAULT_CA_DESC="Vault-CA LXC (${CT_IP}) — ssh ${ADMIN_USER}@${CT_IP} -p ${SSH_PORT}
+VAULT_CA_DESC="Vault-CA LXC (${CT_IP}) — ssh${SSH_PORT_ARG} ${ADMIN_USER}@${CT_IP}
 <details><summary>Details</summary>Debian ${DEBIAN_VERSION} SSH Certificate Authority
 Admin user: ${ADMIN_USER}
 SSH port: ${SSH_PORT}
@@ -1808,8 +1929,10 @@ Default validity: ${CA_DEFAULT_VALIDITY} (max $(( CA_MAX_VALIDITY_SEC / 3600 ))h
 Default principals: ${CA_DEFAULT_PRINCIPALS}
 Helper: ${VAULT_CA_BIN}
 Audit log: ${AUDIT_LOG}
-Workstation wrapper: ssh ${ADMIN_USER}@${CT_IP} vault-ca client-wrapper
-Inbound SSH locked until a key is added to /home/${ADMIN_USER}/.ssh/authorized_keys
+Workstation wrapper: ssh${SSH_PORT_ARG} ${ADMIN_USER}@${CT_IP} vault-ca client-wrapper
+$( [[ -n "$ADMIN_PUBKEY_LINE" ]] \
+     && echo "Inbound SSH: pubkey pre-seeded in /home/${ADMIN_USER}/.ssh/authorized_keys" \
+     || echo "Inbound SSH: locked until a key is added to /home/${ADMIN_USER}/.ssh/authorized_keys" )
 Created by vault-ca.sh</details>"
 pct set "$CT_ID" --description "$VAULT_CA_DESC"
 
@@ -1839,15 +1962,20 @@ echo "  Audit log:      $AUDIT_LOG (inside CT)"
 echo ""
 echo "  Bootstrap steps (in order, run from your workstation unless noted):"
 echo ""
-echo "    1) On the PVE host, add an inbound login key for $ADMIN_USER:"
-echo "         pct console $CT_ID"
-echo "         (login as $ADMIN_USER, paste your pubkey into ~/.ssh/authorized_keys)"
-echo ""
+if [[ -n "$ADMIN_PUBKEY_LINE" ]]; then
+  echo "    1) Authorized key was seeded at deploy — no console step needed."
+  echo ""
+else
+  echo "    1) On the PVE host, add an inbound login key for $ADMIN_USER:"
+  echo "         pct console $CT_ID"
+  echo "         (login as $ADMIN_USER, paste your pubkey into ~/.ssh/authorized_keys)"
+  echo ""
+fi
 echo "    2) Verify you can SSH in:"
-echo "         ssh $ADMIN_USER@$CT_IP hostname"
+echo "         ssh${SSH_PORT_ARG} $ADMIN_USER@$CT_IP hostname"
 echo ""
 echo "    3) Install the workstation wrapper:"
-echo "         ssh $ADMIN_USER@$CT_IP vault-ca client-wrapper \\"
+echo "         ssh${SSH_PORT_ARG} $ADMIN_USER@$CT_IP vault-ca client-wrapper \\"
 echo "             > ~/.local/bin/ca-sign"
 echo "         chmod +x ~/.local/bin/ca-sign"
 echo ""
@@ -1856,15 +1984,15 @@ echo "         ca-sign"
 echo "       Custom: ca-sign -k ~/.ssh/work_ed25519 -V +4h -n ubuntu,root"
 echo ""
 echo "    5) Trust the CA on a target (no outbound SSH needed on the vault):"
-echo "         ssh $ADMIN_USER@$CT_IP vault-ca trust-bundle \\"
+echo "         ssh${SSH_PORT_ARG} $ADMIN_USER@$CT_IP vault-ca trust-bundle \\"
 echo "             | ssh root@target.lab 'bash -s'"
 echo ""
 echo "    6) Log into the target — OpenSSH presents the cert automatically:"
 echo "         ssh root@target.lab"
 echo ""
 echo "  Revocation:"
-echo "    ssh $ADMIN_USER@$CT_IP vault-ca revoke <serial>"
-echo "    ssh $ADMIN_USER@$CT_IP vault-ca krl-bundle | ssh root@target.lab 'bash -s'"
+echo "    ssh${SSH_PORT_ARG} $ADMIN_USER@$CT_IP vault-ca revoke <serial>"
+echo "    ssh${SSH_PORT_ARG} $ADMIN_USER@$CT_IP vault-ca krl-bundle | ssh root@target.lab 'bash -s'"
 echo ""
 echo "  Fallback if SSH is broken:"
 echo "    pct enter $CT_ID"
