@@ -2104,9 +2104,7 @@ pct console ${CT_ID}
 
 Log in as \`${ADMIN_USER}\` (password set during deploy), then inside the console:
 \`\`\`bash
-mkdir -p ~/.ssh && chmod 700 ~/.ssh
 nano ~/.ssh/authorized_keys        # paste the pubkey line, save
-chmod 600 ~/.ssh/authorized_keys
 exit
 \`\`\`
 
