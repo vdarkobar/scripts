@@ -2061,24 +2061,17 @@ pct exec "$CT_ID" -- bash -lc '
 # Minimal at-a-glance description: a one-line header outside <details>, and
 # inside <details> a sequenced, command-first walkthrough — workstation
 # setup first (authorize key, install ca-sign), then per-target onboarding,
-# then daily use. The trust installer and ca-sign wrapper source are kept
-# at the bottom as paste-fallbacks for isolated workstations/targets.
-# All three (CA pubkey, trust installer, wrapper) are fetched from the CT
-# so the description stays authoritative after any in-CT change — in
-# particular, the embedded trust installer is byte-for-byte the output of
-# `vault-ca trust-bundle`, so the documented fallback matches the real
-# installer (backup, FORCE gate, sshd_config Include handling, rollback).
-# Everything else (fingerprint, audit log path, defaults) is surfaced by
-# \`vault-ca help\` and the post-install bootstrap summary.
-CA_SIGN_CONTENT="$(pct exec "$CT_ID" -- cat "${VAULT_CA_WRAPPER}")"
-TRUST_BUNDLE_CONTENT="$(pct exec "$CT_ID" -- "${VAULT_CA_BIN}" trust-bundle)"
+# then daily use. Earlier revisions embedded the emitted trust-bundle
+# installer and ca-sign wrapper source in appendices; both were dropped
+# because Proxmox caps --description at 8192 chars and the two artifacts
+# together (~9 KB) blew past that limit. Both are one SSH command away
+# from the walkthrough itself (\`vault-ca trust-bundle\`, \`vault-ca
+# client-wrapper\`), which is the authoritative source anyway. Everything
+# else (fingerprint, audit log path, defaults) is surfaced by \`vault-ca
+# help\` and the post-install bootstrap summary.
 
 # Heredoc is unquoted on purpose: \${VARS} expand once, and \` gives literal
-# backticks for the markdown code fences. The interpolated wrapper and
-# trust-bundle contents are NOT re-parsed — any \$VAR or \$(...) inside
-# them stays literal as variable content. (Trust-bundle itself contains
-# heredoc delimiters like TRUST_BODY / CONF; those are inert at this
-# layer and only become active when the user pastes the block on a target.)
+# backticks for the markdown code fences.
 VAULT_CA_DESC="$(cat <<EOF_DESC
 Vault-CA LXC (${CT_IP}) — ssh${SSH_PORT_ARG} ${ADMIN_USER}@${CT_IP}
 <details><summary>Setup &amp; onboarding commands</summary>
@@ -2137,12 +2130,17 @@ access to both the vault (as \`${ADMIN_USER}\`, set up in step 1) and the target
 ${SSH_CMD_STR} ${ADMIN_USER}@${CT_IP} vault-ca trust-bundle | ssh root@<target-ip> 'bash -s'
 \`\`\`
 
-**Fallback — manual paste.** Use when the workstation can't SSH to the target
-(isolated network, no sshd yet, bootstrapping from console, etc.). Get a root
-shell on the target (SSH, \`pct console\`, or physical console), then paste the
-**Trust installer** from the appendix below. The installer is byte-for-byte
-equivalent to what \`vault-ca trust-bundle\` emits over SSH — the CA pubkey is
-baked in, it backs up what it touches, refuses to clobber a different CA
+**Fallback — save and hand-carry.** Use when the workstation can reach the
+vault but not the target (isolated network, no sshd yet, bootstrapping from
+console). Save the installer locally, transfer it to the target by scp/USB/
+copy-paste, then run it there as root:
+\`\`\`bash
+${SSH_CMD_STR} ${ADMIN_USER}@${CT_IP} vault-ca trust-bundle > trust-installer.sh
+# …get trust-installer.sh onto the target, then on the target as root:
+bash trust-installer.sh
+\`\`\`
+
+The installer backs up what it touches, refuses to clobber a different CA
 (unless \`FORCE=1\`), adds the \`Include\` line to \`sshd_config\` if missing,
 and rolls back on any failure.
 
@@ -2151,25 +2149,6 @@ and rolls back on any failure.
 \`\`\`bash
 ca-sign                    # fetch fresh 8h certificate
 ssh root@<target-ip>       # OpenSSH picks up the cert automatically
-\`\`\`
-
-### Appendix — Trust installer (fallback for step 3)
-
-Paste this into a root shell on the target. Equivalent to running
-\`${SSH_CMD_STR} ${ADMIN_USER}@${CT_IP} vault-ca trust-bundle | ssh root@<target> 'bash -s'\`
-from a workstation that can reach both sides.
-
-\`\`\`bash
-${TRUST_BUNDLE_CONTENT}
-\`\`\`
-
-### Appendix — ca-sign wrapper source
-
-Fallback for workstations that cannot SSH to the vault. Save as
-\`~/.local/bin/ca-sign\` and \`chmod +x\`. Otherwise use step 2 above.
-
-\`\`\`bash
-${CA_SIGN_CONTENT}
 \`\`\`
 
 </details>
