@@ -378,6 +378,14 @@ case "$response" in
     else
       echo "  ERROR: Failed to save a local editable copy of the script." >&2
     fi
+    # When run via `bash <(curl -fsSL URL)`, BASH_SOURCE[0] is a FIFO that
+    # curl is still writing to. Exiting now closes the reader and upstream
+    # curl prints 'error 23: Failure writing output to destination'. Drain
+    # the FIFO first so curl sees a clean EOF. No effect when the script
+    # is run from a regular file (-f short-circuits).
+    if [[ -n "${BASH_SOURCE[0]:-}" && ! -f "${BASH_SOURCE[0]}" ]]; then
+      cat "${BASH_SOURCE[0]}" >/dev/null 2>&1 || true
+    fi
     exit 0
     ;;
 esac
