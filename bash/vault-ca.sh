@@ -738,7 +738,7 @@ pct exec "$CT_ID" -- bash -lc '
             --comment "SSH CA owner" sshca
     echo "  Created system user: sshca"
   fi
-  install -d -m 0750 -o sshca -g sshca /var/lib/ssh-ca
+  install -d -m 0755 -o sshca -g sshca /var/lib/ssh-ca
   install -d -m 0755 -o root  -g root  /usr/local/lib/vault-ca
   install -d -m 0755 -o root  -g root  /usr/local/share/vault-ca
   install -d -m 0755 -o root  -g root  /etc/vault-ca
@@ -1098,7 +1098,7 @@ cmd_init() {
   if [[ $EUID -ne 0 ]]; then
     die "init must be run as root — from the PVE host: 'pct exec <CTID> -- vault-ca init', or 'pct enter <CTID>' then run as root"
   fi
-  install -d -m 0750 -o sshca -g sshca "$CA_DIR"
+  install -d -m 0755 -o sshca -g sshca "$CA_DIR"
   sudo -n -u sshca ssh-keygen -q -t ed25519 \
         -f "${CA_DIR}/ca_user_key" -N "" \
         -C "vault-ca user CA ($(hostname -f 2>/dev/null || hostname), $(date -u +%Y-%m-%dT%H:%M:%SZ))"
