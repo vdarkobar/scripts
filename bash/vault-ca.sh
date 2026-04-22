@@ -86,6 +86,11 @@ AUDIT_LOG="/var/log/vault-ca.log"
 # Behavior flags
 DISABLE_IPV6=0                       # 1 = also disable IPv6 via sysctl hardening
 LOCK_ROOT_PASSWORD=1                 # 1 = lock local root password after setup; pct enter still works
+ENABLE_NESTING=1                     # 1 = enable CT nesting feature; required on
+                                     # some PVE versions for the web GUI console
+                                     # to render (xterm.js over noVNC). Safe for
+                                     # this CT; set 0 only if you have a specific
+                                     # reason and use 'pct console' / 'pct enter'.
 CLEANUP_ON_FAIL=1                    # 1 = destroy CT on error, 0 = keep for debugging
 
 # ── Custom configs created by this script ─────────────────────────────────────
@@ -176,6 +181,7 @@ fi
 [[ "$DEBIAN_VERSION" =~ ^[0-9]+$ ]] || { echo "  ERROR: DEBIAN_VERSION must be numeric." >&2; exit 1; }
 [[ "$DISABLE_IPV6" =~ ^[01]$ ]] || { echo "  ERROR: DISABLE_IPV6 must be 0 or 1." >&2; exit 1; }
 [[ "$LOCK_ROOT_PASSWORD" =~ ^[01]$ ]] || { echo "  ERROR: LOCK_ROOT_PASSWORD must be 0 or 1." >&2; exit 1; }
+[[ "$ENABLE_NESTING" =~ ^[01]$ ]] || { echo "  ERROR: ENABLE_NESTING must be 0 or 1." >&2; exit 1; }
 [[ "$CLEANUP_ON_FAIL" =~ ^[01]$ ]] || { echo "  ERROR: CLEANUP_ON_FAIL must be 0 or 1." >&2; exit 1; }
 
 if [[ ! "$APP_TZ" =~ ^[A-Za-z0-9._/+:-]+$ ]]; then
@@ -337,6 +343,7 @@ cat <<EOF2
   X11 forwarding:      $([ "$ALLOW_X11_FORWARDING" -eq 1 ] && echo 'yes' || echo 'no')
   Lock root password:  $([ "$LOCK_ROOT_PASSWORD" -eq 1 ] && echo 'yes (no prompt; root left locked)' || echo 'no (will prompt)')
   IPv6:                $([ "$DISABLE_IPV6" -eq 1 ] && echo 'disabled (net + sysctl)' || echo 'auto (SLAAC)')
+  Nesting:             $([ "$ENABLE_NESTING" -eq 1 ] && echo 'enabled (GUI console works)' || echo 'disabled (use pct console/enter)')
   Cleanup on fail:     $CLEANUP_ON_FAIL
   ────────────────────────────────────────
   CA default validity: $CA_DEFAULT_VALIDITY
@@ -506,6 +513,7 @@ PCT_OPTIONS=(
   -tags "$TAGS"
   -net0 "$NET0"
 )
+[[ "$ENABLE_NESTING" -eq 1 ]] && PCT_OPTIONS+=(-features "nesting=1")
 
 pct create "$CT_ID" "${TEMPLATE_STORAGE}:vztmpl/${TEMPLATE}" "${PCT_OPTIONS[@]}"
 CREATED=1
