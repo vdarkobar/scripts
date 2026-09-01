@@ -22,7 +22,7 @@ TAGS="flatnotes;podman;quadlet;lxc"
 
 # Images / versions
 APP_IMAGE_REPO="docker.io/dullage/flatnotes"
-APP_TAG="v5.5.4"                     # pinned default; do not default to :latest
+APP_TAG="v5.5.5"                     # pinned default; do not default to :latest
 DEBIAN_VERSION=13
 
 # Auto-update policy
