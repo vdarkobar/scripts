@@ -133,12 +133,12 @@
 </details>
 
 <details>
-  <summary>Flatnotes on Podman</summary>
+  <summary>Flatnotes</summary>
   <p>Database-less note-taking web app.</p>
   <p>Flatnotes on Podman</p>
   <pre><code>bash &lt;(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/bash/flatnotes-podman.sh)</code></pre>
   <p>systemd + Quadlet</p>
-  <pre><code>bash &lt;(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/bash/flatnotes-podman.sh)</code></pre>
+  <pre><code>bash &lt;(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/bash/flatnotes-quadlet.sh)</code></pre>
 </details>
 
 <details>
