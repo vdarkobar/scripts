@@ -97,9 +97,9 @@
 </details>
 
 <details>
-  <summary>Immich on Podman</summary>
+  <summary>Immich</summary>
   <p>Self-hosted photo and video backup platform.</p>
-  <pre><code>bash &lt;(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/bash/immich-podman.sh)</code></pre>
+  <pre><code>bash &lt;(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/bash/immich-quadlet.sh)</code></pre>
 </details>
 
 <details>
