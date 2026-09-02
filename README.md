@@ -70,7 +70,7 @@
 <details>
   <summary>UpSnap</summary>
   <p>A simple wake on lan web app.</p>
-  <pre><code>bash &lt;(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/bash/upsnap-podman.sh)</code></pre>
+  <pre><code>bash &lt;(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/bash/upsnap-quadlet.sh)</code></pre>
 </details>
 
 <details>
