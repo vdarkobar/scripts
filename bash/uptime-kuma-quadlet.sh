@@ -19,12 +19,28 @@ TAGS="uptime-kuma;podman;quadlet;lxc"
 
 # Images / versions
 APP_IMAGE_REPO="docker.io/louislam/uptime-kuma"
-APP_TAG="2.2.1"                      # pinned default; do not default to :latest
+APP_TAG="2.5.3"                      # pinned default; do not default to :latest
 DEBIAN_VERSION=13
+
+# Auto-update policy
+# AUTO_UPDATE=0 (default): timer installed but disabled; manual updates via
+#   uptime-kuma-maint.sh update <tag>
+# AUTO_UPDATE=1: timer re-pulls the CURRENT PINNED TAG on schedule and restarts
+#   only if the image digest changed. :latest is never used.
+AUTO_UPDATE=0
+
+# Podman storage backend
+# PODMAN_FUSE_OVERLAY=1: lab default so far — fuse=1 on the CT + fuse-overlayfs
+#   as mount_program. Proxmox warns that FUSE mounts inside a CT can deadlock
+#   when the CT is frozen, which snapshot-mode vzdump/PBS backups do.
+# PODMAN_FUSE_OVERLAY=0: native overlayfs in the CT's user namespace (kernel
+#   >= 5.11); no fuse=1, no mount_program, no freezer interaction. Verify after
+#   install with: podman info --format '{{.Store.GraphDriverName}}' (overlay) and
+#   run a snapshot-mode backup under load before adopting lab-wide.
+PODMAN_FUSE_OVERLAY=1
 
 # Extra packages to install (space-separated or array)
 EXTRA_PACKAGES=(
-  qemu-guest-agent
 )
 
 # Behavior
@@ -41,6 +57,8 @@ QUADLET_SERVICE="uptime-kuma.service"
 #   /opt/uptime-kuma/.env                          (runtime state — read by maint script)
 #   /opt/uptime-kuma/data/                         (persistent data — DB backend + uploads; backend selected at first-run setup)
 #   /usr/local/bin/uptime-kuma-maint.sh            (maintenance helper)
+#   /etc/systemd/system/uptime-kuma-update.service
+#   /etc/systemd/system/uptime-kuma-update.timer
 #   /etc/update-motd.d/00-header
 #   /etc/update-motd.d/10-sysinfo
 #   /etc/update-motd.d/30-app
@@ -56,20 +74,30 @@ QUADLET_SERVICE="uptime-kuma.service"
 [[ "$DEBIAN_VERSION" =~ ^[0-9]+$ ]] || { echo "  ERROR: DEBIAN_VERSION must be numeric." >&2; exit 1; }
 [[ "$APP_PORT" =~ ^[0-9]+$ ]] || { echo "  ERROR: APP_PORT must be numeric." >&2; exit 1; }
 (( APP_PORT >= 1 && APP_PORT <= 65535 )) || { echo "  ERROR: APP_PORT must be between 1 and 65535." >&2; exit 1; }
+[[ "$AUTO_UPDATE" =~ ^[01]$ ]] || { echo "  ERROR: AUTO_UPDATE must be 0 or 1." >&2; exit 1; }
+[[ "$PODMAN_FUSE_OVERLAY" =~ ^[01]$ ]] || { echo "  ERROR: PODMAN_FUSE_OVERLAY must be 0 or 1." >&2; exit 1; }
 [[ "$CLEANUP_ON_FAIL" =~ ^[01]$ ]] || { echo "  ERROR: CLEANUP_ON_FAIL must be 0 or 1." >&2; exit 1; }
-[[ -n "$APP_IMAGE_REPO" && ! "$APP_IMAGE_REPO" =~ [[:space:]] ]] || {
-  echo "  ERROR: APP_IMAGE_REPO must be non-empty and contain no spaces." >&2
+# Image repo is interpolated into podman, sed, the Quadlet unit and .env.
+[[ "$APP_IMAGE_REPO" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*[A-Za-z0-9]$ ]] || {
+  echo "  ERROR: APP_IMAGE_REPO must look like registry/namespace/name (no tag, no spaces)." >&2
   exit 1
 }
+# Uptime Kuma: full semver only. Floating tags (2, 2-slim, :latest) re-point on
+# every release and can change the embedded-MariaDB UID under bind-mounted data.
 [[ "$APP_TAG" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9._-]+)?$ ]] || {
-  echo "  ERROR: APP_TAG must be a pinned version like 2.2.1 — ':latest' is not permitted." >&2
+  echo "  ERROR: APP_TAG must be a pinned version like 2.5.3 — ':latest' and floating tags are not permitted." >&2
   exit 1
 }
 [[ -e "/usr/share/zoneinfo/${APP_TZ}" ]] || { echo "  ERROR: APP_TZ not found in /usr/share/zoneinfo: $APP_TZ" >&2; exit 1; }
+[[ "$APP_TZ" =~ ^[A-Za-z0-9._+-]+(/[A-Za-z0-9._+-]+)+$ ]] || { echo "  ERROR: APP_TZ contains invalid characters." >&2; exit 1; }
 if [[ -n "$APP_FQDN" ]]; then
   [[ "$APP_FQDN" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)+$ ]] \
     || { echo "  ERROR: APP_FQDN is not a valid hostname: $APP_FQDN" >&2; exit 1; }
 fi
+[[ "$TAGS" =~ ^[A-Za-z0-9._-]+(;[A-Za-z0-9._-]+)*$ ]] || { echo "  ERROR: TAGS must be a semicolon-separated list without spaces." >&2; exit 1; }
+for pkg in "${EXTRA_PACKAGES[@]}"; do
+  [[ "$pkg" =~ ^[a-z0-9][a-z0-9+.-]*$ ]] || { echo "  ERROR: Invalid package name in EXTRA_PACKAGES: $pkg" >&2; exit 1; }
+done
 
 # ── Trap cleanup ──────────────────────────────────────────────────────────────
 trap 'rc=$?;
@@ -98,9 +126,25 @@ trap 'rc=$?;
 # ── Preflight — root & commands ───────────────────────────────────────────────
 [[ "$(id -u)" -eq 0 ]] || { echo "  ERROR: Run as root on the Proxmox host." >&2; exit 1; }
 
-for cmd in pvesh pveam pct pvesm curl python3 ip awk sort paste readlink cp chmod; do
+for cmd in pvesh pveam pct pvesm qm curl python3 ip awk grep sed sort paste seq readlink cp chmod dpkg head tr; do
   command -v "$cmd" >/dev/null 2>&1 || { echo "  ERROR: Missing required command: $cmd" >&2; exit 1; }
 done
+
+# pveam lists templates for more than one CPU architecture. Selecting only by
+# Debian version can pick an ARM64 rootfs on an AMD64 host (or vice versa),
+# which creates successfully but fails when LXC executes /sbin/init.
+HOST_ARCH="$(dpkg --print-architecture)"
+case "$HOST_ARCH" in
+  amd64|arm64) ;;
+  *) echo "  ERROR: Unsupported Proxmox host architecture: $HOST_ARCH" >&2; exit 1 ;;
+esac
+
+# Prompts read from the terminal directly so the script also works when
+# piped (curl ... | bash) and stdin is the script body.
+if ! exec 8</dev/tty; then
+  echo "  ERROR: An interactive terminal is required for confirmation and password prompts." >&2
+  exit 1
+fi
 
 if [[ -n "$CT_ID" ]]; then
   [[ "$CT_ID" =~ ^[0-9]+$ ]] && (( CT_ID >= 100 && CT_ID <= 999999999 )) \
@@ -112,6 +156,16 @@ if [[ -n "$CT_ID" ]]; then
 else
   CT_ID="$(pvesh get /cluster/nextid)"
   [[ -n "$CT_ID" ]] || { echo "  ERROR: Could not obtain next CT ID." >&2; exit 1; }
+fi
+
+# Creator scripts are not idempotent: a re-run would create a second CT with the
+# same hostname. Refuse if one already exists on this node (e.g. a preserved
+# failed install) — destroy it first or change HN.
+EXISTING_CT="$(pct list 2>/dev/null | awk -v h="$HN" 'NR>1 && $NF==h {print $1}' | head -n1)"
+if [[ -n "$EXISTING_CT" ]]; then
+  echo "  ERROR: A CT with hostname '${HN}' already exists on this node (CT ${EXISTING_CT})." >&2
+  echo "  Destroy it (pct set ${EXISTING_CT} --protection 0; pct destroy ${EXISTING_CT}) or change HN, then re-run." >&2
+  exit 1
 fi
 
 # ── Discover available resources ──────────────────────────────────────────────
@@ -134,13 +188,16 @@ cat <<EOF2
   Bridge:            $BRIDGE ($AVAIL_BRIDGES)
   Template storage:  $TEMPLATE_STORAGE ($AVAIL_TMPL_STORES)
   Container storage: $CONTAINER_STORAGE ($AVAIL_CT_STORES)
+  Host architecture: $HOST_ARCH
   Debian:            $DEBIAN_VERSION
   App image:         $APP_IMAGE
   App port:          $APP_PORT
   Timezone:          $APP_TZ
   FQDN:              $([ -n "$APP_FQDN" ] && echo "$APP_FQDN" || echo "(local only)")
+  Podman storage:    $([ "$PODMAN_FUSE_OVERLAY" -eq 1 ] && echo "fuse-overlayfs (fuse=1)" || echo "native overlay (no FUSE)")
   Tags:              $TAGS
-  Cleanup on fail:   $CLEANUP_ON_FAIL
+  Auto-update:       $([ "$AUTO_UPDATE" -eq 1 ] && echo "enabled (re-pull pinned $APP_TAG)" || echo "disabled (pinned $APP_TAG, manual)")
+  Cleanup on fail:   $CLEANUP_ON_FAIL (until first service start; CT preserved after that)
   ────────────────────────────────────────
   To change defaults, press Enter and
   edit the Config section at the top of
@@ -152,13 +209,15 @@ SCRIPT_URL="https://raw.githubusercontent.com/vdarkobar/scripts/main/bash/uptime
 SCRIPT_LOCAL="/root/uptime-kuma-quadlet.sh"
 SCRIPT_SELF="$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")"
 
-read -r -p "  Continue with these settings? [y/N]: " response
+read -r -p "  Continue with these settings? [y/N]: " response <&8
 case "$response" in
   [yY][eE][sS]|[yY]) ;;
   *)
     echo ""
     echo "  Saving current script to ${SCRIPT_LOCAL} for editing..."
-    if [[ -f "$SCRIPT_SELF" ]] && cp -f -- "$SCRIPT_SELF" "$SCRIPT_LOCAL"; then
+    # Shebang check: when run as 'curl | bash', $0 is the bash binary, not this script.
+    if [[ -f "$SCRIPT_SELF" ]] && head -n1 "$SCRIPT_SELF" 2>/dev/null | grep -q '^#!/usr/bin/env bash$' \
+      && cp -f -- "$SCRIPT_SELF" "$SCRIPT_LOCAL"; then
       chmod +x "$SCRIPT_LOCAL"
       echo "  Edit:  nano ${SCRIPT_LOCAL}"
       echo "  Run:   bash ${SCRIPT_LOCAL}"
@@ -198,11 +257,11 @@ ip link show "$BRIDGE" >/dev/null 2>&1 \
 # ── Root password ─────────────────────────────────────────────────────────────
 PASSWORD=""
 while true; do
-  read -r -s -p "  Set root password: " PW1; echo
+  read -r -s -p "  Set root password: " PW1 <&8; echo
   if [[ -z "$PW1" ]]; then echo "  Password cannot be blank."; continue; fi
   if [[ "$PW1" == *" "* ]]; then echo "  Password cannot contain spaces."; continue; fi
   if [[ ${#PW1} -lt 8 ]]; then echo "  Password must be at least 8 characters."; continue; fi
-  read -r -s -p "  Verify root password: " PW2; echo
+  read -r -s -p "  Verify root password: " PW2 <&8; echo
   if [[ "$PW1" == "$PW2" ]]; then PASSWORD="$PW1"; break; fi
   echo "  Passwords do not match. Try again."
 done
@@ -213,21 +272,28 @@ echo ""
 pveam update
 
 echo ""
-TEMPLATE="$(pveam available -section system | awk -v p="debian-${DEBIAN_VERSION}" '$2 ~ ("^" p) {print $2}' | sort -V | tail -n1)"
-if [[ -z "$TEMPLATE" ]]; then
-  echo "  WARNING: No Debian ${DEBIAN_VERSION} template found, trying any Debian..." >&2
-  TEMPLATE="$(pveam available -section system | awk '$2 ~ /^debian-/ {print $2}' | sort -V | tail -n1)"
-fi
-[[ -n "$TEMPLATE" ]] || { echo "  ERROR: No Debian template found via pveam." >&2; exit 1; }
+TEMPLATE="$(pveam available -section system \
+  | awk -v p="debian-${DEBIAN_VERSION}" -v a="$HOST_ARCH" \
+      '$2 ~ ("^" p "-standard_") && $2 ~ ("_" a "\\.tar\\.(zst|gz|xz)$") {print $2}' \
+  | sort -V | tail -n1)"
+[[ -n "$TEMPLATE" ]] || {
+  echo "  ERROR: No Debian ${DEBIAN_VERSION} template for host architecture ${HOST_ARCH} was found via pveam." >&2
+  exit 1
+}
 echo "  Template: $TEMPLATE"
 
-if [[ "$TEMPLATE_STORAGE" == "local" && -f "/var/lib/vz/template/cache/$TEMPLATE" ]]; then
+if pveam list "$TEMPLATE_STORAGE" 2>/dev/null | awk -v v="${TEMPLATE_STORAGE}:vztmpl/${TEMPLATE}" '$1==v{found=1} END{exit(!found)}'; then
   echo "  Template already present: $TEMPLATE"
 else
   pveam download "$TEMPLATE_STORAGE" "$TEMPLATE"
 fi
 
 # ── Create LXC ────────────────────────────────────────────────────────────────
+# Root password is set after start via chpasswd on stdin, keeping it out of
+# the host process list (pct create -password exposes it in ps).
+CT_FEATURES="nesting=1,keyctl=1"
+[[ "$PODMAN_FUSE_OVERLAY" -eq 1 ]] && CT_FEATURES+=",fuse=1"
+
 PCT_OPTIONS=(
   -hostname "$HN"
   -cores "$CPU"
@@ -235,11 +301,11 @@ PCT_OPTIONS=(
   -rootfs "${CONTAINER_STORAGE}:${DISK}"
   -onboot 1
   -ostype debian
+  -arch "$HOST_ARCH"
   -unprivileged 1
-  -features "nesting=1,keyctl=1,fuse=1"
+  -features "$CT_FEATURES"
   -tags "$TAGS"
   -net0 "name=eth0,bridge=${BRIDGE},ip=dhcp,ip6=manual"
-  -password "$PASSWORD"
 )
 
 pct create "$CT_ID" "${TEMPLATE_STORAGE}:vztmpl/${TEMPLATE}" "${PCT_OPTIONS[@]}"
@@ -258,6 +324,9 @@ done
 [[ -n "$CT_IP" ]] || { echo "  ERROR: No IPv4 address acquired via DHCP within timeout." >&2; exit 1; }
 echo "  CT $CT_ID is up — IP: $CT_IP"
 
+printf 'root:%s\n' "$PASSWORD" | pct exec "$CT_ID" -- chpasswd
+unset PASSWORD PW1 PW2
+
 # ── OS update ─────────────────────────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc '
   set -euo pipefail
@@ -272,11 +341,14 @@ pct exec "$CT_ID" -- bash -lc '
 '
 
 # ── Base packages, locale, timezone ───────────────────────────────────────────
+PODMAN_FUSE_PKG=""
+[[ "$PODMAN_FUSE_OVERLAY" -eq 1 ]] && PODMAN_FUSE_PKG="fuse-overlayfs"
+
 pct exec "$CT_ID" -- bash -lc "
   set -euo pipefail
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -qq
-  apt-get install -y locales curl ca-certificates iproute2 podman fuse-overlayfs tar gzip
+  apt-get install -y locales curl ca-certificates iproute2 podman tar gzip ${PODMAN_FUSE_PKG}
   sed -i 's/^# *en_US.UTF-8/en_US.UTF-8/' /etc/locale.gen
   locale-gen
   update-locale LANG=en_US.UTF-8
@@ -295,31 +367,44 @@ pct exec "$CT_ID" -- bash -lc '
 '
 
 # ── Podman configuration ──────────────────────────────────────────────────────
-pct exec "$CT_ID" -- bash -lc '
+OVERLAY_OPTIONS=""
+if [[ "$PODMAN_FUSE_OVERLAY" -eq 1 ]]; then
+  OVERLAY_OPTIONS='
+[storage.options.overlay]
+mount_program = "/usr/bin/fuse-overlayfs"'
+fi
+
+pct exec "$CT_ID" -- bash -lc "
   set -euo pipefail
   mkdir -p /etc/containers
 
   cat > /etc/containers/storage.conf <<EOF2
 [storage]
-driver = "overlay"
-runroot = "/run/containers/storage"
-graphroot = "/var/lib/containers/storage"
-
-[storage.options.overlay]
-mount_program = "/usr/bin/fuse-overlayfs"
+driver = \"overlay\"
+runroot = \"/run/containers/storage\"
+graphroot = \"/var/lib/containers/storage\"
+${OVERLAY_OPTIONS}
 EOF2
 
   cat > /etc/containers/containers.conf <<EOF2
 [containers]
 log_size_max = 10485760
 EOF2
-'
+"
 
 pct exec "$CT_ID" -- podman info >/dev/null 2>&1
 pct exec "$CT_ID" -- podman --version
 
+# Quadlet requires cgroup v2 and the overlay driver must actually be active
+# (a silent fallback to vfs would work but eat disk and be very slow).
+CGROUPS_VERSION="$(pct exec "$CT_ID" -- podman info --format '{{.Host.CgroupsVersion}}' 2>/dev/null || echo "?")"
+[[ "$CGROUPS_VERSION" == "v2" ]] || { echo "  ERROR: Quadlet requires cgroup v2 inside the CT; podman reports '${CGROUPS_VERSION}'." >&2; exit 1; }
+GRAPH_DRIVER="$(pct exec "$CT_ID" -- podman info --format '{{.Store.GraphDriverName}}' 2>/dev/null || echo "?")"
+[[ "$GRAPH_DRIVER" == "overlay" ]] || { echo "  ERROR: Podman storage driver is '${GRAPH_DRIVER}', expected overlay." >&2; exit 1; }
+echo "  Podman: cgroup ${CGROUPS_VERSION}, storage driver ${GRAPH_DRIVER}$([ "$PODMAN_FUSE_OVERLAY" -eq 1 ] && echo " (fuse-overlayfs)" || echo " (native)")"
+
 # ── Pull image ────────────────────────────────────────────────────────────────
-echo "  Pulling Uptime Kuma image ..."
+echo "  Pulling Uptime Kuma image: ${APP_IMAGE} ..."
 pct exec "$CT_ID" -- bash -lc "
   set -euo pipefail
   podman pull '${APP_IMAGE}'
@@ -377,7 +462,7 @@ EOF2
 
 # ── Runtime state file ────────────────────────────────────────────────────────
 # .env is not read by Quadlet or systemd. It is the maint script's source of
-# truth for current image tag and policy flags. Keep it in sync with the
+# truth for the current image tag and policy flag. Keep it in sync with the
 # Quadlet unit whenever the image is updated.
 pct exec "$CT_ID" -- bash -lc "
   set -euo pipefail
@@ -388,13 +473,17 @@ APP_IMAGE=${APP_IMAGE}
 APP_PORT=${APP_PORT}
 APP_TZ=${APP_TZ}
 APP_FQDN=${APP_FQDN}
+AUTO_UPDATE=${AUTO_UPDATE}
 EOF2
   chmod 0600 '${APP_DIR}/.env'
 "
 
 # ── Maintenance script ────────────────────────────────────────────────────────
-# Update flow: pull new image → sed Image= in Quadlet file → sed .env →
-# daemon-reload → restart service. Rollback restores both files and restarts.
+# update <tag>: guards → pull → sed Image= in Quadlet file → sed .env →
+#   daemon-reload → restart → health check; rollback restores both files,
+#   re-tags the previous image ID, daemon-reload, restart.
+# auto-update:  re-pull the CURRENT PINNED TAG; restart only if the image ID
+#   changed; rollback re-tags the previous image ID and restarts.
 pct exec "$CT_ID" -- bash -lc 'cat > /usr/local/bin/uptime-kuma-maint.sh && chmod 0755 /usr/local/bin/uptime-kuma-maint.sh' <<'MAINT'
 #!/usr/bin/env bash
 set -Eeo pipefail
@@ -402,6 +491,7 @@ set -Eeo pipefail
 APP_DIR="${APP_DIR:-/opt/uptime-kuma}"
 QUADLET_FILE="/etc/containers/systemd/uptime-kuma.container"
 SERVICE="uptime-kuma.service"
+CONTAINER="uptime-kuma"
 ENV_FILE="${APP_DIR}/.env"
 
 need_root() { [[ $EUID -eq 0 ]] || { echo "  ERROR: Run as root." >&2; exit 1; }; }
@@ -409,15 +499,17 @@ die() { echo "  ERROR: $*" >&2; exit 1; }
 
 usage() {
   cat <<EOF2
-  Uptime Kuma Maintenance
-  ───────────────────────
+  Uptime Kuma Maintenance (Quadlet)
+  ─────────────────────────────────
   Usage:
-    $0 update <tag>       # e.g. 2.3.0 — pinned version required, no :latest
+    $0 update <tag> [--yes]   # e.g. 2.5.3 — pinned version required, no :latest
+    $0 auto-update            # re-pull current pinned tag (only if AUTO_UPDATE=1)
     $0 version
 
   Notes:
-    - update pulls the pinned tag, updates the Quadlet unit, and restarts the service
-    - :latest is not permitted — always specify an explicit version tag
+    - update pulls the pinned tag, updates the Quadlet unit and .env, restarts the service
+    - auto-update is called by uptime-kuma-update.timer; it never changes the tag
+    - :latest and floating tags (2, 2-slim) are not permitted — always specify X.Y.Z
     - backup and restore are handled by PBS and PVE snapshots
     - take a PVE snapshot before manual updates: pct snapshot <CT_ID> pre-update-\$(date +%Y%m%d)
 EOF2
@@ -427,33 +519,48 @@ EOF2
 [[ -f "$ENV_FILE" ]]     || die "Missing env file: $ENV_FILE"
 [[ -f "$QUADLET_FILE" ]] || die "Missing Quadlet unit: $QUADLET_FILE"
 
-current_image() {
-  awk -F= '/^APP_IMAGE=/{print $2}' "$ENV_FILE" | tail -n1
+# One maintenance operation at a time — a manual update must not overlap the timer.
+LOCK_FILE="/run/lock/uptime-kuma-maint.lock"
+mkdir -p /run/lock
+exec 9>"$LOCK_FILE"
+flock -n 9 || die "Another uptime-kuma-maint.sh operation is already running."
+
+env_val() {
+  awk -F= -v key="$1" '$1==key{print substr($0, length(key)+2)}' "$ENV_FILE" | tail -n1
 }
 
-current_repo() {
-  awk -F= '/^APP_IMAGE_REPO=/{print $2}' "$ENV_FILE" | tail -n1
-}
-
-current_tag() {
-  local img
-  img="$(current_image)"
-  echo "${img##*:}"
+env_flag() {
+  local raw
+  raw="$(env_val "$1" | tr -d '[:space:]')"
+  [[ "$raw" =~ ^[01]$ ]] && printf '%s' "$raw" || printf '0'
 }
 
 app_port() {
   local port
-  port="$(awk -F= '/^APP_PORT=/{print $2}' "$ENV_FILE" | tail -n1 | tr -d '[:space:]')"
+  port="$(env_val APP_PORT | tr -d '[:space:]')"
   [[ "$port" =~ ^[0-9]+$ ]] && printf '%s' "$port" || printf '3001'
 }
 
+current_image() { env_val APP_IMAGE; }
+current_repo()  { env_val APP_IMAGE_REPO; }
+current_tag()   { local img; img="$(current_image)"; echo "${img##*:}"; }
+
+running_image_id() {
+  podman inspect --format '{{.Image}}' "$CONTAINER" 2>/dev/null || true
+}
+
+image_id_of() {
+  podman image inspect --format '{{.Id}}' "$1" 2>/dev/null || true
+}
+
+# Upstream extra/healthcheck.js probes / and accepts 200 or 302.
 wait_for_app() {
   local port code
   port="$(app_port)"
   for i in $(seq 1 45); do
     code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 "http://127.0.0.1:${port}/" 2>/dev/null || echo 000)"
     case "$code" in
-      200|301|302|401|403) return 0 ;;
+      200|302) return 0 ;;
     esac
     sleep 2
   done
@@ -469,15 +576,19 @@ update_app() {
     esac
   done
 
-  local old_tag repo new_image tmp_env tmp_quadlet
+  local old_tag repo old_image new_image old_id tmp_env tmp_quadlet
   [[ -n "$new_tag" ]] || die "Usage: uptime-kuma-maint.sh update <tag>"
   [[ "$new_tag" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9._-]+)?$ ]] \
-    || die "Invalid tag: $new_tag — pinned version required (e.g. 2.3.0), ':latest' is not permitted."
+    || die "Invalid tag: $new_tag — pinned version required (e.g. 2.5.3), ':latest' and floating tags are not permitted."
 
   old_tag="$(current_tag)"
   repo="$(current_repo)"
   [[ -n "$repo" ]] || die "Could not read APP_IMAGE_REPO from .env"
+  old_image="$(current_image)"
   new_image="${repo}:${new_tag}"
+  # Capture the current image ID before pulling: if new_tag == old_tag, the pull
+  # moves the tag and the old ref would otherwise resolve to the NEW image on rollback.
+  old_id="$(image_id_of "$old_image")"
   tmp_env="$(mktemp)"
   tmp_quadlet="$(mktemp)"
 
@@ -566,9 +677,15 @@ update_app() {
     echo "  !! Update failed — rolling back and restarting ..." >&2
     cp -a "$tmp_env"     "$ENV_FILE"
     cp -a "$tmp_quadlet" "$QUADLET_FILE"
+    [[ -n "$old_id" ]] && podman tag "$old_id" "$old_image" >/dev/null 2>&1 || true
     systemctl daemon-reload
     systemctl restart "$SERVICE" || true
     rm -f "$tmp_env" "$tmp_quadlet"
+    if wait_for_app; then
+      echo "  Rollback complete — ${old_image} is healthy again." >&2
+    else
+      echo "  CRITICAL: rollback to ${old_image} did not become healthy. Restore the CT from the PVE snapshot / PBS." >&2
+    fi
   }
   trap rollback ERR
 
@@ -594,15 +711,70 @@ update_app() {
 
   trap - ERR
   cleanup
+  if [[ -n "$old_id" && "$old_id" != "$(image_id_of "$new_image")" ]]; then
+    podman rmi "$old_id" >/dev/null 2>&1 || true
+  fi
   echo "  OK: Uptime Kuma updated to $new_tag"
+}
+
+# auto-update — re-pull the current pinned tag; restart only if the image changed
+auto_update_app() {
+  if [[ "$(env_flag AUTO_UPDATE)" != "1" ]]; then
+    echo "  Auto-update disabled in ${ENV_FILE}; nothing to do."
+    return 0
+  fi
+
+  local image old_id new_id
+  image="$(current_image)"
+  [[ -n "$image" ]] || die "Could not read APP_IMAGE from .env"
+  old_id="$(running_image_id)"
+
+  echo "  Auto-update: re-pulling pinned ${image} ..."
+  podman pull "$image"
+  new_id="$(image_id_of "$image")"
+  [[ -n "$new_id" ]] || die "Could not inspect pulled image ${image}"
+
+  if [[ -n "$old_id" && "$new_id" == "$old_id" ]]; then
+    echo "  OK: ${image} is already current — no restart needed."
+    return 0
+  fi
+
+  rollback() {
+    echo "  !! Auto-update failed — restoring previous image and restarting ..." >&2
+    [[ -n "$old_id" ]] && podman tag "$old_id" "$image" >/dev/null 2>&1 || true
+    systemctl restart "$SERVICE" || true
+    if wait_for_app; then
+      echo "  Rollback complete — previous image is healthy again." >&2
+    else
+      echo "  CRITICAL: rollback did not become healthy. Restore the CT from the PVE snapshot / PBS." >&2
+    fi
+  }
+  trap rollback ERR
+
+  echo "  Image changed — restarting service ..."
+  systemctl restart "$SERVICE"
+
+  echo "  Waiting for UI ..."
+  if ! wait_for_app; then
+    trap - ERR
+    rollback
+    die "Uptime Kuma did not become reachable after auto-update."
+  fi
+
+  trap - ERR
+  [[ -n "$old_id" ]] && podman rmi "$old_id" >/dev/null 2>&1 || true
+  echo "  OK: Uptime Kuma refreshed on ${image}"
 }
 
 need_root
 cmd="${1:-}"
 case "$cmd" in
   update)      shift; update_app "$@" ;;
+  auto-update) auto_update_app ;;
   version)
     echo "Configured image: $(current_image)"
+    echo "Running image ID: $(running_image_id)"
+    echo "AUTO_UPDATE=$(env_flag AUTO_UPDATE)"
     ;;
   ""|-h|--help) usage ;;
   *) usage; die "Unknown command: $cmd" ;;
@@ -653,11 +825,13 @@ else
   echo "  Container count OK ($RUNNING running)"
 fi
 
+# Upstream extra/healthcheck.js probes / and accepts 200 or 302. Long loop:
+# first start initialises the embedded DB before the HTTP listener comes up.
 UK_HEALTHY=0
 for i in $(seq 1 90); do
   HTTP_CODE="$(pct exec "$CT_ID" -- sh -lc "curl -s -o /dev/null -w '%{http_code}' --max-time 3 http://127.0.0.1:${APP_PORT}/ 2>/dev/null" 2>/dev/null || echo 000)"
   case "$HTTP_CODE" in
-    200|301|302|401|403)
+    200|302)
       UK_HEALTHY=1
       break
       ;;
@@ -679,6 +853,44 @@ if (( VERIFY_FAIL == 1 )); then
   echo "  FATAL: Core verification failed — CT $CT_ID is preserved but the install is incomplete." >&2
   echo "  Inspect the container and fix manually, or destroy and re-run." >&2
   exit 1
+fi
+
+# ── Auto-update timer (policy-driven) ─────────────────────────────────────────
+pct exec "$CT_ID" -- bash -lc '
+  set -euo pipefail
+  cat > /etc/systemd/system/uptime-kuma-update.service <<EOF2
+[Unit]
+Description=Uptime Kuma auto-update maintenance run
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/uptime-kuma-maint.sh auto-update
+EOF2
+
+  cat > /etc/systemd/system/uptime-kuma-update.timer <<EOF2
+[Unit]
+Description=Uptime Kuma auto-update timer
+
+[Timer]
+OnCalendar=*-*-01 05:30:00
+OnCalendar=*-*-15 05:30:00
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target
+EOF2
+
+  systemctl daemon-reload
+'
+if [[ "$AUTO_UPDATE" -eq 1 ]]; then
+  pct exec "$CT_ID" -- bash -lc 'systemctl enable --now uptime-kuma-update.timer'
+  echo "  Auto-update timer enabled"
+else
+  pct exec "$CT_ID" -- bash -lc 'systemctl disable --now uptime-kuma-update.timer >/dev/null 2>&1 || true'
+  echo "  Auto-update timer installed but disabled"
 fi
 
 # ── Unattended upgrades ───────────────────────────────────────────────────────
@@ -737,7 +949,10 @@ net.ipv4.conf.default.accept_source_route = 0
 net.ipv4.icmp_echo_ignore_broadcasts = 1
 net.ipv4.icmp_ignore_bogus_error_responses = 1
 EOF2
-  sysctl --system >/dev/null 2>&1 || true
+  if ! sysctl --system >/dev/null 2>&1; then
+    echo "  WARNING: sysctl --system reported errors — some keys may be read-only in this unprivileged CT:" >&2
+    sysctl --system 2>&1 | grep -i "error\|permission" >&2 || true
+  fi
 '
 
 # ── Cleanup packages ──────────────────────────────────────────────────────────
@@ -774,15 +989,21 @@ MOTD
   cat > /etc/update-motd.d/30-app <<'MOTD'
 #!/bin/sh
 running=\$(podman ps --filter name=^uptime-kuma$ --format '{{.Names}}' 2>/dev/null | wc -l)
-svc_status=\$(systemctl is-active uptime-kuma.service 2>/dev/null || echo "unknown")
+svc_status=\$(systemctl is-active uptime-kuma.service 2>/dev/null); svc_status=\${svc_status:-unknown}
 ip=\$(ip -4 -o addr show scope global 2>/dev/null | awk '{print \$4}' | cut -d/ -f1 | head -n1)
-fqdn=\"\$(awk -F= '/^APP_FQDN=/{print \$2}' /opt/uptime-kuma/.env 2>/dev/null | tail -n1)\"
-port=\"\$(awk -F= '/^APP_PORT=/{print \$2}' /opt/uptime-kuma/.env 2>/dev/null | tail -n1)\"
-port=\"\${port:-3001}\"
+image=\$(awk -F= '/^APP_IMAGE=/{print \$2}' /opt/uptime-kuma/.env 2>/dev/null | tail -n1)
+auto=\$(awk -F= '/^AUTO_UPDATE=/{print \$2}' /opt/uptime-kuma/.env 2>/dev/null | tail -n1)
+fqdn=\$(awk -F= '/^APP_FQDN=/{print \$2}' /opt/uptime-kuma/.env 2>/dev/null | tail -n1)
+port=\$(awk -F= '/^APP_PORT=/{print \$2}' /opt/uptime-kuma/.env 2>/dev/null | tail -n1)
+port=\${port:-3001}
 printf '  Container: uptime-kuma (%s running)\n' \"\$running\"
 printf '  Service:   uptime-kuma.service (%s)\n' \"\$svc_status\"
+printf '  Image:     %s\n' \"\${image:-n/a}\"
+printf '  Policy:    %s\n' \"\$([ \"\$auto\" = '1' ] && echo 'auto-update 1st/15th (re-pull pinned tag)' || echo 'manual updates only')\"
+printf '  Data:      /opt/uptime-kuma/data (owned 1000:1000 — embedded MariaDB)\n'
 printf '  Logs:      journalctl -u uptime-kuma.service -f\n'
-printf '  Maintain:  /usr/local/bin/uptime-kuma-maint.sh [update|version]\n'
+printf '  Maintain:  /usr/local/bin/uptime-kuma-maint.sh [update|auto-update|version]\n'
+printf '  Updates:   systemctl status uptime-kuma-update.timer\n'
 if [ -n \"\$fqdn\" ]; then
   printf '  Web UI:    https://%s\n' \"\$fqdn\"
 fi
@@ -811,6 +1032,7 @@ if [[ -n "$APP_FQDN" ]]; then
 fi
 UK_DESC="<a href='${UK_DESC_LINK}/' target='_blank' rel='noopener noreferrer' style='text-decoration: none; color: #00617f;'>Uptime Kuma</a>
 <details><summary>Details</summary>Uptime Kuma (Podman/Quadlet) on Debian ${DEBIAN_VERSION} LXC
+Tag: ${APP_TAG}
 Created by uptime-kuma-quadlet.sh</details>"
 pct set "$CT_ID" --description "$UK_DESC"
 
@@ -825,15 +1047,24 @@ if [[ -n "$APP_FQDN" ]]; then
 fi
 echo "    Image:   ${APP_IMAGE}"
 echo "    Quadlet: ${QUADLET_FILE}"
+echo "    Data:    ${APP_DIR}/data  (DB backend chosen at first-run setup; owned 1000:1000)"
+echo "    Policy:  $([ "$AUTO_UPDATE" -eq 1 ] && echo "auto-update 1st/15th 05:30 (re-pull pinned ${APP_TAG})" || echo "pinned (manual)")"
 echo ""
 echo "    pct exec $CT_ID -- systemctl status uptime-kuma.service"
 echo "    pct exec $CT_ID -- journalctl -u uptime-kuma.service --no-pager -n 50"
-echo "    pct exec $CT_ID -- /usr/local/bin/uptime-kuma-maint.sh update <tag>  # e.g. 2.3.0 — no :latest"
+echo "    pct exec $CT_ID -- /usr/local/bin/uptime-kuma-maint.sh update <tag>   # e.g. 2.5.4 — no :latest"
+echo "    pct exec $CT_ID -- /usr/local/bin/uptime-kuma-maint.sh auto-update   # re-pull pinned tag (if AUTO_UPDATE=1)"
 echo "    pct exec $CT_ID -- /usr/local/bin/uptime-kuma-maint.sh version"
 echo "    Backup/restore: use PBS or PVE snapshots"
 echo ""
 echo "    NPM reverse proxy: http | ${CT_IP}:${APP_PORT} | enable Websockets Support"
-echo "    First visit creates the admin account."
+echo "    First visit creates the admin account and selects the DB backend (SQLite recommended"
+echo "    for a homelab; embedded MariaDB is sensitive to image changes — see maint guards)."
 echo "    Session lost after update/restart — log in again or reset password:"
 echo "    pct exec $CT_ID -- podman exec uptime-kuma node /app/extra/reset-password.js"
+if [[ "$PODMAN_FUSE_OVERLAY" -eq 1 ]]; then
+  echo ""
+  echo "    Backups: fuse=1 + fuse-overlayfs can deadlock under snapshot-mode vzdump/PBS (freezer)."
+  echo "             Use stop-mode backups for this CT, or test PODMAN_FUSE_OVERLAY=0."
+fi
 echo ""
