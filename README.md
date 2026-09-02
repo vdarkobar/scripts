@@ -176,7 +176,7 @@
 <details>
   <summary>SearXNG on Podman</summary>
   <p>Privacy-focused metasearch engine on Podman.</p>
-  <pre><code>bash &lt;(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/bash/searxng-podman.sh)</code></pre>
+  <pre><code>bash &lt;(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/bash/searxng-quadlet.sh)</code></pre>
 </details>
 
 <details>
