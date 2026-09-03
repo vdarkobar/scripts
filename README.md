@@ -123,7 +123,7 @@
 </details>
 
 <details>
-  <summary>Docmost on Podman</summary>
+  <summary>Docmost</summary>
   <p>Collaborative wiki and documentation platform on Podman.</p>
   <pre><code>bash &lt;(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/bash/docmost-quadlet.sh)</code></pre>
 </details>
