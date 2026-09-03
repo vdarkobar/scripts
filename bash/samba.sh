@@ -23,7 +23,10 @@ SMB_SERVER_SIGNING="required"
 SMB_ENCRYPTION="required"
 TAGS="samba;fileserver;lxc"
 DEBIAN_VERSION=13
-SHARE_STORAGE="rootfs"              # rootfs | <zfs-pool-name> | /host/path
+SHARE_STORAGE="rootfs"              # rootfs | <zfs-pool-or-dataset> | /host/path
+SHARE_DATASET_NAME=""               # ZFS mode only; empty = samba-<HN>. Named by hostname so a
+                                    # rebuilt CT re-attaches its existing data automatically.
+SMB_HOSTS_ALLOW=""                  # empty = unrestricted; e.g. "192.168.1.0/24" or "10.0.0.0/8 192.168.1.0/24"
 
 # Post-install: add more Samba users inside the CT
 #   pct exec <CT_ID> -- useradd -M -s /usr/sbin/nologin -G sambashare <username>
@@ -33,9 +36,8 @@ SHARE_STORAGE="rootfs"              # rootfs | <zfs-pool-name> | /host/path
 # Optional features
 DISABLE_IPV6=0
 
-# Extra packages to install (space-separated or array)
+# Extra packages to install inside the CT (leave empty for none)
 EXTRA_PACKAGES=(
-  qemu-guest-agent
 )
 
 # Behavior
@@ -50,10 +52,11 @@ CLEANUP_ON_FAIL=1  # 1 = destroy CT on error, 0 = keep for debugging
 #   /etc/apt/apt.conf.d/52unattended-<hostname>.conf
 #   /etc/apt/apt.conf.d/20auto-upgrades
 #   /etc/sysctl.d/99-hardening.conf
-#   <pool>/samba-share-lxc<CT_ID>                                      (optional: ZFS dataset, when SHARE_STORAGE=<pool>)
+#   <pool>/<SHARE_DATASET_NAME or samba-<HN>>                        (optional: ZFS dataset, when SHARE_STORAGE=<pool>)
 
-# ── Validate config values (guard against sed injection) ──────────────────────
+# ── Validate config values (expanded into smb.conf / pct set) ────────────────
 fail=""
+[[ "$HN"                 =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]] || fail="HN"
 [[ "$APP_TZ"             =~ ^[A-Za-z0-9._+-]+(/[A-Za-z0-9._+-]+)+$ ]] || fail="APP_TZ"
 [[ "$SMB_WORKGROUP"      =~ ^[A-Za-z0-9._-]+$ ]]     || fail="SMB_WORKGROUP"
 [[ "$SMB_SERVER_NAME"    =~ ^[A-Za-z0-9._-]+$ ]]     || fail="SMB_SERVER_NAME"
@@ -63,24 +66,36 @@ fail=""
 [[ "$SMB_MIN_PROTOCOL"   =~ ^[A-Za-z0-9_]+$ ]]       || fail="SMB_MIN_PROTOCOL"
 [[ "$SMB_SERVER_SIGNING" =~ ^[a-z]+$ ]]              || fail="SMB_SERVER_SIGNING"
 [[ "$SMB_ENCRYPTION"     =~ ^[a-z]+$ ]]              || fail="SMB_ENCRYPTION"
+[[ "$SHARE_DATASET_NAME" =~ ^[A-Za-z0-9_.-]*$ ]]     || fail="SHARE_DATASET_NAME"
+[[ "$SMB_HOSTS_ALLOW"    =~ ^[0-9A-Fa-f.:/,\ ]*$ ]]   || fail="SMB_HOSTS_ALLOW"
 if [[ -n "$fail" ]]; then
   echo "  ERROR: Invalid characters in $fail — check the Config section." >&2
   exit 1
 fi
 
-if [[ "$SHARE_STORAGE" != "rootfs" && "$SHARE_STORAGE" != /* && ! "$SHARE_STORAGE" =~ ^[A-Za-z0-9_.:-]+$ ]]; then
-  echo "  ERROR: SHARE_STORAGE must be rootfs, an absolute host path, or a ZFS pool name." >&2
+if [[ "$SHARE_STORAGE" == /* ]]; then
+  [[ "$SHARE_STORAGE" =~ ^/[A-Za-z0-9/_.-]+$ ]] \
+    || { echo "  ERROR: SHARE_STORAGE host path contains invalid characters." >&2; exit 1; }
+elif [[ "$SHARE_STORAGE" != "rootfs" && ! "$SHARE_STORAGE" =~ ^[A-Za-z0-9_.-]+(/[A-Za-z0-9_.-]+)*$ ]]; then
+  echo "  ERROR: SHARE_STORAGE must be rootfs, an absolute host path, or a ZFS pool/dataset name." >&2
   exit 1
 fi
 
+[[ -f "/usr/share/zoneinfo/${APP_TZ}" ]] \
+  || { echo "  ERROR: Unknown timezone: ${APP_TZ}" >&2; exit 1; }
+
 # ── Trap cleanup ──────────────────────────────────────────────────────────────
-trap 'trap - ERR; rc=$?;
-  echo "  ERROR: failed (rc=$rc) near line ${BASH_LINENO[0]:-?}" >&2
+trap 'rc=$?; trap - ERR;
+  echo "  ERROR: failed (rc=$rc) near line $LINENO" >&2
   echo "  Command: $BASH_COMMAND" >&2
   if [[ "${CLEANUP_ON_FAIL:-0}" -eq 1 && "${CREATED:-0}" -eq 1 ]]; then
     echo "  Cleanup: stopping/destroying CT ${CT_ID} ..." >&2
     pct stop "${CT_ID}" >/dev/null 2>&1 || true
     pct destroy "${CT_ID}" >/dev/null 2>&1 || true
+    if [[ -n "${SHARE_DATASET:-}" ]] && zfs list -H -o name "${SHARE_DATASET}" >/dev/null 2>&1; then
+      echo "  Note: ZFS dataset ${SHARE_DATASET} was left in place (data is never auto-destroyed)." >&2
+      echo "        Remove it manually if unwanted: zfs destroy ${SHARE_DATASET}" >&2
+    fi
   fi
   exit "$rc"
 ' ERR
@@ -92,14 +107,19 @@ trap 'rc=$?;
     echo "  Cleanup: stopping/destroying CT ${CT_ID} ..." >&2
     pct stop "${CT_ID}" >/dev/null 2>&1 || true
     pct destroy "${CT_ID}" >/dev/null 2>&1 || true
+    if [[ -n "${SHARE_DATASET:-}" ]] && zfs list -H -o name "${SHARE_DATASET}" >/dev/null 2>&1; then
+      echo "  Note: ZFS dataset ${SHARE_DATASET} was left in place (data is never auto-destroyed)." >&2
+      echo "        Remove it manually if unwanted: zfs destroy ${SHARE_DATASET}" >&2
+    fi
   fi
   exit "$rc"
 ' INT TERM
 
 # ── Preflight — root & commands ───────────────────────────────────────────────
 [[ "$(id -u)" -eq 0 ]] || { echo "  ERROR: Run as root on the Proxmox host." >&2; exit 1; }
+[[ -t 0 ]] || { echo "  ERROR: stdin is not a terminal — run interactively, e.g. bash <(curl -fsSL URL), not curl | bash." >&2; exit 1; }
 
-for cmd in pvesh pveam pct pvesm curl python3 ip awk sort paste; do
+for cmd in pvesh pveam pct pvesm curl python3 ip awk sort paste dpkg; do
   command -v "$cmd" >/dev/null 2>&1 || { echo "  ERROR: Missing required command: $cmd" >&2; exit 1; }
 done
 
@@ -135,7 +155,7 @@ if [[ "$SHARE_STORAGE" == "rootfs" ]]; then
 elif [[ "$SHARE_STORAGE" == /* ]]; then
   SHARE_DERIVED="${SHARE_STORAGE} -> ${SMB_SHARE_PATH} (CT mp0)"
 else
-  SHARE_DERIVED="${SHARE_STORAGE}/samba-share-lxc${CT_ID} -> ${SMB_SHARE_PATH} (CT mp0)"
+  SHARE_DERIVED="${SHARE_STORAGE}/${SHARE_DATASET_NAME:-samba-${HN}} -> ${SMB_SHARE_PATH} (CT mp0)"
 fi
 
 cat <<EOF
@@ -162,6 +182,7 @@ cat <<EOF
   SMB Encryption:    $SMB_ENCRYPTION
   Share Storage:     $SHARE_STORAGE (available ZFS pools: $AVAIL_ZFS_POOLS)
   Derived:           $SHARE_DERIVED
+  Hosts Allow:       ${SMB_HOSTS_ALLOW:-unrestricted}
   Tags:              $TAGS
   Cleanup on fail:   $CLEANUP_ON_FAIL
   ────────────────────────────────────────────────
@@ -201,6 +222,11 @@ pvesm status | awk -v s="$CONTAINER_STORAGE" '$1==s{f=1} END{exit(!f)}' \
 
 ip link show "$BRIDGE" >/dev/null 2>&1 || { echo "  ERROR: Bridge not found: $BRIDGE" >&2; exit 1; }
 
+if [[ "$SHARE_STORAGE" != "rootfs" && "$SHARE_STORAGE" != /* ]]; then
+  zfs list -H -o name "$SHARE_STORAGE" >/dev/null 2>&1 \
+    || { echo "  ERROR: ZFS pool/dataset not found: $SHARE_STORAGE (available: $AVAIL_ZFS_POOLS)" >&2; exit 1; }
+fi
+
 # ── Root password ─────────────────────────────────────────────────────────────
 PASSWORD=""
 while true; do
@@ -225,6 +251,11 @@ while true; do
     SMB_USER=""
     continue
   fi
+  if [[ "$SMB_USER" == "root" ]]; then
+    echo "  Invalid: root cannot be a Samba user."
+    SMB_USER=""
+    continue
+  fi
   while true; do
     read -r -s -p "  Samba password for $SMB_USER: " SP1; echo
     if [[ -z "$SP1" ]]; then echo "  Password cannot be blank."; continue; fi
@@ -241,15 +272,23 @@ echo ""
 pveam update
 echo ""
 
-TEMPLATE="$(pveam available -section system | awk -v p="debian-${DEBIAN_VERSION}" '$2 ~ ("^" p) {print $2}' | sort -V | tail -n1)"
+# Filter by host architecture: the index lists amd64 and arm64 templates side by
+# side, and "_arm64" sorts after "_amd64" — without this filter an x86 host picks
+# the ARM template and the CT dies with "Exec format error" on /sbin/init.
+HOST_ARCH="$(dpkg --print-architecture)"
+TEMPLATE="$(pveam available -section system \
+  | awk -v p="debian-${DEBIAN_VERSION}" -v a="_${HOST_ARCH}." '$2 ~ ("^" p) && index($2, a) {print $2}' \
+  | sort -V | tail -n1)"
 if [[ -z "$TEMPLATE" ]]; then
-  echo "  WARNING: No Debian ${DEBIAN_VERSION} template found, trying any Debian..." >&2
-  TEMPLATE="$(pveam available -section system | awk '$2 ~ /^debian-/ {print $2}' | sort -V | tail -n1)"
+  echo "  WARNING: No Debian ${DEBIAN_VERSION} ${HOST_ARCH} template found, trying any Debian ${HOST_ARCH}..." >&2
+  TEMPLATE="$(pveam available -section system \
+    | awk -v a="_${HOST_ARCH}." '$2 ~ /^debian-/ && index($2, a) {print $2}' \
+    | sort -V | tail -n1)"
 fi
 [[ -n "$TEMPLATE" ]] || { echo "  ERROR: No Debian template found via pveam." >&2; exit 1; }
 echo "  Template: $TEMPLATE"
 
-if [[ "$TEMPLATE_STORAGE" == "local" && -f "/var/lib/vz/template/cache/$TEMPLATE" ]]; then
+if pvesm list "$TEMPLATE_STORAGE" --content vztmpl 2>/dev/null | grep -qF "vztmpl/${TEMPLATE}"; then
   echo "  Template already present: $TEMPLATE"
 else
   pveam download "$TEMPLATE_STORAGE" "$TEMPLATE"
@@ -264,6 +303,8 @@ PCT_OPTIONS=(
   -onboot 1
   -ostype debian
   -unprivileged 1
+  # nesting=1 is NOT for Samba: unprivileged CTs with systemd >= 255 (Debian 13 = 257)
+  # need it to boot at all — PVE warns "You may need to enable nesting" without it.
   -features "nesting=1"
   -tags "$TAGS"
   -net0 "name=eth0,bridge=${BRIDGE},ip=dhcp,ip6=manual"
@@ -276,20 +317,45 @@ CREATED=1
 # ── Share storage — ZFS dataset / bind-mount ──────────────────────────────────
 if [[ "$SHARE_STORAGE" == "rootfs" ]]; then
   echo "  WARNING: No external share storage configured — share will use rootfs (${DISK} GB)." >&2
-elif [[ "$SHARE_STORAGE" == /* ]]; then
-  mkdir -p "$SHARE_STORAGE"
-  chown 100000:100000 "$SHARE_STORAGE"
-  pct set "$CT_ID" --mp0 "${SHARE_STORAGE},mp=${SMB_SHARE_PATH}"
-  echo "  Share mount: ${SHARE_STORAGE} -> ${SMB_SHARE_PATH} (CT ${CT_ID})"
 else
-  SHARE_DATASET="${SHARE_STORAGE}/samba-share-lxc${CT_ID}"
-  SHARE_HOST_PATH="$(zfs get -H -o value mountpoint "${SHARE_DATASET}" 2>/dev/null || true)"
-  if [[ -z "$SHARE_HOST_PATH" || "$SHARE_HOST_PATH" == "-" ]]; then
-    echo "  Creating ZFS dataset: ${SHARE_DATASET}"
-    zfs create -o compression=lz4 "${SHARE_DATASET}"
-    SHARE_HOST_PATH="$(zfs get -H -o value mountpoint "${SHARE_DATASET}")"
+  if [[ "$SHARE_STORAGE" == /* ]]; then
+    SHARE_HOST_PATH="$SHARE_STORAGE"
+    mkdir -p "$SHARE_HOST_PATH"
   else
-    echo "  ZFS dataset already exists: ${SHARE_DATASET} -> ${SHARE_HOST_PATH}"
+    SHARE_DATASET="${SHARE_STORAGE}/${SHARE_DATASET_NAME:-samba-${HN}}"
+    SHARE_HOST_PATH="$(zfs get -H -o value mountpoint "${SHARE_DATASET}" 2>/dev/null || true)"
+    if [[ -z "$SHARE_HOST_PATH" || "$SHARE_HOST_PATH" == "-" ]]; then
+      echo "  Creating ZFS dataset: ${SHARE_DATASET}"
+      # posixacl + xattr=sa: required for setfacl default ACLs and Samba DOS attributes
+      zfs create \
+        -o compression=lz4 \
+        -o acltype=posixacl \
+        -o xattr=sa \
+        -o aclinherit=passthrough \
+        "${SHARE_DATASET}"
+      SHARE_HOST_PATH="$(zfs get -H -o value mountpoint "${SHARE_DATASET}")"
+    elif [[ "$SHARE_HOST_PATH" == "legacy" || "$SHARE_HOST_PATH" == "none" ]]; then
+      echo "  ERROR: ZFS dataset ${SHARE_DATASET} exists but has mountpoint=${SHARE_HOST_PATH}." >&2
+      echo "         Set a real mountpoint (zfs set mountpoint=/path ${SHARE_DATASET}) or use another name." >&2
+      false
+    else
+      echo "  Reusing existing ZFS dataset: ${SHARE_DATASET} -> ${SHARE_HOST_PATH}"
+      [[ "$(zfs get -H -o value acltype "${SHARE_DATASET}")" == "posixacl" ]] \
+        || echo "  WARNING: ${SHARE_DATASET} has acltype != posixacl — default ACLs will not apply." >&2
+    fi
+  fi
+
+  # Unprivileged CT: CT root = host UID 100000. The mountpoint itself must be owned
+  # by 100000 so the CT can chown/chmod it. Only the top directory is changed here —
+  # existing files keep their host UIDs. Files written by a previous CT built with
+  # this script already sit in the 100000+ range and remain usable. Anything else
+  # must be fixed on the host afterwards, e.g.
+  #   chown -R 100000:100000 <path>        (make everything CT-root owned), or
+  #   chown -R 10XXXX:10YYYY <path>        (map to a specific CT uid/gid + 100000)
+  if [[ -n "$(ls -A "$SHARE_HOST_PATH" 2>/dev/null)" ]]; then
+    echo "  NOTE: ${SHARE_HOST_PATH} already contains data — keeping it." >&2
+    echo "        Only the top directory is chowned to 100000:100000; existing files keep" >&2
+    echo "        their current ownership (top dir now: $(stat -c '%u:%g' "$SHARE_HOST_PATH"))." >&2
   fi
   chown 100000:100000 "$SHARE_HOST_PATH"
   pct set "$CT_ID" --mp0 "${SHARE_HOST_PATH},mp=${SMB_SHARE_PATH}"
@@ -300,7 +366,7 @@ fi
 pct start "$CT_ID"
 
 CT_IP=""
-for i in $(seq 1 30); do
+for i in $(seq 1 60); do
   CT_IP="$(
     pct exec "$CT_ID" -- sh -lc '
       ip -4 -o addr show scope global 2>/dev/null | awk "{print \$4}" | cut -d/ -f1 | head -n1
@@ -309,7 +375,7 @@ for i in $(seq 1 30); do
   [[ -n "$CT_IP" ]] && break
   sleep 1
 done
-[[ -n "$CT_IP" ]] || { echo "  ERROR: No IPv4 address acquired via DHCP within timeout." >&2; exit 1; }
+[[ -n "$CT_IP" ]] || { echo "  ERROR: No IPv4 address acquired via DHCP within timeout." >&2; false; }
 
 # ── OS update ─────────────────────────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc '
@@ -373,12 +439,20 @@ pct exec "$CT_ID" -- bash -lc "
   chown root:'${SMB_GROUP}' '${SMB_SHARE_PATH}'
   chmod 2775 '${SMB_SHARE_PATH}'
   
-  # Set default ACLs
-  setfacl -d -m 'g:${SMB_GROUP}:rwx' '${SMB_SHARE_PATH}' 2>/dev/null || true
-  setfacl -d -m 'm:rwx' '${SMB_SHARE_PATH}' 2>/dev/null || true
+  # Set default ACLs (new files/dirs inherit group rwx)
+  if ! setfacl -d -m 'g:${SMB_GROUP}:rwx' -m 'm:rwx' '${SMB_SHARE_PATH}' 2>/dev/null; then
+    echo '  WARNING: default ACLs not applied — filesystem lacks POSIX ACL support' >&2
+  fi
 "
 
 # ── Write smb.conf ────────────────────────────────────────────────────────────
+# hosts allow semantics: when set, only listed hosts may connect (no hosts deny needed)
+if [[ -n "$SMB_HOSTS_ALLOW" ]]; then
+  SMB_HOSTS_ALLOW_LINE="   hosts allow = ${SMB_HOSTS_ALLOW} 127.0.0.1"
+else
+  SMB_HOSTS_ALLOW_LINE="   # hosts allow = <unrestricted — set SMB_HOSTS_ALLOW in the creator script>"
+fi
+
 pct exec "$CT_ID" -- bash -lc "
   set -euo pipefail
   
@@ -389,21 +463,26 @@ pct exec "$CT_ID" -- bash -lc "
 #======================= Global Settings =======================
 
 [global]
-   workgroup = __WORKGROUP__
-   server string = Samba File Server %v
-   netbios name = __SERVER_NAME__
+   workgroup = ${SMB_WORKGROUP}
+   server string = Samba File Server
+   netbios name = ${SMB_SERVER_NAME}
+   disable netbios = yes
+   smb ports = 445
+${SMB_HOSTS_ALLOW_LINE}
 
    security = user
    passdb backend = tdbsam
    map to guest = never
 
-   server min protocol = __MIN_PROTOCOL__
-   client min protocol = __MIN_PROTOCOL__
-   server signing = __SERVER_SIGNING__
-   client signing = __SERVER_SIGNING__
-   smb encrypt = __SMB_ENCRYPTION__
-   server smb3 encryption algorithms = AES-256-GCM, AES-256-CCM
-   server smb3 signing algorithms = AES-256-GMAC
+   server min protocol = ${SMB_MIN_PROTOCOL}
+   client min protocol = ${SMB_MIN_PROTOCOL}
+   server signing = ${SMB_SERVER_SIGNING}
+   client signing = ${SMB_SERVER_SIGNING}
+   smb encrypt = ${SMB_ENCRYPTION}
+   # AES-256 preferred; AES-128-GCM kept so Windows 10, older macOS and
+   # Android clients (AES-128 only) can still connect
+   server smb3 encryption algorithms = AES-256-GCM, AES-256-CCM, AES-128-GCM
+   server smb3 signing algorithms = AES-256-GMAC, AES-128-GMAC
    ntlm auth = ntlmv2-only
 
    log file = /var/log/samba/log.%m
@@ -424,21 +503,22 @@ pct exec "$CT_ID" -- bash -lc "
 
 #======================= Share Definitions =======================
 
-[__SHARE_NAME__]
+[${SMB_SHARE_NAME}]
    comment = Shared Directory
-   path = __SHARE_PATH__
+   path = ${SMB_SHARE_PATH}
    browseable = yes
    writable = yes
    guest ok = no
-   valid users = @__GROUP__
+   valid users = @${SMB_GROUP}
    create mask = 0664
    directory mask = 2775
-   force group = __GROUP__
+   force group = ${SMB_GROUP}
 
    oplocks = yes
    level2 oplocks = yes
 
-   vfs objects = acl_xattr
+   # acl_xattr intentionally omitted: it stores NT ACLs in security.* xattrs,
+   # which an unprivileged CT cannot write. POSIX perms + force group suffice here.
    inherit acls = yes
    inherit permissions = yes
    ea support = yes
@@ -450,21 +530,6 @@ pct exec "$CT_ID" -- bash -lc "
 SAMBA_CONF
 "
 
-# Replace placeholders
-pct exec "$CT_ID" -- bash -lc "
-  set -euo pipefail
-  sed -i \
-    -e 's|__WORKGROUP__|${SMB_WORKGROUP}|g' \
-    -e 's|__SERVER_NAME__|${SMB_SERVER_NAME}|g' \
-    -e 's|__MIN_PROTOCOL__|${SMB_MIN_PROTOCOL}|g' \
-    -e 's|__SERVER_SIGNING__|${SMB_SERVER_SIGNING}|g' \
-    -e 's|__SMB_ENCRYPTION__|${SMB_ENCRYPTION}|g' \
-    -e 's|__SHARE_NAME__|${SMB_SHARE_NAME}|g' \
-    -e 's|__SHARE_PATH__|${SMB_SHARE_PATH}|g' \
-    -e 's|__GROUP__|${SMB_GROUP}|g' \
-    /etc/samba/smb.conf
-"
-
 # ── Validate config ───────────────────────────────────────────────────────────
 # Note: "Weak crypto is allowed by GnuTLS" is a cosmetic testparm message
 # reflecting system GnuTLS state, not a config problem. Safe to ignore —
@@ -474,13 +539,15 @@ if pct exec "$CT_ID" -- testparm -s /etc/samba/smb.conf >/dev/null 2>&1; then
 else
   echo "  ERROR: smb.conf validation failed" >&2
   pct exec "$CT_ID" -- testparm -s /etc/samba/smb.conf >&2 || true
-  exit 1
+  false
 fi
 
 # ── Start services ────────────────────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc '
   set -euo pipefail
   mkdir -p /var/log/samba
+  systemctl disable --now nmbd 2>/dev/null || true
+  systemctl mask nmbd 2>/dev/null || true
   systemctl enable smbd
   systemctl restart smbd
 '
@@ -503,7 +570,12 @@ fi
 
 # ── Create first Samba user ───────────────────────────────────────────────────
 if [[ -n "$SMB_USER" ]]; then
-  pct exec "$CT_ID" -- useradd -M -s /usr/sbin/nologin -G "$SMB_GROUP" "$SMB_USER"
+  if pct exec "$CT_ID" -- getent passwd "$SMB_USER" >/dev/null 2>&1; then
+    echo "  WARNING: system user $SMB_USER already exists — adding to $SMB_GROUP instead of creating." >&2
+    pct exec "$CT_ID" -- usermod -aG "$SMB_GROUP" "$SMB_USER"
+  else
+    pct exec "$CT_ID" -- useradd -M -s /usr/sbin/nologin -G "$SMB_GROUP" "$SMB_USER"
+  fi
   printf '%s\n%s\n' "$SMB_USER_PASS" "$SMB_USER_PASS" \
     | pct exec "$CT_ID" -- smbpasswd -a -s "$SMB_USER"
   pct exec "$CT_ID" -- smbpasswd -e "$SMB_USER"
@@ -667,8 +739,17 @@ if [[ "$SHARE_STORAGE" == "rootfs" ]]; then
 elif [[ "$SHARE_STORAGE" == /* ]]; then
   echo "    ${SHARE_STORAGE} -> ${SMB_SHARE_PATH} (CT mp0)"
 else
-  echo "    ${SHARE_STORAGE}/samba-share-lxc${CT_ID} -> ${SHARE_HOST_PATH} -> ${SMB_SHARE_PATH} (CT mp0)"
+  echo "    ${SHARE_DATASET} -> ${SHARE_HOST_PATH} -> ${SMB_SHARE_PATH} (CT mp0)"
 fi
+echo ""
+echo "  Notes:"
+if [[ "$SHARE_STORAGE" != "rootfs" ]]; then
+  echo "    - The bind-mounted share is NOT included in vzdump backups of CT ${CT_ID}."
+  echo "      Back up ${SHARE_HOST_PATH} on the host (e.g. ZFS snapshots / sanoid)."
+fi
+echo "    - NetBIOS is disabled: the server does not appear in Windows Network browsing."
+echo "      Connect directly via \\\\${CT_IP}\\${SMB_SHARE_NAME} (or the DNS name)."
+echo "    - DHCP lease: reserve ${CT_IP} for this CT in your DHCP server."
 echo ""
 echo "  Add more Samba users:"
 echo "    pct exec $CT_ID -- useradd -M -s /usr/sbin/nologin -G $SMB_GROUP <username>"
