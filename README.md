@@ -110,9 +110,9 @@
 
 ## Communication
 <details>
-  <summary>Matrix on Podman</summary>
+  <summary>Matrix</summary>
   <p><a href="https://github.com/vdarkobar/scripts/blob/main/misc/matrix-how-to.md">Decentralised communication platform.</a></p>
-  <pre><code>bash &lt;(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/bash/matrix-podman.sh)</code></pre>
+  <pre><code>bash &lt;(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/bash/matrix-quadlet.sh)</code></pre>
 </details>
 
 ## Documents & Writing
