@@ -1,75 +1,93 @@
 #!/usr/bin/env bash
 set -Eeo pipefail
 
+# Fresh-install creator; run on the Proxmox host. Edit the top Config block.
+# Lab baseline: Tier 1 pinned Quadlet images, host networking, PBS/PVE recovery.
+# Revision: 2026-09-07 — UFW inside the CT; no PVE Datacenter firewall dependency.
+# Input fix: NPM subnet entries produce a host-address hint without a traceback.
+# Resolver permissions fix: provisioning uses 022; credential writes retain 077.
+# UFW check fix: use ufw6-* chain names for IPv6 setup and startup verification.
+# No in-CT data archives or restore engine. See the final summary before exposure.
+# Upstream behavior reviewed against:
+# https://element-hq.github.io/synapse/latest/upgrade.html
+# https://manpages.debian.org/trixie/podman/quadlet.5.en.html
+# https://manpages.debian.org/trixie/ufw/ufw.8.en.html
+# https://github.com/element-hq/element-call/blob/main/docs/self_hosting.md
+# Provisioning must create system files readable by unprivileged services (_apt).
+# Restrict permissions locally when writing credentials; do not pass 077 to pct.
+umask 022
+export LC_ALL=C
+
 # ── Config ────────────────────────────────────────────────────────────────────
-CT_ID=""                             # empty = auto-assign via pvesh; set e.g. CT_ID=120 to pin
+CT_ID=""                             # empty = next free cluster ID
 HN="matrix"
 CPU=4
 RAM=4096
-DISK=32                              # media_store grows with uploads + remote media cache (90d retention)
+DISK=32                              # database, media and Podman images; monitor free space
 BRIDGE="vmbr0"
 TEMPLATE_STORAGE="local"
 CONTAINER_STORAGE="local-lvm"
-
-# Matrix / Podman + Quadlet
-MATRIX_DOMAIN="example.com"          # Synapse server_name becomes matrix.<domain> — IMMUTABLE after first start
-SYNAPSE_PORT=8008                    # Synapse client+federation listener on the CT interface (Network=host, >= 1024)
-ELEMENT_PORT=8080                    # Element Web (nginx, non-root) on the CT interface (Network=host, >= 1024)
+DEBIAN_VERSION=13
+MATRIX_DOMAIN="example.com"          # REQUIRED: replace; server identity is matrix.<domain>
+SYNAPSE_PORT=8008
+ELEMENT_PORT=8080
 APP_TZ="Europe/Berlin"
-MAX_UPLOAD_SIZE="100M"               # Synapse max_upload_size; match client_max_body_size in NPM.
-                                     # 100M = Cloudflare Free/Pro request-body cap; raise only if NPM terminates TLS itself
+MAX_UPLOAD_SIZE="90M"                # headroom below a 100 MB upstream request cap; also configure NPM
 TAGS="matrix;podman;quadlet;lxc"
 
-# Images / versions
-# Synapse: pinned vX.Y.Z from https://github.com/element-hq/synapse/releases
-SYNAPSE_IMAGE_REPO="ghcr.io/element-hq/synapse"
-SYNAPSE_TAG="v1.160.0"               # pinned; :latest and floating tags are rejected
-# Element Web: pinned vX.Y.Z from https://github.com/element-hq/element-web/releases
-ELEMENT_IMAGE_REPO="docker.io/vectorim/element-web"
-ELEMENT_TAG="v1.12.27"               # pinned; :latest and floating tags are rejected
-# PostgreSQL: MAJOR.MINOR only (18.6). "latest" and major-only tags are rejected —
-# a major jump (18 → 19) cannot start on the old data directory and needs
-# pg_upgrade / dump+restore, which this script does not automate.
-POSTGRES_IMAGE_REPO="docker.io/library/postgres"
-POSTGRES_TAG="18.6-alpine"           # MAJOR.MINOR like 18.6 (optional -alpine/-trixie suffix)
-DEBIAN_VERSION=13
+# Source addresses seen by this CT. Use the NPM CT's address, not Cloudflare's.
+# NPM addresses only: bare IPs, IPv4 /32 or IPv6 /128. Whole subnets are rejected.
+# Use the NPM host IP without its LAN subnet mask (e.g. /24 is not a host rule).
+# Empty arrays prompt after confirmation, before pct create.
+# UFW inside the CT permits these NPM sources on the two HTTP ports.
+# Manage Matrix through pct enter/exec and loopback; no management LAN exception.
+# Example: BACKEND_ALLOWED_IPV4=("192.168.1.20/32")
+BACKEND_ALLOWED_IPV4=()
+BACKEND_ALLOWED_IPV6=()
 
-# TURN / VoIP relay (openrelay free tier by default; 500 MB/month relay data)
-# For production voice/video, replace TURN_HOST and TURN_SHARED_SECRET with your own coturn.
-TURN_HOST="staticauth.openrelay.metered.ca"
-TURN_SHARED_SECRET="openrelayprojectsecret"
+# Human-readable versions are resolved to immutable image IDs. Quadlets run with
+# Pull=never; a partial pull or moved upstream tag cannot change a restart.
+SYNAPSE_IMAGE_REPO="ghcr.io/element-hq/synapse"
+SYNAPSE_TAG="v1.160.0"
+ELEMENT_IMAGE_REPO="docker.io/vectorim/element-web"
+ELEMENT_TAG="v1.12.27"
+POSTGRES_IMAGE_REPO="docker.io/library/postgres"
+POSTGRES_TAG="18.6-alpine"            # only major 18; minor updates keep the same variant
+
+# TURN relays legacy Matrix calls. Use the exact listeners configured on eturnal
+# or coturn; these examples use 3478 TCP/UDP and 5349 TLS. TLS needs a valid cert.
+# external: use your own URIs and secret (prompted if empty).
+# disabled: no legacy TURN relay. openrelay: explicit public test service opt-in.
+TURN_MODE="disabled"
+TURN_URIS=(
+  "turn:turn.${MATRIX_DOMAIN}:3478?transport=udp"
+  "turn:turn.${MATRIX_DOMAIN}:3478?transport=tcp"
+  "turns:turn.${MATRIX_DOMAIN}:5349?transport=tcp"
+)
+TURN_SHARED_SECRET=""                # blank = concealed interactive prompt; never printed
 TURN_USER_LIFETIME_MS=86400000
 TURN_ALLOW_GUESTS=0
 
-# Element Web — MapTiler API key (empty = location-sharing map disabled in Element)
+# Modern Element Call additionally requires a separately operated LiveKit SFU
+# and MatrixRTC authorization service. Set both URLs to integrate that backend.
+# Empty URLs explicitly mean MatrixRTC is NOT configured; TURN alone is not enough.
+# Example: https://matrix-rtc.your-domain.tld/livekit/jwt
+MATRIX_RTC_AUTH_URL=""
+MATRIX_RTC_HEALTH_URL=""              # public HTTPS health endpoint, e.g. above URL + /healthz
 MAPTILER_KEY=""
 
-# Auto-update policy
-# AUTO_UPDATE=0 (default): timer installed but disabled; manual updates via
-#   matrix-maint.sh update <tag> / update-element <tag> / update-postgres <tag>
-# AUTO_UPDATE=1: matrix-update.timer re-pulls the CURRENT PINNED TAGS of all
-#   three images daily at UPDATE_TIME and restarts only the services whose image
-#   ID changed; a failed health check rolls back to the previous images.
-#   :latest is never used — a version change is always a deliberate manual step.
+# Automatic refresh is opt-in and re-pulls current pinned tags component by component.
+# It relies on your external PBS/PVE recovery policy; it does not verify/create backups.
 AUTO_UPDATE=0
-UPDATE_TIME="03:00"                  # local CT time (APP_TZ), HH:MM; timer runs daily
-
-# Podman storage backend
-# PODMAN_FUSE_OVERLAY=1: lab default so far — fuse=1 on the CT + fuse-overlayfs
-#   as mount_program. Proxmox warns that FUSE mounts inside a CT can deadlock
-#   when the CT is frozen, which snapshot-mode vzdump/PBS backups do.
-# PODMAN_FUSE_OVERLAY=0: native overlayfs in the CT's user namespace (kernel
-#   >= 5.11); no fuse=1, no mount_program, no freezer interaction. Verify after
-#   install with: podman info --format '{{.Store.GraphDriverName}}' (overlay) and
-#   run a snapshot-mode backup under load before adopting lab-wide.
-PODMAN_FUSE_OVERLAY=1
-
-# Extra packages to install (space-separated or array)
-EXTRA_PACKAGES=(
-)
-
-# Behavior
-CLEANUP_ON_FAIL=1
+UPDATE_TIME="03:00"
+INITIAL_WAIT_SECONDS=180              # fresh install: fail early on a crash loop
+SYNAPSE_WAIT_SECONDS=1800             # upgrades: allow long migrations; never auto-downgrade
+PODMAN_FUSE_OVERLAY=1                 # lab default; use stop-mode PBS backups with FUSE
+# Native overlay (=0) still needs validation under snapshot-mode backup with I/O.
+EXTRA_PACKAGES=()
+CLEANUP_ON_FAIL=1                     # until first service start; CT preserved after that
+SCRIPT_URL="https://raw.githubusercontent.com/vdarkobar/scripts/main/bash/matrix-quadlet.sh"
+SCRIPT_LOCAL="/root/matrix-quadlet.sh"
 
 # Derived
 APP_DIR="/opt/matrix"
@@ -95,7 +113,7 @@ POSTGRES_QUADLET_SERVICE="matrix-postgres.service"
 #   /etc/containers/systemd/matrix-synapse.container   (Quadlet unit — source of truth)
 #   /etc/containers/systemd/matrix-element.container   (Quadlet unit — Element Web, static files)
 #   /etc/containers/systemd/matrix-postgres.container  (Quadlet unit — PostgreSQL, loopback only)
-#   /opt/matrix/postgres.env                           (POSTGRES_PASSWORD + initdb args — read by Quadlet, 0600)
+#   /opt/matrix/postgres.env                           (separate admin/app bootstrap credentials — 0600)
 #   /opt/matrix/element-config.json                    (Element Web config → /app/config.json, 0644)
 #   /opt/matrix/.env                                   (runtime state — read by maint script)
 #   /opt/matrix/synapse/                               (Synapse /data: homeserver.yaml, signing key,
@@ -105,72 +123,12 @@ POSTGRES_QUADLET_SERVICE="matrix-postgres.service"
 #   /usr/local/bin/matrix-maint.sh                     (maintenance helper)
 #   /etc/systemd/system/matrix-update.service
 #   /etc/systemd/system/matrix-update.timer
-#   /etc/update-motd.d/00-header
-#   /etc/update-motd.d/10-sysinfo
-#   /etc/update-motd.d/30-app
-#   /etc/update-motd.d/99-footer
+#   /etc/update-motd.d/00-header, 10-sysinfo, 30-app, 99-footer
+#   /etc/default/ufw, /etc/ufw/ufw.conf                 (in-CT firewall policy/boot enable)
+#   /etc/ufw/user.rules, /etc/ufw/user6.rules            (UFW-managed NPM-only HTTP rules)
+#   /usr/local/sbin/matrix-ufw-check                    (read-only service-start guard)
 #   /etc/apt/apt.conf.d/52unattended-<hostname>.conf
 #   /etc/sysctl.d/99-hardening.conf
-
-# ── Config validation ─────────────────────────────────────────────────────────
-[[ "$HN" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$ ]] || { echo "  ERROR: HN is not a valid hostname: $HN" >&2; exit 1; }
-[[ "$CPU" =~ ^[0-9]+$ ]] && (( CPU >= 1 )) || { echo "  ERROR: CPU must be a positive integer." >&2; exit 1; }
-[[ "$RAM" =~ ^[0-9]+$ ]] && (( RAM >= 2048 )) || { echo "  ERROR: RAM must be >= 2048 MB (Synapse + PostgreSQL)." >&2; exit 1; }
-[[ "$DISK" =~ ^[0-9]+$ ]] && (( DISK >= 8 )) || { echo "  ERROR: DISK must be >= 8 GB." >&2; exit 1; }
-[[ "$DEBIAN_VERSION" =~ ^[0-9]+$ ]] || { echo "  ERROR: DEBIAN_VERSION must be numeric." >&2; exit 1; }
-[[ "$SYNAPSE_PORT" =~ ^[0-9]+$ ]] || { echo "  ERROR: SYNAPSE_PORT must be numeric." >&2; exit 1; }
-[[ "$ELEMENT_PORT" =~ ^[0-9]+$ ]] || { echo "  ERROR: ELEMENT_PORT must be numeric." >&2; exit 1; }
-# Both containers drop privileges before binding (Synapse → 991 via gosu, Element →
-# nginx-unprivileged) and share the CT network stack, so ports < 1024 are refused.
-(( SYNAPSE_PORT >= 1024 && SYNAPSE_PORT <= 65535 )) || { echo "  ERROR: SYNAPSE_PORT must be between 1024 and 65535 (container binds as non-root)." >&2; exit 1; }
-(( ELEMENT_PORT >= 1024 && ELEMENT_PORT <= 65535 )) || { echo "  ERROR: ELEMENT_PORT must be between 1024 and 65535 (container binds as non-root)." >&2; exit 1; }
-(( SYNAPSE_PORT != ELEMENT_PORT )) || { echo "  ERROR: SYNAPSE_PORT and ELEMENT_PORT must differ (shared host network)." >&2; exit 1; }
-(( SYNAPSE_PORT != 5432 && ELEMENT_PORT != 5432 )) || { echo "  ERROR: port 5432 is reserved for PostgreSQL on the shared host network." >&2; exit 1; }
-[[ "$AUTO_UPDATE" =~ ^[01]$ ]] || { echo "  ERROR: AUTO_UPDATE must be 0 or 1." >&2; exit 1; }
-[[ "$PODMAN_FUSE_OVERLAY" =~ ^[01]$ ]] || { echo "  ERROR: PODMAN_FUSE_OVERLAY must be 0 or 1." >&2; exit 1; }
-[[ "$CLEANUP_ON_FAIL" =~ ^[01]$ ]] || { echo "  ERROR: CLEANUP_ON_FAIL must be 0 or 1." >&2; exit 1; }
-# Image repos are interpolated into podman, sed, the Quadlet units and .env.
-for v in SYNAPSE_IMAGE_REPO ELEMENT_IMAGE_REPO POSTGRES_IMAGE_REPO; do
-  [[ "${!v}" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*[A-Za-z0-9]$ ]] || {
-    echo "  ERROR: $v must look like registry/namespace/name (no tag, no spaces)." >&2
-    exit 1
-  }
-done
-# Synapse: vX.Y.Z (optional rcN). Synapse runs schema deltas on start and they are
-# not reversible across every release, so the tag must always be a deliberate choice.
-[[ "$SYNAPSE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(rc[0-9]+)?$ ]] || {
-  echo "  ERROR: SYNAPSE_TAG must be a pinned version like v1.160.0 — ':latest' and floating tags are not permitted." >&2
-  exit 1
-}
-# Element Web: vX.Y.Z (optional -rc.N).
-[[ "$ELEMENT_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$ ]] || {
-  echo "  ERROR: ELEMENT_TAG must be a pinned version like v1.12.27 — ':latest' and floating tags are not permitted." >&2
-  exit 1
-}
-# PostgreSQL: MAJOR.MINOR (18.6), optional variant suffix. No "latest", no major-only:
-# a silent major bump would leave a cluster the new binaries cannot open.
-[[ "$POSTGRES_TAG" =~ ^[0-9]+\.[0-9]+(-[A-Za-z0-9.]+)?$ ]] || {
-  echo "  ERROR: POSTGRES_TAG must be MAJOR.MINOR like 18.6 — 'latest' and major-only tags (18) are not accepted." >&2
-  exit 1
-}
-[[ "$MATRIX_DOMAIN" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)+$ ]] \
-  || { echo "  ERROR: MATRIX_DOMAIN is not a valid domain: $MATRIX_DOMAIN" >&2; exit 1; }
-[[ "$MAX_UPLOAD_SIZE" =~ ^[0-9]+[KMG]$ ]] || { echo "  ERROR: MAX_UPLOAD_SIZE must look like 200M or 1G." >&2; exit 1; }
-[[ "$TURN_HOST" =~ ^[A-Za-z0-9.-]+$ ]] || { echo "  ERROR: TURN_HOST contains invalid characters." >&2; exit 1; }
-[[ -n "$TURN_SHARED_SECRET" && ! "$TURN_SHARED_SECRET" =~ [\"\'\\] ]] || { echo "  ERROR: TURN_SHARED_SECRET must be non-empty and must not contain quotes or backslashes." >&2; exit 1; }
-[[ "$TURN_USER_LIFETIME_MS" =~ ^[0-9]+$ ]] || { echo "  ERROR: TURN_USER_LIFETIME_MS must be numeric." >&2; exit 1; }
-[[ "$TURN_ALLOW_GUESTS" =~ ^[01]$ ]] || { echo "  ERROR: TURN_ALLOW_GUESTS must be 0 or 1." >&2; exit 1; }
-if [[ -n "$MAPTILER_KEY" && ! "$MAPTILER_KEY" =~ ^[A-Za-z0-9_-]+$ ]]; then
-  echo "  ERROR: MAPTILER_KEY contains invalid characters." >&2
-  exit 1
-fi
-[[ "$UPDATE_TIME" =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]] || { echo "  ERROR: UPDATE_TIME must be HH:MM (24h), e.g. 03:00." >&2; exit 1; }
-[[ -e "/usr/share/zoneinfo/${APP_TZ}" ]] || { echo "  ERROR: APP_TZ not found in /usr/share/zoneinfo: $APP_TZ" >&2; exit 1; }
-[[ "$APP_TZ" =~ ^[A-Za-z0-9._+-]+(/[A-Za-z0-9._+-]+)+$ ]] || { echo "  ERROR: APP_TZ contains invalid characters." >&2; exit 1; }
-[[ "$TAGS" =~ ^[A-Za-z0-9._-]+(;[A-Za-z0-9._-]+)*$ ]] || { echo "  ERROR: TAGS must be a semicolon-separated list without spaces." >&2; exit 1; }
-for pkg in "${EXTRA_PACKAGES[@]}"; do
-  [[ "$pkg" =~ ^[a-z0-9][a-z0-9+.-]*$ ]] || { echo "  ERROR: Invalid package name in EXTRA_PACKAGES: $pkg" >&2; exit 1; }
-done
 
 # ── Trap cleanup ──────────────────────────────────────────────────────────────
 # rc is captured before the trap is reset; $LINENO is the failing line at top
@@ -188,7 +146,8 @@ trap 'rc=$?;
   exit "$rc"
 ' ERR
 
-trap 'rc=$?;
+trap 'rc=130;
+  trap - ERR INT TERM HUP
   echo "  Interrupted (rc=$rc)" >&2
   echo "  Command: $BASH_COMMAND" >&2
   if [[ "${CLEANUP_ON_FAIL:-0}" -eq 1 && "${CREATED:-0}" -eq 1 ]]; then
@@ -197,14 +156,21 @@ trap 'rc=$?;
     pct destroy "${CT_ID}" >/dev/null 2>&1 || true
   fi
   exit "$rc"
-' INT TERM
+' INT TERM HUP
 
 # ── Preflight — root & commands ───────────────────────────────────────────────
 [[ "$(id -u)" -eq 0 ]] || { echo "  ERROR: Run as root on the Proxmox host." >&2; exit 1; }
 
-for cmd in pvesh pveam pct pvesm qm curl python3 ip awk grep sed sort paste seq readlink cp chmod dpkg head tr; do
+for cmd in pvesh pveam pct pvesm qm curl python3 ip awk grep sed sort paste seq readlink cp chmod dpkg head tail tr mktemp mv flock rm sleep id cat bash install sync; do
   command -v "$cmd" >/dev/null 2>&1 || { echo "  ERROR: Missing required command: $cmd" >&2; exit 1; }
 done
+
+[[ "$HN" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]] || { echo "ERROR: Invalid HN." >&2; exit 1; }
+[[ -f "/usr/share/zoneinfo/$APP_TZ" ]] || { echo "ERROR: Unknown APP_TZ." >&2; exit 1; }
+# Serialize creators so another invocation cannot race ID/hostname selection.
+exec 7>/run/lock/matrix-creator.lock
+flock -n 7 || { echo "ERROR: Another Matrix creator is running." >&2; exit 1; }
+
 
 # pveam lists templates for more than one CPU architecture. Selecting only by
 # Debian version can pick an ARM64 rootfs on an AMD64 host (or vice versa),
@@ -221,6 +187,7 @@ if ! exec 8</dev/tty; then
   echo "  ERROR: An interactive terminal is required for confirmation and password prompts." >&2
   exit 1
 fi
+[[ -t 8 ]] || { echo "ERROR: Prompt input is not a terminal." >&2; exit 1; }
 
 if [[ -n "$CT_ID" ]]; then
   [[ "$CT_ID" =~ ^[0-9]+$ ]] && (( CT_ID >= 100 && CT_ID <= 999999999 )) \
@@ -240,7 +207,10 @@ fi
 EXISTING_CT="$(pct list 2>/dev/null | awk -v h="$HN" 'NR>1 && $NF==h {print $1}' | head -n1)"
 if [[ -n "$EXISTING_CT" ]]; then
   echo "  ERROR: A CT with hostname '${HN}' already exists on this node (CT ${EXISTING_CT})." >&2
-  echo "  Destroy it (pct set ${EXISTING_CT} --protection 0; pct destroy ${EXISTING_CT}) or change HN, then re-run." >&2
+  echo "  Fresh installer: use the existing CT maintenance helper. To discard an UNUSED failed install after checking its data:" >&2
+  echo "    pct set $EXISTING_CT --protection 0" >&2
+  echo "    pct stop $EXISTING_CT" >&2
+  echo "    pct destroy $EXISTING_CT" >&2
   exit 1
 fi
 
@@ -273,9 +243,13 @@ cat <<EOF2
   Server name:       $SYNAPSE_SERVER_NAME  (user IDs @user:${SYNAPSE_SERVER_NAME} — IMMUTABLE after first start)
   Synapse FQDN:      $SYNAPSE_FQDN -> port $SYNAPSE_PORT
   Element FQDN:      $ELEMENT_FQDN -> port $ELEMENT_PORT
-  Listens on:        0.0.0.0:${SYNAPSE_PORT} + 0.0.0.0:${ELEMENT_PORT} inside the CT (Network=host) — reachable from the whole LAN
+  Backend ports:     ${SYNAPSE_PORT}, ${ELEMENT_PORT} — UFW inside this CT permits only NPM sources
+  NPM IPv4:          ${BACKEND_ALLOWED_IPV4[*]:-(prompt if neither family configured)}
+  NPM IPv6:          ${BACKEND_ALLOWED_IPV6[*]:-(none)}
   Max upload:        $MAX_UPLOAD_SIZE
-  TURN host:         $TURN_HOST
+  TURN mode:         $TURN_MODE
+  TURN URIs:         $([[ $TURN_MODE == disabled ]] && echo disabled || echo "${TURN_URIS[*]}")
+  MatrixRTC:         ${MATRIX_RTC_AUTH_URL:-NOT configured — external LiveKit + authorization backend required}
   TURN guests:       $([ "$TURN_ALLOW_GUESTS" -eq 1 ] && echo "allowed" || echo "denied")
   MapTiler key:      $([ -n "$MAPTILER_KEY" ] && echo "set" || echo "unset (map feature disabled)")
   Timezone:          $APP_TZ
@@ -283,6 +257,9 @@ cat <<EOF2
   Tags:              $TAGS
   Auto-update:       $([ "$AUTO_UPDATE" -eq 1 ] && echo "enabled — daily at ${UPDATE_TIME} (re-pull ${SYNAPSE_TAG} / ${ELEMENT_TAG} / ${POSTGRES_TAG})" || echo "disabled (${SYNAPSE_TAG} / ${ELEMENT_TAG} / ${POSTGRES_TAG}, manual)")
   Cleanup on fail:   $CLEANUP_ON_FAIL (until first service start; CT preserved after that)
+  Update recovery:   PBS/PVE checkpoint managed on the host; no in-CT archives
+  Initial health:    ${INITIAL_WAIT_SECONDS}s; crash loops fail earlier
+  Migration wait:    ${SYNAPSE_WAIT_SECONDS}s; timeout never downgrades a migrated database
   ────────────────────────────────────────
   To change defaults, press Enter and
   edit the Config section at the top of
@@ -290,32 +267,35 @@ cat <<EOF2
 
 EOF2
 
-SCRIPT_URL="https://raw.githubusercontent.com/vdarkobar/scripts/main/bash/matrix-quadlet.sh"
-SCRIPT_LOCAL="/root/matrix-quadlet.sh"
 SCRIPT_SELF="$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")"
 
-read -r -p "  Continue with these settings? [y/N]: " response <&8
+response=""
+read -r -p "  Continue with these settings? [y/N]: " response <&8 || response=""
 case "$response" in
   [yY][eE][sS]|[yY]) ;;
   *)
     echo ""
-    echo "  Saving current script to ${SCRIPT_LOCAL} for editing..."
-    # Shebang check: when run as 'curl | bash', $0 is the bash binary, not this script.
-    if [[ -f "$SCRIPT_SELF" ]] && head -n1 "$SCRIPT_SELF" 2>/dev/null | grep -q '^#!/usr/bin/env bash$' \
-      && cp -f -- "$SCRIPT_SELF" "$SCRIPT_LOCAL"; then
-      chmod +x "$SCRIPT_LOCAL"
-      echo "  Edit:  nano ${SCRIPT_LOCAL}"
-      echo "  Run:   bash ${SCRIPT_LOCAL}"
-      echo ""
-    elif curl -fsSL "$SCRIPT_URL" -o "$SCRIPT_LOCAL"; then
-      chmod +x "$SCRIPT_LOCAL"
-      echo "  WARNING: Could not copy the running script; downloaded fallback from GitHub instead."
-      echo "  Edit:  nano ${SCRIPT_LOCAL}"
-      echo "  Run:   bash ${SCRIPT_LOCAL}"
-      echo ""
+    echo "  Keeping an editable script copy..."
+    if [[ -f "$SCRIPT_SELF" ]] && head -n 1 "$SCRIPT_SELF" | grep -q '^#!/usr/bin/env bash$'; then
+      # The running local file is already the correct editable copy. In particular,
+      # never cp a file onto itself and then fetch a replacement over user edits.
+      echo "  Edit: nano $SCRIPT_SELF"
+      echo "  Run:  bash $SCRIPT_SELF"
     else
-      echo "  ERROR: Failed to save a local editable copy of the script." >&2
-      exit 1
+      [[ ! -e $SCRIPT_LOCAL ]] || SCRIPT_LOCAL="/root/matrix-quadlet-downloaded.$$.sh"
+      DOWNLOAD_TEMP=$(mktemp /root/matrix-download.XXXXXX)
+      if curl -fLsS --retry 3 --connect-timeout 10 --max-time 120 "$SCRIPT_URL" -o "$DOWNLOAD_TEMP" \
+        && head -n 1 "$DOWNLOAD_TEMP" | grep -q '^#!/usr/bin/env bash$' \
+        && bash -n "$DOWNLOAD_TEMP"; then
+        chmod 0700 "$DOWNLOAD_TEMP"
+        mv -T "$DOWNLOAD_TEMP" "$SCRIPT_LOCAL"
+        echo "  Downloaded a separate upstream copy; it may differ from the piped script."
+        echo "  Edit: nano $SCRIPT_LOCAL"
+      else
+        rm -f -- "$DOWNLOAD_TEMP"
+        echo "  ERROR: Could not save a validated upstream copy. Existing files were preserved." >&2
+        exit 1
+      fi
     fi
     exit 0
     ;;
@@ -323,14 +303,113 @@ esac
 
 echo ""
 
+# ── Config validation ─────────────────────────────────────────────────────────
+[[ "$HN" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]] || { echo "ERROR: HN must be a lowercase hostname." >&2; exit 1; }
+for number in CPU RAM DISK SYNAPSE_PORT ELEMENT_PORT SYNAPSE_WAIT_SECONDS INITIAL_WAIT_SECONDS TURN_USER_LIFETIME_MS; do
+  [[ ${!number} =~ ^[1-9][0-9]{0,9}$ ]] || { echo "ERROR: $number must be a positive decimal integer." >&2; exit 1; }
+done
+(( CPU >= 1 && RAM >= 2048 && DISK >= 16 )) || { echo "ERROR: CPU >= 1, RAM >= 2048 MB, DISK >= 16 GB required." >&2; exit 1; }
+[[ $DEBIAN_VERSION == 13 ]] || { echo "ERROR: This installer targets Debian 13 only." >&2; exit 1; }
+(( SYNAPSE_WAIT_SECONDS >= 60 && SYNAPSE_WAIT_SECONDS <= 86400 )) || { echo "ERROR: SYNAPSE_WAIT_SECONDS must be 60..86400." >&2; exit 1; }
+for port in SYNAPSE_PORT ELEMENT_PORT; do
+  (( ${!port} >= 1024 && ${!port} <= 65535 && ${!port} != 5432 )) || { echo "ERROR: Invalid/reserved $port." >&2; exit 1; }
+done
+(( SYNAPSE_PORT != ELEMENT_PORT )) || { echo "ERROR: Service ports must differ." >&2; exit 1; }
+for flag in AUTO_UPDATE PODMAN_FUSE_OVERLAY CLEANUP_ON_FAIL TURN_ALLOW_GUESTS; do
+  [[ ${!flag} =~ ^[01]$ ]] || { echo "ERROR: $flag must be 0 or 1." >&2; exit 1; }
+done
+for repo in SYNAPSE_IMAGE_REPO ELEMENT_IMAGE_REPO POSTGRES_IMAGE_REPO; do
+  [[ ${!repo} =~ ^[a-z0-9][a-z0-9._/-]*[a-z0-9]$ ]] || { echo "ERROR: Invalid $repo." >&2; exit 1; }
+done
+[[ $SYNAPSE_TAG =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "ERROR: Synapse requires pinned vX.Y.Z." >&2; exit 1; }
+[[ $ELEMENT_TAG =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "ERROR: Element requires pinned vX.Y.Z." >&2; exit 1; }
+[[ $POSTGRES_TAG =~ ^18\.[0-9]+(-[a-z0-9.]+)?$ ]] || { echo "ERROR: Only PostgreSQL 18.MINOR[-variant] is supported by this data layout." >&2; exit 1; }
+[[ $MAX_UPLOAD_SIZE =~ ^[1-9][0-9]*[KMG]$ ]] || { echo "ERROR: Invalid upload size." >&2; exit 1; }
+[[ $UPDATE_TIME =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]] || { echo "ERROR: UPDATE_TIME must be HH:MM." >&2; exit 1; }
+[[ $APP_TZ =~ ^[A-Za-z0-9._+-]+(/[A-Za-z0-9._+-]+)+$ && -f /usr/share/zoneinfo/$APP_TZ ]] || { echo "ERROR: Invalid timezone." >&2; exit 1; }
+[[ $TAGS =~ ^[a-z0-9._-]+(;[a-z0-9._-]+)*$ ]] || { echo "ERROR: Invalid tags." >&2; exit 1; }
+[[ -z $MAPTILER_KEY || $MAPTILER_KEY =~ ^[A-Za-z0-9_-]+$ ]] || { echo "ERROR: Invalid MapTiler key." >&2; exit 1; }
+for pkg in "${EXTRA_PACKAGES[@]}"; do
+  [[ $pkg =~ ^[a-z0-9][a-z0-9+.-]*$ ]] || { echo "ERROR: Invalid extra package name." >&2; exit 1; }
+done
+for name in BRIDGE TEMPLATE_STORAGE CONTAINER_STORAGE; do
+  [[ ${!name} =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] || { echo "ERROR: Invalid $name." >&2; exit 1; }
+done
+(( INITIAL_WAIT_SECONDS >= 30 && INITIAL_WAIT_SECONDS <= 600 )) || { echo "ERROR: INITIAL_WAIT_SECONDS must be 30..600." >&2; exit 1; }
+case $TURN_MODE in
+  external) (( ${#TURN_URIS[@]} > 0 )) || { echo "ERROR: External TURN needs TURN_URIS." >&2; exit 1; } ;;
+  disabled) TURN_URIS=(); TURN_SHARED_SECRET="" ;;
+  openrelay)
+    TURN_URIS=("turn:staticauth.openrelay.metered.ca:80?transport=udp" "turn:staticauth.openrelay.metered.ca:443?transport=tcp" "turns:staticauth.openrelay.metered.ca:443?transport=tcp")
+    TURN_SHARED_SECRET=openrelayprojectsecret
+    # Public test relay; check current provider terms and availability before use.
+    ;;
+  *) echo "ERROR: TURN_MODE must be external, disabled or openrelay." >&2; exit 1 ;;
+esac
+
+# ── Backend source addresses ─────────────────────────────────────────────────
+if (( ${#BACKEND_ALLOWED_IPV4[@]} + ${#BACKEND_ALLOWED_IPV6[@]} == 0 )); then
+  read -r -p "  NPM CT IPv4 addresses (bare IP or /32; omit the LAN /24 mask): " -a BACKEND_ALLOWED_IPV4 <&8
+  read -r -p "  Optional NPM CT IPv6 addresses (Enter to skip): " -a BACKEND_ALLOWED_IPV6 <&8
+fi
+if ! python3 - "$MATRIX_DOMAIN" "$SYNAPSE_FQDN" "$MATRIX_RTC_AUTH_URL" "$MATRIX_RTC_HEALTH_URL" \
+  "${#BACKEND_ALLOWED_IPV4[@]}" "${#BACKEND_ALLOWED_IPV6[@]}" \
+  "${BACKEND_ALLOWED_IPV4[@]}" "${BACKEND_ALLOWED_IPV6[@]}" "${TURN_URIS[@]}" <<'PREFLIGHT'
+import ipaddress, re, sys, urllib.parse
+domain, server, rtc, health = sys.argv[1:5]
+def valid_domain(value):
+    return (len(value) <= 253 and value == value.lower() and len(value.split(".")) > 1
+            and all(re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", x) for x in value.split(".")))
+if not valid_domain(domain) or not valid_domain(server):
+    raise SystemExit("ERROR: Use a valid lowercase domain; labels <= 63 characters.")
+if any(domain == x or domain.endswith("." + x) for x in ("example.com", "example.net", "example.org", "invalid", "test", "localhost")):
+    raise SystemExit("ERROR: Replace MATRIX_DOMAIN with your real domain before creating an immutable identity.")
+v4, v6 = map(int, sys.argv[5:7]); values = sys.argv[7:]
+if v4 == 0: raise SystemExit("ERROR: Set at least one BACKEND_ALLOWED_IPV4 entry; Synapse uses an IPv4 listener in this DHCP/IPv6-manual CT.")
+for i, value in enumerate(values[:v4+v6]):
+    field = "BACKEND_ALLOWED_IPV4" if i < v4 else "BACKEND_ALLOWED_IPV6"
+    try:
+        host = ipaddress.ip_interface(value)
+    except ValueError:
+        raise SystemExit(f"ERROR: {field}: invalid NPM address {value!r}. Use a bare IP, IPv4 /32 or IPv6 /128.")
+    if host.version != (4 if i < v4 else 6):
+        raise SystemExit(f"ERROR: {field}: address {value!r} belongs in the other IP-family array.")
+    if host.network.prefixlen != host.max_prefixlen:
+        raise SystemExit(f"ERROR: {field}: {value!r} specifies a subnet. To allow only this NPM host, use {host.ip} or {host.ip}/{host.max_prefixlen}.")
+    if host.ip.is_multicast or host.ip.is_unspecified or host.ip.is_loopback:
+        raise SystemExit(f"ERROR: {field}: use NPM's reachable host IP, not a multicast/unspecified/loopback address: {value}")
+for uri in values[v4+v6:]:
+    m = re.fullmatch(r"(turn|turns):(\[[0-9a-fA-F:]+\]|[a-zA-Z0-9.-]+):([1-9][0-9]{0,4})\?transport=(udp|tcp)", uri)
+    if not m or int(m[3]) > 65535: raise SystemExit("ERROR: TURN URI needs explicit host, port and transport: " + uri)
+    if m[2].startswith("["): ipaddress.IPv6Address(m[2][1:-1])
+    elif not valid_domain(m[2].lower()):
+        ipaddress.IPv4Address(m[2])
+    if m[1] == "turns" and m[4] != "tcp": raise SystemExit("ERROR: Use turns with TCP for WebRTC clients.")
+if bool(rtc) != bool(health): raise SystemExit("ERROR: Set both MATRIX_RTC_AUTH_URL and MATRIX_RTC_HEALTH_URL, or neither.")
+for value in (rtc, health):
+    if not value: continue
+    parsed = urllib.parse.urlsplit(value)
+    if (parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password
+            or parsed.query or parsed.fragment or re.search(r"[\s\x00-\x1f\x7f]", value)
+            or not re.fullmatch(r"https://[A-Za-z0-9.:-]+(?:/[A-Za-z0-9._~/-]*)?", value)):
+        raise SystemExit("ERROR: MatrixRTC URLs must be plain public HTTPS URLs without credentials or query/fragment.")
+    if not valid_domain(parsed.hostname): raise SystemExit("ERROR: MatrixRTC requires a DNS hostname and valid TLS.")
+PREFLIGHT
+then
+  # Expected configuration errors occur before CT creation; show the validator's
+  # message and stop without dumping the entire heredoc through the ERR trap.
+  exit 1
+fi
+
+
 # ── Preflight — environment ───────────────────────────────────────────────────
-pvesm status | awk -v s="$TEMPLATE_STORAGE" '$1==s{f=1} END{exit(!f)}' \
+pvesm status | awk -v s="$TEMPLATE_STORAGE" '$1==s && $3=="active"{f=1} END{exit(!f)}' \
   || { echo "  ERROR: Template storage not found: $TEMPLATE_STORAGE" >&2; exit 1; }
 pvesh get /storage/"$TEMPLATE_STORAGE" --output-format json 2>/dev/null \
   | python3 -c "import sys,json; d=json.load(sys.stdin); assert 'vztmpl' in d.get('content','')" 2>/dev/null \
   || { echo "  ERROR: Template storage '$TEMPLATE_STORAGE' does not support vztmpl content." >&2; exit 1; }
 
-pvesm status | awk -v s="$CONTAINER_STORAGE" '$1==s{f=1} END{exit(!f)}' \
+pvesm status | awk -v s="$CONTAINER_STORAGE" '$1==s && $3=="active"{f=1} END{exit(!f)}' \
   || { echo "  ERROR: Container storage not found: $CONTAINER_STORAGE" >&2; exit 1; }
 pvesh get /storage/"$CONTAINER_STORAGE" --output-format json 2>/dev/null \
   | python3 -c "import sys,json; d=json.load(sys.stdin); assert 'rootdir' in d.get('content','')" 2>/dev/null \
@@ -338,6 +417,20 @@ pvesh get /storage/"$CONTAINER_STORAGE" --output-format json 2>/dev/null \
 
 ip link show "$BRIDGE" >/dev/null 2>&1 \
   || { echo "  ERROR: Bridge not found: $BRIDGE" >&2; exit 1; }
+
+# Verify the external MatrixRTC authorization health endpoint before creating a CT.
+if [[ -n $MATRIX_RTC_AUTH_URL ]]; then
+  curl -fLsS --connect-timeout 10 --max-time 30 --proto '=https' --proto-redir '=https' \
+    "$MATRIX_RTC_HEALTH_URL" -o /dev/null \
+    || { echo "ERROR: External MatrixRTC authorization health endpoint is unavailable." >&2; exit 1; }
+fi
+if [[ $TURN_MODE == external && -z $TURN_SHARED_SECRET ]]; then
+  read -r -s -p "  eturnal/coturn shared secret (must match the TURN server): " TURN_SHARED_SECRET <&8
+  echo
+fi
+if [[ $TURN_MODE != disabled ]]; then
+  printf '%s' "$TURN_SHARED_SECRET" | python3 -c 'import sys; s=sys.stdin.read(); sys.exit(0 if 16 <= len(s) <= 512 and all(ord(c) >= 32 and ord(c) != 127 for c in s) else "ERROR: TURN secret must have 16..512 characters with no control characters.")'
+fi
 
 # ── Root password ─────────────────────────────────────────────────────────────
 PASSWORD=""
@@ -353,14 +446,10 @@ done
 
 echo ""
 
-# ── Generate secrets ──────────────────────────────────────────────────────────
-# DB_PASSWORD goes into homeserver.yaml (quoted) and postgres.env (unquoted),
-# so it is alphanumeric only. Synapse generates its own macaroon/form/registration
-# secrets and signing key during `generate`.
-set +o pipefail
-DB_PASSWORD="$(head -c 4096 /dev/urandom | tr -dc 'A-Za-z0-9' | head -c 40)"
-set -o pipefail
-[[ ${#DB_PASSWORD} -eq 40 ]] || { echo "  ERROR: Failed to generate secrets." >&2; exit 1; }
+# ── Generate independent bootstrap and application secrets ────────────────────
+DB_PASSWORD=$(python3 -c 'import secrets; print(secrets.token_hex(32))')
+PG_ADMIN_PASSWORD=$(python3 -c 'import secrets; print(secrets.token_hex(32))')
+[[ ${#DB_PASSWORD} == 64 && ${#PG_ADMIN_PASSWORD} == 64 ]] || { echo "ERROR: Secret generation failed." >&2; exit 1; }
 
 # ── Template discovery & download ─────────────────────────────────────────────
 pveam update
@@ -385,6 +474,7 @@ fi
 # ── Create LXC ────────────────────────────────────────────────────────────────
 # Root password is set after start via chpasswd on stdin, keeping it out of
 # the host process list (pct create -password exposes it in ps).
+# nesting=1 is required for Debian 13 template boot; keyctl=1 supports Podman.
 CT_FEATURES="nesting=1,keyctl=1"
 [[ "$PODMAN_FUSE_OVERLAY" -eq 1 ]] && CT_FEATURES+=",fuse=1"
 
@@ -399,7 +489,7 @@ PCT_OPTIONS=(
   -unprivileged 1
   -features "$CT_FEATURES"
   -tags "$TAGS"
-  -net0 "name=eth0,bridge=${BRIDGE},ip=dhcp,ip6=manual"
+  -net0 "name=eth0,bridge=${BRIDGE},ip=dhcp,ip6=manual,firewall=0"
 )
 
 pct create "$CT_ID" "${TEMPLATE_STORAGE}:vztmpl/${TEMPLATE}" "${PCT_OPTIONS[@]}"
@@ -408,7 +498,7 @@ CREATED=1
 # ── Start & wait for IPv4 ─────────────────────────────────────────────────────
 pct start "$CT_ID"
 CT_IP=""
-for i in $(seq 1 30); do
+for i in $(seq 1 60); do
   CT_IP="$(pct exec "$CT_ID" -- sh -lc '
     ip -4 -o addr show scope global 2>/dev/null | awk "{print \$4}" | cut -d/ -f1 | head -n1
   ' 2>/dev/null || true)"
@@ -444,7 +534,7 @@ pct exec "$CT_ID" -- bash -lc "
   set -euo pipefail
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -qq
-  apt-get install -y locales curl ca-certificates iproute2 podman tar gzip python3 ${PODMAN_FUSE_PKG}
+  apt-get install -y locales curl ca-certificates iproute2 podman tar gzip python3 python3-yaml util-linux ufw iptables ${PODMAN_FUSE_PKG}
   sed -i 's/^# *en_US.UTF-8/en_US.UTF-8/' /etc/locale.gen
   locale-gen
   update-locale LANG=en_US.UTF-8
@@ -461,6 +551,78 @@ pct exec "$CT_ID" -- bash -lc '
   apt-get purge -y openssh-server postfix 2>/dev/null || true
   apt-get -y autoremove
 '
+
+# ── UFW inside the CT ─────────────────────────────────────────────────────────
+# Fresh CT only: replace UFW's initial user rules before app services are created.
+# Network=host means these HTTP listeners use this CT's INPUT chain, without
+# published-port NAT bypasses. Outbound federation, DNS and updates remain allowed.
+# UFW's standard loopback, established-reply, DHCP and ICMP handling is retained.
+pct exec "$CT_ID" -- bash -s -- "$SYNAPSE_PORT" "$ELEMENT_PORT" \
+  "${BACKEND_ALLOWED_IPV4[@]}" "${BACKEND_ALLOWED_IPV6[@]}" <<'UFWSETUP'
+set -euo pipefail
+export LC_ALL=C
+synapse_port=$1; element_port=$2; shift 2
+(( $# > 0 )) || { echo "ERROR: No NPM source addresses supplied." >&2; exit 1; }
+# Netfilter must be usable inside this unprivileged CT; no privileged fallback.
+iptables -w 5 -S INPUT >/dev/null
+ip6tables -w 5 -S INPUT >/dev/null
+ufw --force reset
+sed -i 's/^IPV6=.*/IPV6=yes/' /etc/default/ufw
+grep -qx 'IPV6=yes' /etc/default/ufw
+# This creator owns /etc/sysctl.d/99-hardening.conf. Avoid a second sysctl writer
+# during ufw-init, including attempts to change host-owned/read-only LXC keys.
+grep -q '^IPT_SYSCTL=' /etc/default/ufw
+sed -i 's|^IPT_SYSCTL=.*|IPT_SYSCTL=|' /etc/default/ufw
+ufw default deny incoming
+ufw default allow outgoing
+ufw default deny routed
+ufw logging off
+for source in "$@"; do
+  ufw allow in proto tcp from "$source" to any port "$synapse_port"
+  ufw allow in proto tcp from "$source" to any port "$element_port"
+done
+ufw --force enable
+systemctl enable ufw.service
+systemctl restart ufw.service
+# Verify each specific allow reached the active IPv4/IPv6 rules, not only disk.
+for source in "$@"; do
+  tool=iptables; prefix=ufw
+  if [[ $source == *:* ]]; then tool=ip6tables; prefix=ufw6; fi
+  for port in "$synapse_port" "$element_port"; do
+    "$tool" -w 5 -C "${prefix}-user-input" -s "$source" -p tcp -m tcp --dport "$port" -j ACCEPT
+  done
+done
+ufw status verbose
+UFWSETUP
+
+tmp="$(mktemp)"
+cat > "$tmp" <<'UFWCHECK'
+#!/usr/bin/env bash
+set -euo pipefail
+export LC_ALL=C
+# A running oneshot unit alone does not prove UFW was enabled or rules loaded.
+# Called before every Synapse/Element start, including boot and updates.
+grep -qx 'ENABLED=yes' /etc/ufw/ufw.conf
+grep -qx 'IPV6=yes' /etc/default/ufw
+status=$(/usr/sbin/ufw status)
+grep -qx 'Status: active' <<< "$status"
+for tool in /usr/sbin/iptables /usr/sbin/ip6tables; do
+  prefix=ufw
+  [[ ${tool##*/} != ip6tables ]] || prefix=ufw6
+  rules=$("$tool" -w 5 -S INPUT)
+  grep -qx -- '-P INPUT DROP' <<< "$rules"
+  # UFW uses ufw-* for IPv4 and ufw6-* for IPv6, even with no allowed IPv6 sources.
+  "$tool" -w 5 -C INPUT -j "${prefix}-before-input"
+  "$tool" -w 5 -S "${prefix}-user-input" >/dev/null
+done
+UFWCHECK
+pct push "$CT_ID" "$tmp" /usr/local/sbin/matrix-ufw-check --perms 0755
+rm -f "$tmp"
+if ! pct exec "$CT_ID" -- /usr/local/sbin/matrix-ufw-check; then
+  echo "  ERROR: UFW did not establish IPv4/IPv6 filtering inside CT $CT_ID." >&2
+  echo "  Inspect: pct exec $CT_ID -- ufw status verbose" >&2
+  false
+fi
 
 # ── Podman configuration ──────────────────────────────────────────────────────
 OVERLAY_OPTIONS=""
@@ -508,6 +670,15 @@ for img in "$POSTGRES_IMAGE" "$SYNAPSE_IMAGE" "$ELEMENT_IMAGE"; do
   "
 done
 
+# Resolve the pulled images once. Every generated service uses its content ID.
+for component in SYNAPSE ELEMENT POSTGRES; do
+  reference_var="${component}_IMAGE"
+  resolved=$(pct exec "$CT_ID" -- podman image inspect --format '{{.Id}}' "${!reference_var}")
+  resolved=${resolved#sha256:}
+  [[ $resolved =~ ^[a-f0-9]{64}$ ]] || { echo "ERROR: Invalid resolved image ID for $component." >&2; false; }
+  printf -v "${component}_IMAGE_ID" 'sha256:%s' "$resolved"
+done
+
 # ── Detect container UIDs/GIDs for bind mounts ────────────────────────────────
 # PostgreSQL drops to its own service user before touching the mount; the UID
 # differs between the Debian (999) and Alpine (70) variants, so read it from
@@ -516,8 +687,8 @@ done
 # is passed explicitly to both `generate` and the Quadlet unit. Element Web is
 # nginx-unprivileged and only reads a root-owned 0644 config file.
 # --network none: the probes need no network and must not touch Netavark.
-POSTGRES_UID="$(pct exec "$CT_ID" -- podman run --rm --network none --entrypoint sh "$POSTGRES_IMAGE" -c 'id -u postgres 2>/dev/null || id -u' 2>/dev/null | tr -d '\r')"
-POSTGRES_GID="$(pct exec "$CT_ID" -- podman run --rm --network none --entrypoint sh "$POSTGRES_IMAGE" -c 'id -g postgres 2>/dev/null || id -g' 2>/dev/null | tr -d '\r')"
+POSTGRES_UID="$(pct exec "$CT_ID" -- podman run --rm --network none --entrypoint sh "$POSTGRES_IMAGE_ID" -c 'id -u postgres 2>/dev/null || id -u' 2>/dev/null | tr -d '\r')"
+POSTGRES_GID="$(pct exec "$CT_ID" -- podman run --rm --network none --entrypoint sh "$POSTGRES_IMAGE_ID" -c 'id -g postgres 2>/dev/null || id -g' 2>/dev/null | tr -d '\r')"
 
 for v in POSTGRES_UID POSTGRES_GID; do
   [[ "${!v}" =~ ^[0-9]+$ ]] || { echo "  ERROR: Failed to detect numeric $v from the PostgreSQL image." >&2; false; }
@@ -532,14 +703,13 @@ echo "  Bind-mount ownership: postgres=${POSTGRES_UID}:${POSTGRES_GID} synapse=$
 #                                     <server_name>.log.config, media_store/ (uploads + remote
 #                                     media cache) — everything Synapse writes lives here
 #   /opt/matrix/element-config.json   Element Web config (script-managed, regenerate by hand)
-#   /opt/matrix/postgres.env          PostgreSQL password (must match homeserver.yaml) + initdb args
-# Only the top-level mount directories are created here; PostgreSQL initializes
-# its own cluster and Synapse creates media_store on first start.
+#   /opt/matrix/postgres.env          bootstrap/admin + application initialization credentials
+# Create the mount roots and empty media directory; PostgreSQL initializes its own cluster.
 pct exec "$CT_ID" -- bash -lc "
   set -euo pipefail
   install -d -m 0755 '${APP_DIR}'
   install -d -m 0750 -o ${POSTGRES_UID} -g ${POSTGRES_GID} '${APP_DIR}/postgresdata'
-  install -d -m 0750 -o ${SYNAPSE_UID}  -g ${SYNAPSE_GID}  '${SYNAPSE_DATA_DIR}'
+  install -d -m 0750 -o ${SYNAPSE_UID}  -g ${SYNAPSE_GID}  '${SYNAPSE_DATA_DIR}' '${SYNAPSE_DATA_DIR}/media_store'
 "
 
 # ── Generate Synapse homeserver.yaml ──────────────────────────────────────────
@@ -556,139 +726,89 @@ pct exec "$CT_ID" -- bash -lc "
     -e SYNAPSE_REPORT_STATS=no \
     -e UID=${SYNAPSE_UID} \
     -e GID=${SYNAPSE_GID} \
-    '${SYNAPSE_IMAGE}' generate
+    '${SYNAPSE_IMAGE_ID}' generate
   test -f '${SYNAPSE_DATA_DIR}/homeserver.yaml'
   test -f '${SYNAPSE_DATA_DIR}/${SYNAPSE_SERVER_NAME}.signing.key'
   test -f '${SYNAPSE_DATA_DIR}/${SYNAPSE_SERVER_NAME}.log.config'
 "
 echo "  homeserver.yaml, signing key and log config generated"
 
-# ── Patch homeserver.yaml ─────────────────────────────────────────────────────
-# 1) Remove the generated SQLite database block (PostgreSQL is appended below).
-# 2) Move the HTTP listener from 8008 to SYNAPSE_PORT — with Network=host there is
-#    no port mapping, the container binds SYNAPSE_PORT directly on the CT.
-# Both edits fail loudly if the upstream layout changed; the file keeps its
-# 991:991 ownership because python rewrites the existing inode.
-echo "  Patching homeserver.yaml ..."
-pct exec "$CT_ID" -- python3 - "${SYNAPSE_DATA_DIR}/homeserver.yaml" "${SYNAPSE_PORT}" <<'PYEOF'
-import re
-import sys
+# ── Generate structured Synapse configuration ────────────────────────────────
+# NUL-delimited stdin keeps secrets out of argv; PyYAML quotes values safely.
+printf '%s\0' "$SYNAPSE_SERVER_NAME" "$SYNAPSE_PORT" "$DB_PASSWORD" "$MAX_UPLOAD_SIZE" \
+  "$TURN_MODE" "$TURN_SHARED_SECRET" "$TURN_USER_LIFETIME_MS" "$TURN_ALLOW_GUESTS" \
+  "$MATRIX_RTC_AUTH_URL" "${TURN_URIS[@]}" | \
+  pct exec "$CT_ID" -- python3 -c "$(cat <<'PYCONFIG'
+import os, pathlib, sys, tempfile, yaml
+values = sys.stdin.buffer.read().decode().split("\0")
+if values.pop() != "": raise SystemExit("Truncated config input")
+server, port, password, upload, mode, secret, lifetime, guests, rtc = values[:9]
+uris = values[9:]
+path = pathlib.Path("/opt/matrix/synapse/homeserver.yaml")
+class UniqueLoader(yaml.SafeLoader):
+    pass
+def unique_mapping(loader, node, deep=False):
+    result = {}
+    for k, v in node.value:
+        key = loader.construct_object(k, deep=deep)
+        if key in result: raise ValueError("Duplicate YAML key: " + str(key))
+        result[key] = loader.construct_object(v, deep=deep)
+    return result
+UniqueLoader.add_constructor(yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, unique_mapping)
+config = yaml.load(path.read_text(), Loader=UniqueLoader)
+if config.get("server_name") != server or not config.get("registration_shared_secret"):
+    raise SystemExit("Generated identity/shared registration secret missing or unexpected")
+config.update({
+    "listeners": [{"port": int(port), "tls": False, "type": "http", "x_forwarded": True,
+                   "bind_addresses": ["0.0.0.0"],
+                   "resources": [{"names": ["client", "federation"], "compress": False}]}],
+    "database": {"name": "psycopg2", "txn_limit": 10000,
+                 "args": {"user": "synapse", "password": password, "database": "synapse",
+                          "host": "127.0.0.1", "port": 5432, "cp_min": 5, "cp_max": 10}},
+    "public_baseurl": "https://" + server + "/", "serve_server_wellknown": True,
+    "max_upload_size": upload, "enable_registration": True, "registration_requires_token": True,
+    "presence": {"enabled": True}, "media_retention": {"remote_media_lifetime": "90d"},
+    "forgotten_room_retention_period": "7d",
+    "turn_uris": uris, "turn_allow_guests": guests == "1",
+    "turn_user_lifetime": int(lifetime),
+    "url_preview_enabled": True,
+    "url_preview_ip_range_blacklist": ["127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
+        "100.64.0.0/10", "192.0.0.0/24", "169.254.0.0/16", "192.88.99.0/24", "198.18.0.0/15",
+        "192.0.2.0/24", "198.51.100.0/24", "203.0.113.0/24", "224.0.0.0/4", "::1/128",
+        "fe80::/10", "fc00::/7", "2001:db8::/32", "ff00::/8", "fec0::/10"]})
+if mode != "disabled": config["turn_shared_secret"] = secret
+else: config.pop("turn_shared_secret", None)
+if rtc:
+    # Element Call's documented Synapse prerequisites, plus discovery for older clients.
+    config["experimental_features"] = {"msc3266_enabled": True, "msc4143_enabled": True, "msc4222_enabled": True}
+    config["max_event_delay_duration"] = "24h"
+    config["rc_message"] = {"per_second": 0.5, "burst_count": 30}
+    config["rc_delayed_event_mgmt"] = {"per_second": 1, "burst_count": 20}
+    config["matrix_rtc"] = {"transports": [{"type": "livekit", "livekit_service_url": rtc}]}
+    config["extra_well_known_client_content"] = {"org.matrix.msc4143.rtc_foci": [
+        {"type": "livekit", "livekit_service_url": rtc}]}
+fd, temp = tempfile.mkstemp(dir=path.parent)
+try:
+    with os.fdopen(fd, "w") as f:
+        yaml.safe_dump(config, f, sort_keys=False); f.flush(); os.fsync(f.fileno())
+    os.chown(temp, 991, 991); os.chmod(temp, 0o600); os.replace(temp, path)
+finally:
+    if os.path.exists(temp): os.unlink(temp)
+PYCONFIG
+)"
 
-path, port = sys.argv[1], sys.argv[2]
-with open(path) as f:
-    content = f.read()
-
-content, n = re.subn(
-    r'\ndatabase:\s*\n\s+name:\s*sqlite3\s*\n\s+args:\s*\n\s+database:\s*/data/homeserver\.db\s*\n',
-    '\n',
-    content,
-)
-if n != 1:
-    sys.exit("ERROR: SQLite database block not found exactly once in homeserver.yaml — upstream format may have changed.")
-
-content, n = re.subn(r'^([ \t]*- port: )8008$', r'\g<1>' + port, content, flags=re.M)
-if n != 1:
-    sys.exit("ERROR: listener 'port: 8008' not found exactly once in homeserver.yaml — upstream format may have changed.")
-
-with open(path, 'w') as f:
-    f.write(content)
-PYEOF
-
-# Build TURN guest flag as yaml literal
-TURN_ALLOW_GUESTS_YAML="false"
-[[ "$TURN_ALLOW_GUESTS" -eq 1 ]] && TURN_ALLOW_GUESTS_YAML="true"
-
-# Append production configuration. Streamed over stdin so DB_PASSWORD never
-# appears in host or CT argv. PostgreSQL is reached on 127.0.0.1 (shared host
-# network). Synapse serves both /.well-known/matrix/{server,client} itself
-# (serve_server_wellknown + public_baseurl), so the reverse proxy needs no
-# custom well-known locations — a plain proxy host for matrix.<domain> is enough.
-{
-  cat <<EOF2
-
-# ── Production configuration (appended by matrix-quadlet.sh) ─────────────────
-
-database:
-  name: psycopg2
-  txn_limit: 10000
-  args:
-    user: synapse
-    password: "${DB_PASSWORD}"
-    database: synapse
-    host: 127.0.0.1
-    port: 5432
-    cp_min: 5
-    cp_max: 10
-
-public_baseurl: "https://${SYNAPSE_FQDN}/"
-serve_server_wellknown: true
-default_identity_server: "https://vector.im"
-
-suppress_key_server_warning: true
-max_upload_size: ${MAX_UPLOAD_SIZE}
-enable_registration: true
-registration_requires_token: true
-
-presence:
-  enabled: true
-
-media_retention:
-  remote_media_lifetime: 90d
-
-forgotten_room_retention_period: 7d
-
-turn_uris:
-  - "turns:${TURN_HOST}:443?transport=tcp"
-  - "turn:${TURN_HOST}:80?transport=udp"
-  - "turn:${TURN_HOST}:443?transport=tcp"
-turn_shared_secret: "${TURN_SHARED_SECRET}"
-turn_user_lifetime: ${TURN_USER_LIFETIME_MS}
-turn_allow_guests: ${TURN_ALLOW_GUESTS_YAML}
-
-url_preview_enabled: true
-url_preview_ip_range_blacklist:
-  - '127.0.0.0/8'
-  - '10.0.0.0/8'
-  - '172.16.0.0/12'
-  - '192.168.0.0/16'
-  - '100.64.0.0/10'
-  - '192.0.0.0/24'
-  - '169.254.0.0/16'
-  - '198.51.100.0/24'
-  - '203.0.113.0/24'
-  - '224.0.0.0/4'
-  - '::1/128'
-  - 'fe80::/10'
-  - 'fc00::/7'
-  - '2001:db8::/32'
-  - 'ff00::/8'
-  - 'fec0::/10'
-EOF2
-} | pct exec "$CT_ID" -- bash -lc "
-  set -euo pipefail
-  cat >> '${SYNAPSE_DATA_DIR}/homeserver.yaml'
-  chown ${SYNAPSE_UID}:${SYNAPSE_GID} '${SYNAPSE_DATA_DIR}/homeserver.yaml'
-  chmod 0600 '${SYNAPSE_DATA_DIR}/homeserver.yaml'
-"
-
-# Validate patch
-pct exec "$CT_ID" -- bash -lc "
-  set -euo pipefail
-  cfg='${SYNAPSE_DATA_DIR}/homeserver.yaml'
-  grep -q '^  name: psycopg2'          \"\$cfg\" || { echo '  ERROR: psycopg2 not found in homeserver.yaml' >&2; exit 1; }
-  grep -q '^public_baseurl:'           \"\$cfg\" || { echo '  ERROR: public_baseurl not found in homeserver.yaml' >&2; exit 1; }
-  grep -q '^turn_shared_secret:'       \"\$cfg\" || { echo '  ERROR: turn_shared_secret not found in homeserver.yaml' >&2; exit 1; }
-  grep -q '^  - port: ${SYNAPSE_PORT}\$' \"\$cfg\" || { echo '  ERROR: listener port ${SYNAPSE_PORT} not found in homeserver.yaml' >&2; exit 1; }
-  ! grep -q 'name: sqlite3'            \"\$cfg\" || { echo '  ERROR: sqlite3 still present in homeserver.yaml' >&2; exit 1; }
-  grep -q '^registration_shared_secret:' \"\$cfg\" || echo '  WARNING: registration_shared_secret not found — register_new_matrix_user -c will not work until one is added' >&2
-  echo '  homeserver.yaml validated'
-"
+# Use the installed image's real parser. This reads configuration without
+# starting Synapse or running database migrations, and must succeed before start.
+pct exec "$CT_ID" -- podman run --rm --pull=never --network none --user 991:991 \
+  -v "$SYNAPSE_DATA_DIR:/data:ro" --entrypoint python "$SYNAPSE_IMAGE_ID" \
+  -m synapse.config -c /data/homeserver.yaml
+echo "  Synapse configuration parsed successfully"
 
 # ── Element Web config ────────────────────────────────────────────────────────
 # Mounted read-only at /app/config.json. Element talks to Synapse through the
 # public base_url (https://matrix.<domain>), so DNS + reverse proxy must exist
-# before Element is usable; for LAN-only tests point base_url at
-# http://<CT-IP>:SYNAPSE_PORT and restart matrix-element.service.
+# before Element is usable. Use public HTTPS with split DNS for LAN clients;
+# direct backend access is restricted to the NPM CT addresses.
 # The MapTiler key is optional; without it the map_style_url key is omitted and
 # Element's location-sharing map stays disabled. Element runs as nginx-unprivileged
 # (uid 101) and only needs to read this file — root:root 0644.
@@ -770,15 +890,21 @@ After=network-online.target
 Wants=network-online.target
 
 [Container]
-Image=${POSTGRES_IMAGE}
+# MatrixTag=${POSTGRES_TAG}
+# MatrixImage=${POSTGRES_IMAGE}
+Image=${POSTGRES_IMAGE_ID}
+Pull=never
 ContainerName=matrix-postgres
 Network=host
 Exec=postgres -c listen_addresses=127.0.0.1
 Environment=TZ=${APP_TZ}
-Environment=POSTGRES_DB=synapse
-Environment=POSTGRES_USER=synapse
+Environment=POSTGRES_DB=postgres
+Environment=POSTGRES_USER=postgres
+Environment=PGDATA=/var/lib/postgresql/18/docker
 EnvironmentFile=${POSTGRES_ENV_FILE}
 Volume=${APP_DIR}/postgresdata:/var/lib/postgresql
+Volume=${APP_DIR}/postgres-init.sh:/docker-entrypoint-initdb.d/10-synapse.sh:ro
+StopTimeout=110
 ShmSize=512m
 HealthCmd=pg_isready -h 127.0.0.1 -U synapse -d synapse
 HealthInterval=10s
@@ -790,7 +916,7 @@ LogDriver=journald
 
 [Service]
 Restart=always
-TimeoutStartSec=180
+TimeoutStartSec=600
 TimeoutStopSec=120
 
 [Install]
@@ -800,12 +926,15 @@ EOF2
   cat > '${SYNAPSE_QUADLET_FILE}' <<EOF2
 [Unit]
 Description=Matrix Synapse homeserver
-After=network-online.target ${POSTGRES_QUADLET_SERVICE}
+After=network-online.target ufw.service ${POSTGRES_QUADLET_SERVICE}
 Wants=network-online.target
-Requires=${POSTGRES_QUADLET_SERVICE}
+Requires=ufw.service ${POSTGRES_QUADLET_SERVICE}
 
 [Container]
-Image=${SYNAPSE_IMAGE}
+# MatrixTag=${SYNAPSE_TAG}
+# MatrixImage=${SYNAPSE_IMAGE}
+Image=${SYNAPSE_IMAGE_ID}
+Pull=never
 ContainerName=matrix-synapse
 Network=host
 Environment=TZ=${APP_TZ}
@@ -813,6 +942,7 @@ Environment=UID=${SYNAPSE_UID}
 Environment=GID=${SYNAPSE_GID}
 Environment=SYNAPSE_CONFIG_PATH=/data/homeserver.yaml
 Volume=${SYNAPSE_DATA_DIR}:/data
+StopTimeout=80
 Ulimit=nofile=65535:65535
 HealthCmd=curl -fsS -o /dev/null http://127.0.0.1:${SYNAPSE_PORT}/health
 HealthInterval=30s
@@ -822,6 +952,7 @@ HealthStartPeriod=60s
 LogDriver=journald
 
 [Service]
+ExecStartPre=/usr/local/sbin/matrix-ufw-check
 Restart=always
 RestartSec=5
 TimeoutStopSec=90
@@ -833,19 +964,25 @@ EOF2
   cat > '${ELEMENT_QUADLET_FILE}' <<EOF2
 [Unit]
 Description=Element Web for Matrix
-After=network-online.target
+After=network-online.target ufw.service
 Wants=network-online.target
+Requires=ufw.service
 
 [Container]
-Image=${ELEMENT_IMAGE}
+# MatrixTag=${ELEMENT_TAG}
+# MatrixImage=${ELEMENT_IMAGE}
+Image=${ELEMENT_IMAGE_ID}
+Pull=never
 ContainerName=matrix-element
 Network=host
 Environment=TZ=${APP_TZ}
 Environment=ELEMENT_WEB_PORT=${ELEMENT_PORT}
 Volume=${ELEMENT_CONFIG_FILE}:/app/config.json:ro
+StopTimeout=20
 LogDriver=journald
 
 [Service]
+ExecStartPre=/usr/local/sbin/matrix-ufw-check
 Restart=always
 RestartSec=5
 TimeoutStopSec=30
@@ -867,16 +1004,31 @@ EOF2
 # It is only read once, when initdb creates the cluster.
 {
   printf '# PostgreSQL container environment — managed by matrix-quadlet.sh\n'
-  printf '# POSTGRES_PASSWORD must match database.args.password in %s/homeserver.yaml\n' "$SYNAPSE_DATA_DIR"
-  printf 'POSTGRES_PASSWORD=%s\n' "$DB_PASSWORD"
-  printf 'POSTGRES_INITDB_ARGS=--encoding=UTF8 --lc-collate=C --lc-ctype=C\n'
+  printf '# Separate bootstrap superuser; Synapse uses its own restricted database role.\n'
+  printf 'POSTGRES_PASSWORD=%s\n' "$PG_ADMIN_PASSWORD"
+  printf 'SYNAPSE_DB_PASSWORD=%s\n' "$DB_PASSWORD"
+  printf 'POSTGRES_INITDB_ARGS=--encoding=UTF8 --lc-collate=C --lc-ctype=C --auth-host=scram-sha-256 --auth-local=trust\n'
+  printf 'POSTGRES_HOST_AUTH_METHOD=scram-sha-256\n'
 } | pct exec "$CT_ID" -- bash -lc "
   set -euo pipefail
   umask 077
   cat > '${POSTGRES_ENV_FILE}'
   chmod 0600 '${POSTGRES_ENV_FILE}'
 "
-unset DB_PASSWORD
+# Initialization script contains no credentials; only validated hex enters SQL.
+pct exec "$CT_ID" -- bash -c 'cat > /opt/matrix/postgres-init.sh; chmod 0755 /opt/matrix/postgres-init.sh' <<'PGINIT'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${SYNAPSE_DB_PASSWORD:?Missing application bootstrap password}"
+[[ $SYNAPSE_DB_PASSWORD =~ ^[a-f0-9]{64}$ ]] || { echo "Invalid application bootstrap secret format." >&2; exit 1; }
+# The generated secret is hex only. Stream SQL on stdin; no password in psql argv.
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname postgres <<SQL
+CREATE ROLE synapse LOGIN PASSWORD '${SYNAPSE_DB_PASSWORD}' NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
+CREATE DATABASE synapse OWNER synapse ENCODING 'UTF8' LC_COLLATE 'C' LC_CTYPE 'C' TEMPLATE template0;
+REVOKE ALL ON DATABASE synapse FROM PUBLIC;
+SQL
+PGINIT
+
 
 # ── Runtime state file ────────────────────────────────────────────────────────
 # .env is not read by Quadlet or systemd. It is the maint script's source of
@@ -888,12 +1040,15 @@ pct exec "$CT_ID" -- bash -lc "
 SYNAPSE_IMAGE_REPO=${SYNAPSE_IMAGE_REPO}
 SYNAPSE_TAG=${SYNAPSE_TAG}
 SYNAPSE_IMAGE=${SYNAPSE_IMAGE}
+SYNAPSE_IMAGE_ID=${SYNAPSE_IMAGE_ID}
 ELEMENT_IMAGE_REPO=${ELEMENT_IMAGE_REPO}
 ELEMENT_TAG=${ELEMENT_TAG}
 ELEMENT_IMAGE=${ELEMENT_IMAGE}
+ELEMENT_IMAGE_ID=${ELEMENT_IMAGE_ID}
 POSTGRES_IMAGE_REPO=${POSTGRES_IMAGE_REPO}
 POSTGRES_TAG=${POSTGRES_TAG}
 POSTGRES_IMAGE=${POSTGRES_IMAGE}
+POSTGRES_IMAGE_ID=${POSTGRES_IMAGE_ID}
 MATRIX_DOMAIN=${MATRIX_DOMAIN}
 SYNAPSE_SERVER_NAME=${SYNAPSE_SERVER_NAME}
 SYNAPSE_FQDN=${SYNAPSE_FQDN}
@@ -902,529 +1057,16 @@ SYNAPSE_PORT=${SYNAPSE_PORT}
 ELEMENT_PORT=${ELEMENT_PORT}
 APP_TZ=${APP_TZ}
 AUTO_UPDATE=${AUTO_UPDATE}
+UPDATE_TIME=${UPDATE_TIME}
+INITIAL_WAIT_SECONDS=${INITIAL_WAIT_SECONDS}
+SYNAPSE_WAIT_SECONDS=${SYNAPSE_WAIT_SECONDS}
+PODMAN_FUSE_OVERLAY=${PODMAN_FUSE_OVERLAY}
+TURN_MODE=${TURN_MODE}
+MATRIX_RTC_AUTH_URL=${MATRIX_RTC_AUTH_URL}
+MATRIX_RTC_HEALTH_URL=${MATRIX_RTC_HEALTH_URL}
 EOF2
   chmod 0600 '${APP_DIR}/.env'
 "
-
-# ── Maintenance script ────────────────────────────────────────────────────────
-# update <tag>:          Synapse — guards → pull → sed Image= in Quadlet file →
-#   sed .env → daemon-reload → restart → /health check; rollback restores both
-#   files, re-tags the previous image ID, daemon-reload, restart. Synapse applies
-#   schema deltas at startup; older images cannot always run on a newer schema —
-#   the PVE snapshot taken before the update is the real rollback.
-# update-element <tag>:  same flow for the Element Web unit (static files, no
-#   schema — rollback is always clean).
-# update-postgres <tag>: same flow for the PostgreSQL unit, same MAJOR only
-#   (minor releases share the data format; a major jump needs pg_upgrade).
-#   Synapse is restarted afterwards (Requires= stops it with the DB).
-# auto-update:  re-pull ALL THREE current pinned tags; restart only what changed
-#   (+ Synapse whenever PostgreSQL changed); rollback re-tags the previous
-#   image IDs and restarts. Tags are never changed by the timer.
-pct exec "$CT_ID" -- bash -lc 'cat > /usr/local/bin/matrix-maint.sh && chmod 0755 /usr/local/bin/matrix-maint.sh' <<'MAINT'
-#!/usr/bin/env bash
-set -Eeo pipefail
-
-APP_DIR="${APP_DIR:-/opt/matrix}"
-SYNAPSE_QUADLET_FILE="/etc/containers/systemd/matrix-synapse.container"
-ELEMENT_QUADLET_FILE="/etc/containers/systemd/matrix-element.container"
-POSTGRES_QUADLET_FILE="/etc/containers/systemd/matrix-postgres.container"
-SYNAPSE_SERVICE="matrix-synapse.service"
-ELEMENT_SERVICE="matrix-element.service"
-POSTGRES_SERVICE="matrix-postgres.service"
-SYNAPSE_CONTAINER="matrix-synapse"
-ELEMENT_CONTAINER="matrix-element"
-POSTGRES_CONTAINER="matrix-postgres"
-ENV_FILE="${APP_DIR}/.env"
-
-need_root() { [[ $EUID -eq 0 ]] || { echo "  ERROR: Run as root." >&2; exit 1; }; }
-die() { echo "  ERROR: $*" >&2; exit 1; }
-
-usage() {
-  cat <<EOF2
-  Matrix Maintenance (Quadlet)
-  ────────────────────────────
-  Usage:
-    $0 update <tag> [--yes]            # Synapse:    pinned vX.Y.Z, e.g. v1.161.0 — no :latest
-    $0 update-element <tag> [--yes]    # Element:    pinned vX.Y.Z, e.g. v1.12.28 — no :latest
-    $0 update-postgres <tag> [--yes]   # PostgreSQL: MAJOR.MINOR only, same major (e.g. 18.7-alpine)
-    $0 auto-update                     # re-pull all current pinned tags (only if AUTO_UPDATE=1)
-    $0 version
-
-  Notes:
-    - update pulls the tag, updates the Quadlet unit and .env, restarts the service
-    - read https://element-hq.github.io/synapse/latest/upgrade.html before a Synapse
-      update; schema deltas run on start and an older image may not start on the
-      new schema — restore the PVE snapshot in that case
-    - PostgreSQL major upgrades (18 → 19) are NOT automated: dump/restore or
-      pg_upgrade manually, then set the new tag
-    - :latest and floating tags (v1, 18, 18-alpine) are not permitted
-    - auto-update is called by matrix-update.timer; it never changes the tags
-    - backup and restore are handled by PBS and PVE snapshots
-    - take a PVE snapshot before manual updates: pct snapshot <CT_ID> pre-update-\$(date +%Y%m%d)
-EOF2
-}
-
-[[ -d "$APP_DIR" ]]               || die "APP_DIR not found: $APP_DIR"
-[[ -f "$ENV_FILE" ]]              || die "Missing env file: $ENV_FILE"
-[[ -f "$SYNAPSE_QUADLET_FILE" ]]  || die "Missing Quadlet unit: $SYNAPSE_QUADLET_FILE"
-[[ -f "$ELEMENT_QUADLET_FILE" ]]  || die "Missing Quadlet unit: $ELEMENT_QUADLET_FILE"
-[[ -f "$POSTGRES_QUADLET_FILE" ]] || die "Missing Quadlet unit: $POSTGRES_QUADLET_FILE"
-
-# One maintenance operation at a time — a manual update must not overlap the timer.
-LOCK_FILE="/run/lock/matrix-maint.lock"
-mkdir -p /run/lock
-exec 9>"$LOCK_FILE"
-flock -n 9 || die "Another matrix-maint.sh operation is already running."
-
-env_val() {
-  awk -F= -v key="$1" '$1==key{print substr($0, length(key)+2)}' "$ENV_FILE" | tail -n1
-}
-
-env_flag() {
-  local raw
-  raw="$(env_val "$1" | tr -d '[:space:]')"
-  [[ "$raw" =~ ^[01]$ ]] && printf '%s' "$raw" || printf '0'
-}
-
-synapse_port() {
-  local port
-  port="$(env_val SYNAPSE_PORT | tr -d '[:space:]')"
-  [[ "$port" =~ ^[0-9]+$ ]] && printf '%s' "$port" || printf '8008'
-}
-
-element_port() {
-  local port
-  port="$(env_val ELEMENT_PORT | tr -d '[:space:]')"
-  [[ "$port" =~ ^[0-9]+$ ]] && printf '%s' "$port" || printf '8080'
-}
-
-synapse_image()  { env_val SYNAPSE_IMAGE; }
-synapse_repo()   { env_val SYNAPSE_IMAGE_REPO; }
-synapse_tag()    { local img; img="$(synapse_image)"; echo "${img##*:}"; }
-element_image()  { env_val ELEMENT_IMAGE; }
-element_repo()   { env_val ELEMENT_IMAGE_REPO; }
-element_tag()    { local img; img="$(element_image)"; echo "${img##*:}"; }
-postgres_image() { env_val POSTGRES_IMAGE; }
-postgres_repo()  { env_val POSTGRES_IMAGE_REPO; }
-postgres_tag()   { local img; img="$(postgres_image)"; echo "${img##*:}"; }
-
-running_image_id() {
-  podman inspect --format '{{.Image}}' "$1" 2>/dev/null || true
-}
-
-image_id_of() {
-  podman image inspect --format '{{.Id}}' "$1" 2>/dev/null || true
-}
-
-# /health returns 200 once the listener is up, i.e. after schema deltas and
-# startup completed. Long loop: migrations on a big database can take a while.
-wait_for_synapse() {
-  local port code
-  port="$(synapse_port)"
-  for i in $(seq 1 90); do
-    code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 "http://127.0.0.1:${port}/health" 2>/dev/null || echo 000)"
-    [[ "$code" == "200" ]] && return 0
-    sleep 2
-  done
-  return 1
-}
-
-wait_for_element() {
-  local port code
-  port="$(element_port)"
-  for i in $(seq 1 30); do
-    code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 "http://127.0.0.1:${port}/" 2>/dev/null || echo 000)"
-    [[ "$code" == "200" ]] && return 0
-    sleep 2
-  done
-  return 1
-}
-
-wait_for_postgres() {
-  for i in $(seq 1 30); do
-    if podman exec "$POSTGRES_CONTAINER" pg_isready -h 127.0.0.1 -U synapse -d synapse >/dev/null 2>&1; then
-      return 0
-    fi
-    sleep 2
-  done
-  return 1
-}
-
-confirm_or_exit() {
-  echo ""
-  echo "  IMPORTANT: Take a PVE snapshot before proceeding."
-  echo "  Use: pct snapshot <CT_ID> pre-update-$(date +%Y%m%d)"
-  echo ""
-  read -r -p "  Continue? [y/N]: " confirm
-  case "$confirm" in
-    [yY][eE][sS]|[yY]) return 0 ;;
-    *) echo "  Aborted."; return 1 ;;
-  esac
-}
-
-# update <tag> [--yes] — move Synapse to another pinned version
-update_synapse() {
-  local new_tag="" skip_confirm=0
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      -y|--yes) skip_confirm=1; shift ;;
-      *) new_tag="$1"; shift ;;
-    esac
-  done
-
-  local old_tag repo old_image new_image old_id tmp_env tmp_quadlet
-  [[ -n "$new_tag" ]] || die "Usage: matrix-maint.sh update <tag>"
-  [[ "$new_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(rc[0-9]+)?$ ]] \
-    || die "Invalid tag: $new_tag — pinned version required (e.g. v1.161.0), ':latest' and floating tags are not permitted."
-
-  old_tag="$(synapse_tag)"
-  repo="$(synapse_repo)"
-  [[ -n "$repo" ]] || die "Could not read SYNAPSE_IMAGE_REPO from .env"
-  old_image="$(synapse_image)"
-  new_image="${repo}:${new_tag}"
-  # Capture the current image ID before pulling: if new_tag == old_tag, the pull
-  # moves the tag and the old ref would otherwise resolve to the NEW image on rollback.
-  old_id="$(image_id_of "$old_image")"
-  tmp_env="$(mktemp)"
-  tmp_quadlet="$(mktemp)"
-
-  echo "  Current Synapse tag: $old_tag"
-  echo "  Target  Synapse tag: $new_tag"
-  echo "  Upgrade notes:       https://element-hq.github.io/synapse/latest/upgrade.html"
-
-  # Pre-update guard: a Synapse restart runs schema deltas; refuse if the DB is not there.
-  wait_for_postgres || die "PostgreSQL is not ready — fix ${POSTGRES_SERVICE} before updating Synapse."
-
-  if [[ "$skip_confirm" -eq 0 ]]; then
-    confirm_or_exit || { rm -f "$tmp_env" "$tmp_quadlet"; exit 0; }
-  fi
-
-  cp -a "$ENV_FILE"             "$tmp_env"
-  cp -a "$SYNAPSE_QUADLET_FILE" "$tmp_quadlet"
-
-  cleanup() { rm -f "$tmp_env" "$tmp_quadlet"; }
-  rollback() {
-    echo "  !! Synapse update failed — rolling back and restarting ..." >&2
-    cp -a "$tmp_env"     "$ENV_FILE"
-    cp -a "$tmp_quadlet" "$SYNAPSE_QUADLET_FILE"
-    [[ -n "$old_id" ]] && podman tag "$old_id" "$old_image" >/dev/null 2>&1 || true
-    systemctl daemon-reload
-    systemctl restart "$SYNAPSE_SERVICE" || true
-    rm -f "$tmp_env" "$tmp_quadlet"
-    if wait_for_synapse; then
-      echo "  Rollback complete — ${old_image} is healthy again." >&2
-    else
-      echo "  CRITICAL: rollback to ${old_image} did not become healthy (schema may already be migrated). Restore the CT from the PVE snapshot / PBS." >&2
-    fi
-  }
-  trap rollback ERR
-
-  echo "  Pulling target image ..."
-  podman pull "$new_image"
-
-  sed -i "s|^Image=.*|Image=${new_image}|" "$SYNAPSE_QUADLET_FILE"
-  sed -i \
-    -e "s|^SYNAPSE_TAG=.*|SYNAPSE_TAG=$new_tag|" \
-    -e "s|^SYNAPSE_IMAGE=.*|SYNAPSE_IMAGE=$new_image|" \
-    "$ENV_FILE"
-
-  echo "  Reloading Quadlet and restarting Synapse ..."
-  systemctl daemon-reload
-  systemctl restart "$SYNAPSE_SERVICE"
-
-  echo "  Waiting for Synapse (schema deltas may take a moment) ..."
-  if ! wait_for_synapse; then
-    trap - ERR
-    rollback
-    die "Synapse did not become healthy after update."
-  fi
-
-  trap - ERR
-  cleanup
-  if [[ -n "$old_id" && "$old_id" != "$(image_id_of "$new_image")" ]]; then
-    podman rmi "$old_id" >/dev/null 2>&1 || true
-  fi
-  echo "  OK: Synapse updated to $new_tag"
-}
-
-# update-element <tag> [--yes] — move Element Web to another pinned version
-update_element() {
-  local new_tag="" skip_confirm=0
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      -y|--yes) skip_confirm=1; shift ;;
-      *) new_tag="$1"; shift ;;
-    esac
-  done
-
-  local old_tag repo old_image new_image old_id tmp_env tmp_quadlet
-  [[ -n "$new_tag" ]] || die "Usage: matrix-maint.sh update-element <tag>"
-  [[ "$new_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$ ]] \
-    || die "Invalid tag: $new_tag — pinned version required (e.g. v1.12.28), ':latest' and floating tags are not permitted."
-
-  old_tag="$(element_tag)"
-  repo="$(element_repo)"
-  [[ -n "$repo" ]] || die "Could not read ELEMENT_IMAGE_REPO from .env"
-  old_image="$(element_image)"
-  new_image="${repo}:${new_tag}"
-  old_id="$(image_id_of "$old_image")"
-  tmp_env="$(mktemp)"
-  tmp_quadlet="$(mktemp)"
-
-  echo "  Current Element tag: $old_tag"
-  echo "  Target  Element tag: $new_tag"
-
-  if [[ "$skip_confirm" -eq 0 ]]; then
-    confirm_or_exit || { rm -f "$tmp_env" "$tmp_quadlet"; exit 0; }
-  fi
-
-  cp -a "$ENV_FILE"             "$tmp_env"
-  cp -a "$ELEMENT_QUADLET_FILE" "$tmp_quadlet"
-
-  cleanup() { rm -f "$tmp_env" "$tmp_quadlet"; }
-  rollback() {
-    echo "  !! Element update failed — rolling back and restarting ..." >&2
-    cp -a "$tmp_env"     "$ENV_FILE"
-    cp -a "$tmp_quadlet" "$ELEMENT_QUADLET_FILE"
-    [[ -n "$old_id" ]] && podman tag "$old_id" "$old_image" >/dev/null 2>&1 || true
-    systemctl daemon-reload
-    systemctl restart "$ELEMENT_SERVICE" || true
-    rm -f "$tmp_env" "$tmp_quadlet"
-    if wait_for_element; then
-      echo "  Rollback complete — ${old_image} is healthy again." >&2
-    else
-      echo "  CRITICAL: rollback to ${old_image} did not become healthy. Check: journalctl -u ${ELEMENT_SERVICE}" >&2
-    fi
-  }
-  trap rollback ERR
-
-  echo "  Pulling target image ..."
-  podman pull "$new_image"
-
-  sed -i "s|^Image=.*|Image=${new_image}|" "$ELEMENT_QUADLET_FILE"
-  sed -i \
-    -e "s|^ELEMENT_TAG=.*|ELEMENT_TAG=$new_tag|" \
-    -e "s|^ELEMENT_IMAGE=.*|ELEMENT_IMAGE=$new_image|" \
-    "$ENV_FILE"
-
-  echo "  Reloading Quadlet and restarting Element ..."
-  systemctl daemon-reload
-  systemctl restart "$ELEMENT_SERVICE"
-
-  echo "  Waiting for Element ..."
-  if ! wait_for_element; then
-    trap - ERR
-    rollback
-    die "Element did not become healthy after update."
-  fi
-
-  trap - ERR
-  cleanup
-  if [[ -n "$old_id" && "$old_id" != "$(image_id_of "$new_image")" ]]; then
-    podman rmi "$old_id" >/dev/null 2>&1 || true
-  fi
-  echo "  OK: Element updated to $new_tag"
-}
-
-# update-postgres <tag> [--yes] — move PostgreSQL to another minor of the SAME major
-update_postgres() {
-  local new_tag="" skip_confirm=0
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      -y|--yes) skip_confirm=1; shift ;;
-      *) new_tag="$1"; shift ;;
-    esac
-  done
-
-  local old_tag repo old_image new_image old_id tmp_env tmp_quadlet old_major new_major
-  [[ -n "$new_tag" ]] || die "Usage: matrix-maint.sh update-postgres <tag>"
-  [[ "$new_tag" =~ ^[0-9]+\.[0-9]+(-[A-Za-z0-9.]+)?$ ]] \
-    || die "Invalid tag: $new_tag — PostgreSQL needs MAJOR.MINOR like 18.7-alpine ('latest' and major-only tags are not permitted)."
-
-  old_tag="$(postgres_tag)"
-  repo="$(postgres_repo)"
-  [[ -n "$repo" ]] || die "Could not read POSTGRES_IMAGE_REPO from .env"
-  old_image="$(postgres_image)"
-  new_image="${repo}:${new_tag}"
-  old_major="${old_tag%%.*}"
-  new_major="${new_tag%%.*}"
-  # Guard: the data directory format changes between majors; the new binaries
-  # would refuse to start on the old cluster and rollback would be the only outcome.
-  [[ "$old_major" == "$new_major" ]] \
-    || die "Major upgrade ${old_major} → ${new_major} is not automated. Dump/restore or pg_upgrade manually, then set the tag."
-  old_id="$(image_id_of "$old_image")"
-  tmp_env="$(mktemp)"
-  tmp_quadlet="$(mktemp)"
-
-  echo "  Current PostgreSQL tag: $old_tag"
-  echo "  Target  PostgreSQL tag: $new_tag"
-
-  if [[ "$skip_confirm" -eq 0 ]]; then
-    confirm_or_exit || { rm -f "$tmp_env" "$tmp_quadlet"; exit 0; }
-  fi
-
-  cp -a "$ENV_FILE"              "$tmp_env"
-  cp -a "$POSTGRES_QUADLET_FILE" "$tmp_quadlet"
-
-  cleanup() { rm -f "$tmp_env" "$tmp_quadlet"; }
-  rollback() {
-    echo "  !! PostgreSQL update failed — rolling back and restarting ..." >&2
-    cp -a "$tmp_env"     "$ENV_FILE"
-    cp -a "$tmp_quadlet" "$POSTGRES_QUADLET_FILE"
-    [[ -n "$old_id" ]] && podman tag "$old_id" "$old_image" >/dev/null 2>&1 || true
-    systemctl daemon-reload
-    systemctl restart "$POSTGRES_SERVICE" || true
-    systemctl restart "$SYNAPSE_SERVICE" || true
-    rm -f "$tmp_env" "$tmp_quadlet"
-    if wait_for_postgres && wait_for_synapse; then
-      echo "  Rollback complete — ${old_image} is healthy again." >&2
-    else
-      echo "  CRITICAL: rollback to ${old_image} did not become healthy. Restore the CT from the PVE snapshot / PBS." >&2
-    fi
-  }
-  trap rollback ERR
-
-  echo "  Pulling target image ..."
-  podman pull "$new_image"
-
-  sed -i "s|^Image=.*|Image=${new_image}|" "$POSTGRES_QUADLET_FILE"
-  sed -i \
-    -e "s|^POSTGRES_TAG=.*|POSTGRES_TAG=$new_tag|" \
-    -e "s|^POSTGRES_IMAGE=.*|POSTGRES_IMAGE=$new_image|" \
-    "$ENV_FILE"
-
-  # Requires= stops Synapse together with PostgreSQL; start it again explicitly.
-  echo "  Reloading Quadlet and restarting PostgreSQL + Synapse ..."
-  systemctl daemon-reload
-  systemctl restart "$POSTGRES_SERVICE"
-  systemctl restart "$SYNAPSE_SERVICE"
-
-  echo "  Waiting for PostgreSQL and Synapse ..."
-  if ! wait_for_postgres || ! wait_for_synapse; then
-    trap - ERR
-    rollback
-    die "Stack did not become healthy after PostgreSQL update."
-  fi
-
-  trap - ERR
-  cleanup
-  if [[ -n "$old_id" && "$old_id" != "$(image_id_of "$new_image")" ]]; then
-    podman rmi "$old_id" >/dev/null 2>&1 || true
-  fi
-  echo "  OK: PostgreSQL updated to $new_tag"
-}
-
-# auto-update — re-pull all three current pinned tags; restart only what changed
-auto_update_stack() {
-  if [[ "$(env_flag AUTO_UPDATE)" != "1" ]]; then
-    echo "  Auto-update disabled in ${ENV_FILE}; nothing to do."
-    return 0
-  fi
-
-  local pg_image pg_old_id pg_new_id sy_image sy_old_id sy_new_id el_image el_old_id el_new_id
-  pg_image="$(postgres_image)"
-  sy_image="$(synapse_image)"
-  el_image="$(element_image)"
-  [[ -n "$pg_image" ]] || die "Could not read POSTGRES_IMAGE from .env"
-  [[ -n "$sy_image" ]] || die "Could not read SYNAPSE_IMAGE from .env"
-  [[ -n "$el_image" ]] || die "Could not read ELEMENT_IMAGE from .env"
-  pg_old_id="$(running_image_id "$POSTGRES_CONTAINER")"
-  sy_old_id="$(running_image_id "$SYNAPSE_CONTAINER")"
-  el_old_id="$(running_image_id "$ELEMENT_CONTAINER")"
-
-  echo "  Auto-update: re-pulling pinned ${pg_image} ..."
-  podman pull "$pg_image"
-  pg_new_id="$(image_id_of "$pg_image")"
-  [[ -n "$pg_new_id" ]] || die "Could not inspect pulled image ${pg_image}"
-
-  echo "  Auto-update: re-pulling pinned ${sy_image} ..."
-  podman pull "$sy_image"
-  sy_new_id="$(image_id_of "$sy_image")"
-  [[ -n "$sy_new_id" ]] || die "Could not inspect pulled image ${sy_image}"
-
-  echo "  Auto-update: re-pulling pinned ${el_image} ..."
-  podman pull "$el_image"
-  el_new_id="$(image_id_of "$el_image")"
-  [[ -n "$el_new_id" ]] || die "Could not inspect pulled image ${el_image}"
-
-  local pg_changed=0 sy_changed=0 el_changed=0
-  [[ -z "$pg_old_id" || "$pg_new_id" != "$pg_old_id" ]] && pg_changed=1
-  [[ -z "$sy_old_id" || "$sy_new_id" != "$sy_old_id" ]] && sy_changed=1
-  [[ -z "$el_old_id" || "$el_new_id" != "$el_old_id" ]] && el_changed=1
-
-  if [[ "$pg_changed" -eq 0 && "$sy_changed" -eq 0 && "$el_changed" -eq 0 ]]; then
-    echo "  OK: all images are already current — no restart needed."
-    return 0
-  fi
-
-  rollback() {
-    echo "  !! Auto-update failed — restoring previous images and restarting ..." >&2
-    [[ "$pg_changed" -eq 1 && -n "$pg_old_id" ]] && podman tag "$pg_old_id" "$pg_image" >/dev/null 2>&1 || true
-    [[ "$sy_changed" -eq 1 && -n "$sy_old_id" ]] && podman tag "$sy_old_id" "$sy_image" >/dev/null 2>&1 || true
-    [[ "$el_changed" -eq 1 && -n "$el_old_id" ]] && podman tag "$el_old_id" "$el_image" >/dev/null 2>&1 || true
-    [[ "$pg_changed" -eq 1 ]] && { systemctl restart "$POSTGRES_SERVICE" || true; }
-    [[ "$pg_changed" -eq 1 || "$sy_changed" -eq 1 ]] && { systemctl restart "$SYNAPSE_SERVICE" || true; }
-    [[ "$el_changed" -eq 1 ]] && { systemctl restart "$ELEMENT_SERVICE" || true; }
-    if wait_for_postgres && wait_for_synapse && wait_for_element; then
-      echo "  Rollback complete — previous images are healthy again." >&2
-    else
-      echo "  CRITICAL: rollback did not become healthy (Synapse schema may already be migrated). Restore the CT from the PVE snapshot / PBS." >&2
-    fi
-  }
-  trap rollback ERR
-
-  if [[ "$pg_changed" -eq 1 ]]; then
-    echo "  PostgreSQL image changed — restarting ${POSTGRES_SERVICE} ..."
-    systemctl restart "$POSTGRES_SERVICE"
-  fi
-  # Synapse restarts when its own image changed, or after a PostgreSQL restart
-  # (Requires= already stopped it, and it must reconnect to the new backend).
-  if [[ "$pg_changed" -eq 1 || "$sy_changed" -eq 1 ]]; then
-    echo "  Restarting ${SYNAPSE_SERVICE} ..."
-    systemctl restart "$SYNAPSE_SERVICE"
-  fi
-  if [[ "$el_changed" -eq 1 ]]; then
-    echo "  Element image changed — restarting ${ELEMENT_SERVICE} ..."
-    systemctl restart "$ELEMENT_SERVICE"
-  fi
-
-  echo "  Waiting for PostgreSQL, Synapse and Element ..."
-  if ! wait_for_postgres || ! wait_for_synapse || ! wait_for_element; then
-    trap - ERR
-    rollback
-    die "Stack did not become healthy after auto-update."
-  fi
-
-  trap - ERR
-  [[ "$pg_changed" -eq 1 && -n "$pg_old_id" ]] && podman rmi "$pg_old_id" >/dev/null 2>&1 || true
-  [[ "$sy_changed" -eq 1 && -n "$sy_old_id" ]] && podman rmi "$sy_old_id" >/dev/null 2>&1 || true
-  [[ "$el_changed" -eq 1 && -n "$el_old_id" ]] && podman rmi "$el_old_id" >/dev/null 2>&1 || true
-  echo "  OK: Matrix stack refreshed (Synapse changed: ${sy_changed}, Element changed: ${el_changed}, PostgreSQL changed: ${pg_changed})"
-}
-
-need_root
-cmd="${1:-}"
-case "$cmd" in
-  update)          shift; update_synapse "$@" ;;
-  update-element)  shift; update_element "$@" ;;
-  update-postgres) shift; update_postgres "$@" ;;
-  auto-update)     auto_update_stack ;;
-  version)
-    echo "Configured Synapse image:    $(synapse_image)"
-    echo "Running Synapse image ID:    $(running_image_id "$SYNAPSE_CONTAINER")"
-    echo "Synapse server version:      $(curl -s --max-time 3 "http://127.0.0.1:$(synapse_port)/_synapse/admin/v1/server_version" 2>/dev/null | grep -o '"server_version":"[^"]*"' | cut -d'"' -f4 || echo n/a)"
-    echo "Configured Element image:    $(element_image)"
-    echo "Running Element image ID:    $(running_image_id "$ELEMENT_CONTAINER")"
-    echo "Configured PostgreSQL image: $(postgres_image)"
-    echo "Running PostgreSQL image ID: $(running_image_id "$POSTGRES_CONTAINER")"
-    echo "PostgreSQL server version:   $(podman exec "$POSTGRES_CONTAINER" psql -U synapse -d synapse -tAc 'show server_version' 2>/dev/null || echo n/a)"
-    echo "AUTO_UPDATE=$(env_flag AUTO_UPDATE)"
-    ;;
-  ""|-h|--help) usage ;;
-  *) usage; die "Unknown command: $cmd" ;;
-esac
-MAINT
-echo "  Maintenance script deployed: /usr/local/bin/matrix-maint.sh"
 
 # ── Start via Quadlet ─────────────────────────────────────────────────────────
 # daemon-reload triggers the Quadlet generator which produces matrix-synapse.service,
@@ -1433,17 +1075,27 @@ echo "  Maintenance script deployed: /usr/local/bin/matrix-maint.sh"
 # systemctl-enabled; daemon-reload is sufficient. Starting matrix-synapse.service
 # pulls in PostgreSQL via Requires= and waits for its health check (Notify=healthy);
 # Element is started alongside and is independent of both.
+pct exec "$CT_ID" -- bash -lc '
+  set -euo pipefail
+  /usr/lib/systemd/system-generators/podman-system-generator --dryrun >/dev/null
+  systemctl daemon-reload
+  for service in matrix-postgres matrix-synapse matrix-element; do
+    test "$(systemctl show "$service.service" -p LoadState --value)" = loaded
+  done
+'
+
+# Fail before persistent app startup if filtering was disabled during provisioning.
+pct exec "$CT_ID" -- /usr/local/sbin/matrix-ufw-check
+
+# First persistent service start: disarm BEFORE the command, including a failed start.
+CLEANUP_ON_FAIL=0
 pct exec "$CT_ID" -- bash -lc "
   set -euo pipefail
-  systemctl daemon-reload
   systemctl start '${SYNAPSE_QUADLET_SERVICE}' '${ELEMENT_QUADLET_SERVICE}'
 "
 
-# ── Disarm destructive cleanup ────────────────────────────────────────────────
-CLEANUP_ON_FAIL=0
-
 # ── Verification ──────────────────────────────────────────────────────────────
-sleep 3
+sleep 30
 VERIFY_FAIL=0
 
 for svc in "$POSTGRES_QUADLET_SERVICE" "$SYNAPSE_QUADLET_SERVICE" "$ELEMENT_QUADLET_SERVICE"; do
@@ -1458,14 +1110,14 @@ for svc in "$POSTGRES_QUADLET_SERVICE" "$SYNAPSE_QUADLET_SERVICE" "$ELEMENT_QUAD
 done
 
 RUNNING=0
-for i in $(seq 1 60); do
+for i in 1; do
   RUNNING="$(pct exec "$CT_ID" -- sh -lc \
     'podman ps --filter name=^matrix-synapse$ --filter name=^matrix-element$ --filter name=^matrix-postgres$ --format "{{.Names}}" 2>/dev/null | wc -l' \
     2>/dev/null || echo 0)"
   [[ "$RUNNING" -ge 3 ]] && break
   sleep 2
 done
-pct exec "$CT_ID" -- bash -lc 'podman ps' || true
+pct exec "$CT_ID" -- bash -lc 'set -euo pipefail; podman ps' || true
 
 if [[ "$RUNNING" -lt 3 ]]; then
   echo "  ERROR: Expected 3 containers running (matrix-synapse, matrix-element, matrix-postgres), found $RUNNING" >&2
@@ -1508,17 +1160,21 @@ fi
 # Synapse refuses to start on a database whose collation is not "C" (initdb
 # must have received POSTGRES_INITDB_ARGS). Query pg_database — the lc_collate
 # server variable no longer exists since PostgreSQL 16.
-DB_COLLATE="$(pct exec "$CT_ID" -- sh -lc "podman exec matrix-postgres psql -U synapse -d synapse -tAc \"select datcollate from pg_database where datname = current_database()\" 2>/dev/null" 2>/dev/null | tr -d '[:space:]' || true)"
+DB_COLLATE="$(pct exec "$CT_ID" -- sh -lc "podman exec matrix-postgres psql -U postgres -d synapse -tAc \"select datcollate from pg_database where datname = current_database()\" 2>/dev/null" 2>/dev/null | tr -d '[:space:]' || true)"
 if [[ "$DB_COLLATE" == "C" ]]; then
   echo "  Database collation is C (Synapse requirement)"
 else
   echo "  ERROR: synapse database collation is '${DB_COLLATE:-n/a}', expected 'C' — POSTGRES_INITDB_ARGS was not applied at initdb" >&2
-  echo "  Check: pct exec $CT_ID -- cat ${POSTGRES_ENV_FILE}" >&2
+  echo "  Inspect POSTGRES_INITDB_ARGS in ${POSTGRES_ENV_FILE} without sharing its secrets." >&2
   VERIFY_FAIL=1
 fi
 
 SY_HEALTHY=0
-for i in $(seq 1 90); do
+SY_WAIT_START=$SECONDS
+while (( SECONDS - SY_WAIT_START < INITIAL_WAIT_SECONDS )); do
+  SY_STATE=$(pct exec "$CT_ID" -- systemctl show matrix-synapse.service -p ActiveState --value)
+  SY_RESTARTS=$(pct exec "$CT_ID" -- systemctl show matrix-synapse.service -p NRestarts --value)
+  [[ $SY_STATE != failed && ${SY_RESTARTS:-0} == 0 ]] || break
   HTTP_CODE="$(pct exec "$CT_ID" -- sh -lc "curl -s -o /dev/null -w '%{http_code}' --max-time 3 'http://127.0.0.1:${SYNAPSE_PORT}/health' 2>/dev/null" 2>/dev/null || echo 000)"
   case "$HTTP_CODE" in
     200)
@@ -1540,7 +1196,11 @@ fi
 
 # The signing key response carries the server_name Synapse actually runs with —
 # the one baked into every user ID. It must be what was configured.
-KEY_SERVER_NAME="$(pct exec "$CT_ID" -- sh -lc "curl -s --max-time 3 'http://127.0.0.1:${SYNAPSE_PORT}/_matrix/key/v2/server' 2>/dev/null | grep -o '\"server_name\":\"[^\"]*\"' | cut -d'\"' -f4" 2>/dev/null || true)"
+KEY_SERVER_NAME="$(pct exec "$CT_ID" -- python3 -c '
+import json, sys, urllib.request
+with urllib.request.urlopen(sys.argv[1], timeout=3) as response:
+    print(json.load(response)["server_name"])
+' "http://127.0.0.1:${SYNAPSE_PORT}/_matrix/key/v2/server" 2>/dev/null || true)"
 if [[ "$KEY_SERVER_NAME" == "$SYNAPSE_SERVER_NAME" ]]; then
   echo "  Synapse server_name confirmed: ${KEY_SERVER_NAME}"
 else
@@ -1550,7 +1210,7 @@ fi
 
 # Synapse creates its schema on first start; an empty public schema means it came
 # up without a working database block (or the deltas failed silently).
-TABLE_COUNT="$(pct exec "$CT_ID" -- sh -lc "podman exec matrix-postgres psql -U synapse -d synapse -tAc \"select count(*) from pg_tables where schemaname='public'\" 2>/dev/null" 2>/dev/null | tr -d '[:space:]' || true)"
+TABLE_COUNT="$(pct exec "$CT_ID" -- sh -lc "podman exec matrix-postgres psql -U postgres -d synapse -tAc \"select count(*) from pg_tables where schemaname='public'\" 2>/dev/null" 2>/dev/null | tr -d '[:space:]' || true)"
 if [[ "$TABLE_COUNT" =~ ^[0-9]+$ ]] && (( TABLE_COUNT > 0 )); then
   echo "  Database schema created (${TABLE_COUNT} tables in schema public)"
 else
@@ -1579,12 +1239,440 @@ else
   VERIFY_FAIL=1
 fi
 
+# ── Verify authentication and effective database privileges ───────────────────
+# pg_isready alone cannot verify passwords. Require a deliberately bad password
+# to fail, then verify the real application password over TCP without argv leaks.
+if pct exec "$CT_ID" -- podman exec -e PGPASSWORD=deliberately-wrong matrix-postgres \
+  psql -w -h 127.0.0.1 -U synapse -d synapse -tAc 'SELECT 1' >/dev/null 2>&1; then
+  echo "ERROR: PostgreSQL accepted an incorrect password on TCP loopback." >&2
+  VERIFY_FAIL=1
+fi
+if ! printf '%s\n' "$DB_PASSWORD" | pct exec "$CT_ID" -- podman exec -i matrix-postgres \
+  bash -c 'IFS= read -r PGPASSWORD; export PGPASSWORD; exec psql -w -h 127.0.0.1 -U synapse -d synapse -tAc "SELECT 1"' >/dev/null; then
+  echo "ERROR: PostgreSQL rejected the application password over TCP." >&2
+  VERIFY_FAIL=1
+fi
+ROLE_OK=$(pct exec "$CT_ID" -- podman exec matrix-postgres psql -U postgres -d postgres -tAc \
+  "SELECT rolcanlogin AND NOT rolsuper AND NOT rolcreatedb AND NOT rolcreaterole AND NOT rolreplication AND NOT rolbypassrls FROM pg_roles WHERE rolname='synapse'" | tr -d '[:space:]')
+[[ $ROLE_OK == t ]] || { echo "ERROR: Synapse database role has unexpected privileges." >&2; VERIFY_FAIL=1; }
+OWNER_OK=$(pct exec "$CT_ID" -- podman exec matrix-postgres psql -U postgres -d postgres -tAc \
+  "SELECT pg_get_userbyid(datdba)='synapse' AND datcollate='C' AND datctype='C' FROM pg_database WHERE datname='synapse'" | tr -d '[:space:]')
+[[ $OWNER_OK == t ]] || { echo "ERROR: Database owner/locale is incorrect." >&2; VERIFY_FAIL=1; }
+HBA_OK=$(pct exec "$CT_ID" -- podman exec matrix-postgres psql -U postgres -d postgres -tAc \
+  "SELECT count(*)=0 FROM pg_hba_file_rules WHERE error IS NOT NULL OR (type LIKE 'host%' AND auth_method <> 'scram-sha-256')" | tr -d '[:space:]')
+[[ $HBA_OK == t ]] || { echo "ERROR: Unexpected host authentication rule in pg_hba.conf." >&2; VERIFY_FAIL=1; }
+# Round-trip unquoted env-file secrets, without printing their values.
+for secret in POSTGRES_PASSWORD SYNAPSE_DB_PASSWORD; do
+  got=$(pct exec "$CT_ID" -- podman exec matrix-postgres printenv "$secret") || got=""
+  expected=$DB_PASSWORD
+  [[ $secret != POSTGRES_PASSWORD ]] || expected=$PG_ADMIN_PASSWORD
+  [[ $got == "$expected" ]] || { echo "ERROR: $secret env-file round trip failed." >&2; VERIFY_FAIL=1; }
+done
+unset DB_PASSWORD PG_ADMIN_PASSWORD TURN_SHARED_SECRET got expected
+
+
+if ! pct exec "$CT_ID" -- /usr/local/sbin/matrix-ufw-check; then
+  echo "  ERROR: UFW is inactive or its IPv4/IPv6 filtering is incomplete." >&2
+  VERIFY_FAIL=1
+fi
+
 if (( VERIFY_FAIL == 1 )); then
   echo "" >&2
   echo "  FATAL: Core verification failed — CT $CT_ID is preserved but the install is incomplete." >&2
   echo "  Inspect the container and fix manually, or destroy and re-run." >&2
-  exit 1
+  false
 fi
+
+# ── Maintenance helper ────────────────────────────────────────────────────────
+tmp="$(mktemp)"
+cat > "$tmp" <<'MAINT'
+#!/usr/bin/env bash
+set -Eeo pipefail
+umask 077
+export LC_ALL=C
+
+APP_DIR=/opt/matrix
+ENV_FILE=$APP_DIR/.env
+UNIT_DIR=/etc/containers/systemd
+LOCK=/run/lock/matrix-maint.lock
+# Persistent state: postgresdata/, synapse/ (configuration, keys, media),
+# postgres.env, postgres-init.sh and element-config.json. Updates never replace it.
+# PBS/PVE owns backup and restore. Only a temporary copy of TWO control files is
+# used to unwind a failed switch; no data archive, restore command or boot barrier.
+# One component per operation: each atomic Quadlet is the runtime source of truth.
+# A reboot between its write and the descriptive .env write can only boot the
+# complete old or complete target unit. The next update reconciles .env metadata.
+WORK=""
+SWITCHED=0
+START_ATTEMPTED=0
+APP_STOPPED=0
+COMPONENT=""
+
+die() { printf '  ERROR: %s\n' "$*" >&2; exit 1; }
+image_id() {
+  local value
+  value=$(podman image inspect --format '{{.Id}}' "$1") || return 1
+  value=${value#sha256:}
+  [[ $value =~ ^[a-f0-9]{64}$ ]] || return 1
+  printf 'sha256:%s\n' "$value"
+}
+read_state() {
+  local line key value
+  declare -A seen=()
+  while IFS= read -r line || [[ -n $line ]]; do
+    [[ $line =~ ^[[:space:]]*(#.*)?$ ]] && continue
+    [[ $line =~ ^([A-Z][A-Z0-9_]*)=(.*)$ ]] || die "Malformed state line in $ENV_FILE."
+    key=${BASH_REMATCH[1]}; value=${BASH_REMATCH[2]}
+    [[ ! ${seen[$key]+yes} ]] || die "Duplicate state key: $key"
+    seen[$key]=1
+    case $key in
+      SYNAPSE_IMAGE_REPO|SYNAPSE_TAG|SYNAPSE_IMAGE|SYNAPSE_IMAGE_ID|ELEMENT_IMAGE_REPO|ELEMENT_TAG|ELEMENT_IMAGE|ELEMENT_IMAGE_ID|POSTGRES_IMAGE_REPO|POSTGRES_TAG|POSTGRES_IMAGE|POSTGRES_IMAGE_ID|SYNAPSE_PORT|ELEMENT_PORT|SYNAPSE_WAIT_SECONDS|AUTO_UPDATE|PODMAN_FUSE_OVERLAY)
+        [[ $value =~ ^[A-Za-z0-9_./:+-]+$ ]] || die "Invalid value for $key. Use unquoted KEY=value."
+        printf -v "$key" '%s' "$value"
+        ;;
+      *) ;;  # preserve other configuration keys without executing or interpreting them
+    esac
+  done < "$ENV_FILE"
+  for key in SYNAPSE_PORT ELEMENT_PORT SYNAPSE_WAIT_SECONDS AUTO_UPDATE PODMAN_FUSE_OVERLAY; do
+    [[ ${seen[$key]+yes} ]] || die "Missing state key: $key"
+  done
+  [[ $SYNAPSE_PORT =~ ^[1-9][0-9]{3,4}$ && $ELEMENT_PORT =~ ^[1-9][0-9]{3,4}$ ]] || die "Invalid HTTP ports."
+  (( SYNAPSE_PORT <= 65535 && ELEMENT_PORT <= 65535 )) || die "Invalid HTTP ports."
+  [[ $SYNAPSE_WAIT_SECONDS =~ ^[1-9][0-9]{1,4}$ ]] && (( SYNAPSE_WAIT_SECONDS <= 86400 )) || die "Invalid migration wait."
+  [[ $AUTO_UPDATE =~ ^[01]$ && $PODMAN_FUSE_OVERLAY =~ ^[01]$ ]] || die "Invalid policy flag."
+}
+unit_value() {
+  local prefix=$1 file=$2
+  awk -v p="$prefix" 'index($0,p)==1 {value=substr($0,length(p)+1); n++} END {if(n!=1) exit 1; print value}' "$file"
+}
+valid_tag() {
+  case $1 in
+    SYNAPSE|ELEMENT) [[ $2 =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] ;;
+    POSTGRES) [[ $2 =~ ^18\.[0-9]+(-[a-z0-9.]+)?$ ]] ;;
+    *) return 1 ;;
+  esac
+}
+write_env() {
+  local component=$1 tag=$2 reference=$3 id=$4 temp
+  temp=$(mktemp "${ENV_FILE}.XXXXXX") || return 1
+  if ! awk -v c="$component" -v t="$tag" -v r="$reference" -v id="$id" '
+    index($0,c "_TAG=")==1 {print c "_TAG=" t; next}
+    index($0,c "_IMAGE=")==1 {print c "_IMAGE=" r; next}
+    index($0,c "_IMAGE_ID=")==1 {print c "_IMAGE_ID=" id; next}
+    {print}
+  ' "$ENV_FILE" > "$temp" || ! chmod 0600 "$temp" || ! mv -fT "$temp" "$ENV_FILE"; then
+    rm -f -- "$temp"
+    return 1
+  fi
+}
+write_unit() {
+  local tag=$1 reference=$2 id=$3 old_tag=$4 old_reference=$5 old_id=$6 temp
+  temp=$(mktemp "${UNIT}.XXXXXX") || return 1
+  if ! sed -e "s|^# MatrixTag=.*|# MatrixTag=$tag|" \
+      -e "s|^# MatrixImage=.*|# MatrixImage=$reference|" \
+      -e "s|^Image=.*|Image=$id|" \
+      -e '/^# PreviousTag=/d; /^# PreviousImage=/d; /^# PreviousImageID=/d' "$UNIT" > "$temp"; then
+    rm -f -- "$temp"; return 1
+  fi
+  if [[ $COMPONENT == ELEMENT ]]; then
+    if ! printf '# PreviousTag=%s\n# PreviousImage=%s\n# PreviousImageID=%s\n' "$old_tag" "$old_reference" "$old_id" >> "$temp"; then
+      rm -f -- "$temp"; return 1
+    fi
+  fi
+  if ! chmod 0644 "$temp" || ! mv -fT "$temp" "$UNIT"; then
+    rm -f -- "$temp"; return 1
+  fi
+}
+wait_for_component() {
+  local name=$1 timeout=$2 start=$SECONDS restarts state code port initial_restarts
+  initial_restarts=$(systemctl show "matrix-$name.service" -p NRestarts --value) || return 1
+  while (( SECONDS - start < timeout )); do
+    state=$(systemctl show "matrix-$name.service" -p ActiveState --value) || return 1
+    restarts=$(systemctl show "matrix-$name.service" -p NRestarts --value) || return 1
+    [[ $state != failed && $state != inactive && ${restarts:-0} == "${initial_restarts:-0}" ]] || return 1
+    if [[ $name == postgres ]]; then
+      if [[ $state == active ]] && podman exec matrix-postgres pg_isready -h 127.0.0.1 -U synapse -d synapse >/dev/null 2>&1; then return 0; fi
+    else
+      port=$ELEMENT_PORT; [[ $name != synapse ]] || port=$SYNAPSE_PORT
+      local path=/; [[ $name != synapse ]] || path=/health
+      code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 "http://127.0.0.1:$port$path") || code=000
+      if [[ $state == active && $code == 200 ]]; then return 0; fi
+    fi
+    sleep 2
+  done
+  return 1
+}
+copy_control_file() {
+  local source=$1 destination=$2 temp
+  temp=$(mktemp "${destination}.XXXXXX") || return 1
+  if ! cp --preserve=mode,ownership "$source" "$temp" || ! mv -fT "$temp" "$destination"; then
+    rm -f -- "$temp"
+    return 1
+  fi
+}
+finish() {
+  local rc=$? restored=1
+  trap - EXIT ERR INT TERM HUP
+  set +e
+  if (( rc != 0 && SWITCHED )); then
+    if [[ $COMPONENT == ELEMENT ]] || (( START_ATTEMPTED == 0 )); then
+      # Element is static; before a stateful target start, only control files changed.
+      copy_control_file "$WORK/old.container" "$UNIT" || restored=0
+      copy_control_file "$WORK/old.env" "$ENV_FILE" || restored=0
+      systemctl daemon-reload || restored=0
+      if (( restored )); then
+        if [[ $COMPONENT == ELEMENT ]]; then
+          systemctl restart "$SERVICE" && wait_for_component element 120 || restored=0
+        elif (( APP_STOPPED )); then
+          systemctl start matrix-synapse.service && wait_for_component synapse "$SYNAPSE_WAIT_SECONDS" || restored=0
+        fi
+      fi
+      if (( restored )); then
+        printf '  Previous %s configuration/image restored; persistent data was untouched.\n' "$COMPONENT" >&2
+      else
+        printf '  CRITICAL: Could not confirm recovery. Inspect %s and %s.\n' "$UNIT" "$WORK" >&2
+      fi
+    else
+      printf '  Target %s image is retained. No automatic database/image downgrade.\n' "$COMPONENT" >&2
+      printf '  Synapse may still be migrating. Inspect journalctl -u matrix-synapse.service -u matrix-postgres.service.\n' >&2
+      printf '  Recovery is through the matching PBS/PVE checkpoint if required.\n' >&2
+      [[ $COMPONENT != POSTGRES ]] || printf '  After PostgreSQL is healthy: systemctl start matrix-synapse.service\n' >&2
+    fi
+  elif (( rc != 0 && APP_STOPPED )); then
+    systemctl start matrix-synapse.service || printf '  Could not resume Synapse; inspect its journal.\n' >&2
+  fi
+  if [[ -n $WORK ]]; then
+    if (( restored )); then rm -rf -- "$WORK"; else printf '  Temporary control files retained: %s\n' "$WORK" >&2; fi
+  fi
+  exit "$rc"
+}
+trap finish EXIT
+trap 'printf "  Maintenance failed near line %s.\n" "$LINENO" >&2' ERR
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
+
+update_component() {
+  local component=$1 requested=${2:-} repo_key repo old_tag old_image old_id actual target new_id key configured
+  local old_variant new_variant old_version new_version target_image use_previous=0 previous_id="" old_previous_id=""
+  COMPONENT=$component; UNIT="$UNIT_DIR/matrix-${component,,}.container"
+  SERVICE="matrix-${component,,}.service"
+  SWITCHED=0; START_ATTEMPTED=0; APP_STOPPED=0
+  repo_key=${component}_IMAGE_REPO; repo=${!repo_key}
+  [[ $repo =~ ^[a-z0-9][a-z0-9._/-]*[a-z0-9]$ ]] || die "Invalid $repo_key."
+  for key in "${component}_TAG" "${component}_IMAGE" "${component}_IMAGE_ID"; do
+    unit_value "$key=" "$ENV_FILE" >/dev/null || die "Missing or duplicate state key: $key"
+  done
+  old_tag=$(unit_value '# MatrixTag=' "$UNIT") || die "Missing unit version metadata."
+  old_image=$(unit_value '# MatrixImage=' "$UNIT") || die "Missing unit image metadata."
+  old_id=$(unit_value 'Image=' "$UNIT") || die "Missing unit image ID."
+  valid_tag "$component" "$old_tag" || die "Invalid configured tag."
+  [[ $old_image == "$repo:$old_tag" && $old_id =~ ^sha256:[a-f0-9]{64}$ ]] || die "Unit metadata is inconsistent."
+  [[ $(unit_value 'Pull=' "$UNIT") == never ]] || die "Unit must use Pull=never."
+  target=${requested:-$old_tag}
+  if [[ $component == ELEMENT ]]; then
+    old_previous_id=$(unit_value '# PreviousImageID=' "$UNIT" 2>/dev/null || true)
+    if [[ $target == previous ]]; then
+      use_previous=1
+      target=$(unit_value '# PreviousTag=' "$UNIT") || die "No previous Element version recorded yet."
+      previous_id=$(unit_value '# PreviousImageID=' "$UNIT") || die "Previous Element image ID is missing."
+      [[ $previous_id =~ ^sha256:[a-f0-9]{64}$ ]] || die "Invalid previous Element ID."
+      [[ $(unit_value '# PreviousImage=' "$UNIT") == "$repo:$target" ]] || die "Previous Element metadata is inconsistent."
+    fi
+  fi
+  valid_tag "$component" "$target" || die "Use a pinned release tag; PostgreSQL must remain 18.MINOR[-variant]."
+  if [[ $component == POSTGRES ]]; then
+    old_variant=""; new_variant=""
+    [[ $old_tag != *-* ]] || old_variant=${old_tag#*-}
+    [[ $target != *-* ]] || new_variant=${target#*-}
+    [[ $old_variant == "$new_variant" ]] || die "PostgreSQL variant changes require a separate migration."
+  fi
+  if [[ $component != ELEMENT ]]; then
+    old_version=${old_tag%%-*}; new_version=${target%%-*}
+    [[ $(printf '%s\n%s\n' "$old_version" "$new_version" | sort -V | head -n 1) == "$old_version" ]] \
+      || die "Stateful downgrades require version-specific review and PBS/PVE recovery."
+  fi
+  /usr/local/sbin/matrix-ufw-check || die "UFW filtering is not active; restore firewall policy before maintenance."
+  systemctl is-active --quiet "$SERVICE" || die "$SERVICE must be active before updating."
+  actual=$(podman inspect --format '{{.Image}}' "matrix-${component,,}") || die "Cannot inspect running image."
+  actual=$(image_id "$actual") || die "Running image is unavailable."
+  [[ $actual == "$old_id" ]] || die "Running and configured IDs differ; inspect/restart the selected service first."
+  wait_for_component "${component,,}" 30 || die "$SERVICE is unhealthy before update."
+  if [[ $component == POSTGRES ]]; then
+    wait_for_component synapse 30 || die "Synapse must be healthy before a database update."
+  fi
+  for key in TAG IMAGE IMAGE_ID; do
+    configured="${component}_$key"
+    case $key in TAG) actual=$old_tag ;; IMAGE) actual=$old_image ;; IMAGE_ID) actual=$old_id ;; esac
+    if [[ ${!configured} != "$actual" ]]; then
+      printf '  Reconciling %s metadata from its authoritative Quadlet after an interrupted write.\n' "$component"
+      write_env "$component" "$old_tag" "$old_image" "$old_id"
+      break
+    fi
+  done
+  if (( YES == 0 )); then
+    [[ -t 8 ]] || die "Interactive terminal or --yes is required."
+    printf '  Take/verify a PVE checkpoint or PBS backup on the host before updating.\n'
+    (( PODMAN_FUSE_OVERLAY == 0 )) || printf '  FUSE: use stop-mode PBS; do not freeze a running FUSE CT.\n'
+    [[ $component != SYNAPSE ]] || printf '  Read Synapse release notes; an image downgrade may be unsafe after migration.\n'
+    [[ $component != ELEMENT ]] || printf '  Element-only change; database/media stay live. Check client compatibility when reverting versions.\n'
+    read -r -p "  Update $component $old_tag -> $target? [y/N]: " answer <&8 || return 0
+    [[ $answer =~ ^([Yy]|[Yy][Ee][Ss])$ ]] || return 0
+  else
+    printf '  %s update: external PBS/PVE recovery is the operator responsibility; no backup is created or verified.\n' "$component"
+  fi
+  # Pull can move a tag. Runtime IDs are immutable, so a pull failure cannot
+  # change the current unit or what the next restart uses.
+  target_image="$repo:$target"
+  if (( use_previous )); then
+    new_id=$(image_id "$previous_id") || die "Previous Element image was removed locally; use a reviewed pinned tag instead."
+    [[ $new_id == "$previous_id" ]] || die "Previous Element image ID mismatch."
+  else
+    podman pull "$target_image"
+    new_id=$(image_id "$target_image") || die "Target image ID unavailable."
+  fi
+  if [[ $new_id == "$old_id" && $target == "$old_tag" ]]; then
+    printf '  %s image unchanged; no restart.\n' "$component"
+    return 0
+  fi
+  if [[ $component == SYNAPSE ]]; then
+    podman run --rm --pull=never --network none --user 991:991 \
+      -v "$APP_DIR/synapse:/data:ro" --entrypoint python "$new_id" \
+      -m synapse.config -c /data/homeserver.yaml
+  elif [[ $component == POSTGRES ]]; then
+    [[ $(cat "$APP_DIR/postgresdata/18/docker/PG_VERSION") == 18 ]] || die "Unexpected on-disk PostgreSQL major."
+    local uid gid actual_owner
+    uid=$(podman run --rm --pull=never --network none --entrypoint sh "$new_id" -c 'id -u postgres')
+    gid=$(podman run --rm --pull=never --network none --entrypoint sh "$new_id" -c 'id -g postgres')
+    actual_owner=$(stat -c '%u:%g' "$APP_DIR/postgresdata/18/docker")
+    [[ $uid =~ ^[0-9]+$ && $gid =~ ^[0-9]+$ && $actual_owner == "$uid:$gid" ]] || die "Target PostgreSQL UID/GID differs from cluster ownership. No recursive chown is attempted."
+    podman run --rm --pull=never --network none --entrypoint postgres "$new_id" --version | grep -Eq '^postgres \(PostgreSQL\) 18\.' \
+      || die "Image does not contain PostgreSQL 18."
+  else
+    python3 -m json.tool "$APP_DIR/element-config.json" >/dev/null
+    podman run --rm --pull=never --network none --entrypoint sh "$new_id" -c 'test -s /app/index.html' \
+      || die "Target Element image lacks /app/index.html."
+  fi
+  if [[ $component == ELEMENT && $new_id != "$old_id" ]]; then
+    podman tag "$old_id" localhost/matrix-element:previous
+  fi
+  WORK=$(mktemp -d /run/matrix-update.XXXXXX)
+  cp --preserve=mode,ownership "$UNIT" "$WORK/old.container"
+  cp --preserve=mode,ownership "$ENV_FILE" "$WORK/old.env"
+  # Set before the first write so every ordinary failure restores both files.
+  SWITCHED=1
+  write_unit "$target" "$target_image" "$new_id" "$old_tag" "$old_image" "$old_id"
+  write_env "$component" "$target" "$target_image" "$new_id"
+  /usr/lib/systemd/system-generators/podman-system-generator --dryrun >/dev/null
+  systemctl daemon-reload
+  [[ $(systemctl show "$SERVICE" -p LoadState --value) == loaded ]] || die "Quadlet did not generate $SERVICE."
+  if [[ $new_id != "$old_id" ]]; then
+    if [[ $component == POSTGRES ]]; then
+      APP_STOPPED=1
+      systemctl stop matrix-synapse.service
+    fi
+    # Once a persistent target MIGHT start, never restart the old image automatically.
+    START_ATTEMPTED=1
+    systemctl restart "$SERVICE"
+    wait_for_component "${component,,}" "$([[ $component == SYNAPSE ]] && printf '%s' "$SYNAPSE_WAIT_SECONDS" || printf 120)" \
+      || die "$SERVICE failed readiness or restarted. Inspect logs; migration timeout does not kill Synapse."
+    if [[ $component == POSTGRES ]]; then
+      systemctl start matrix-synapse.service
+      wait_for_component synapse "$SYNAPSE_WAIT_SECONDS" || die "Synapse did not recover after the database update."
+    fi
+  fi
+  actual=$(podman inspect --format '{{.Image}}' "matrix-${component,,}")
+  [[ $(image_id "$actual") == "$new_id" ]] || die "Running image does not match target."
+  if [[ $component == ELEMENT ]]; then
+    curl -fsS --max-time 10 "http://127.0.0.1:$ELEMENT_PORT/config.json" | python3 -m json.tool >/dev/null
+  fi
+  SWITCHED=0; START_ATTEMPTED=0; APP_STOPPED=0
+  rm -rf -- "$WORK"; WORK=""
+  if [[ $old_id != "$new_id" ]]; then
+    # Element: retain exactly one previous image under a local reference. Reverting
+    # its exact captured ID uses update-element previous, with no DB restore.
+    if [[ $component == ELEMENT ]]; then
+      if [[ $old_previous_id =~ ^sha256:[a-f0-9]{64}$ && $old_previous_id != "$old_id" && $old_previous_id != "$new_id" ]]; then
+        podman rmi "$old_previous_id" >/dev/null 2>&1 || true
+      fi
+    else
+      podman rmi "$old_id" >/dev/null 2>&1 || true
+    fi
+  fi
+  read_state
+  printf '  Updated %s to %s (%s).\n' "$component" "$target" "$new_id"
+}
+
+[[ $EUID == 0 ]] || die "Run as root inside the Matrix CT."
+for command in podman systemctl curl python3 awk sed sort head cat stat grep mktemp cp chmod mv rm flock; do
+  command -v "$command" >/dev/null || die "Missing command: $command"
+done
+[[ -f $ENV_FILE ]] || die "Missing $ENV_FILE; this helper belongs to the rewritten creator."
+exec 9>"$LOCK"
+flock -n 9 || die "Another maintenance operation is running."
+YES=0
+ARGS=()
+for arg in "$@"; do
+  case $arg in --yes|-y) YES=1 ;; *) ARGS+=("$arg") ;; esac
+done
+set -- "${ARGS[@]}"
+cmd=${1:---help}
+(( $# == 0 )) || shift
+read_state
+case $cmd in
+  update|update-element|update-postgres)
+    (( $# <= 1 )) || die "$cmd accepts one tag and optional --yes."
+    if (( YES == 0 )); then exec 8</dev/tty || die "No terminal; use --yes for an intentional unattended update."; fi
+    case $cmd in update) component=SYNAPSE ;; update-element) component=ELEMENT ;; update-postgres) component=POSTGRES ;; esac
+    update_component "$component" "${1:-}"
+    ;;
+  auto-update)
+    (( $# == 0 )) || die "auto-update takes no positional arguments."
+    [[ $AUTO_UPDATE == 1 ]] || { echo '  AUTO_UPDATE=0; skipping.'; exit 0; }
+    YES=1
+    # No all-stack transaction: earlier successful component changes remain if
+    # a later pull/update fails. Each component is independently coherent.
+    update_component POSTGRES
+    update_component SYNAPSE
+    update_component ELEMENT
+    ;;
+  version)
+    (( $# == 0 )) || die "version takes no arguments."
+    for component in SYNAPSE ELEMENT POSTGRES; do
+      unit="$UNIT_DIR/matrix-${component,,}.container"
+      printf '%s: %s\n  configured: %s\n  running:    %s\n' "$component" \
+        "$(unit_value '# MatrixImage=' "$unit")" "$(unit_value 'Image=' "$unit")" \
+        "$(podman inspect --format '{{.Image}}' "matrix-${component,,}" 2>/dev/null || printf unavailable)"
+    done
+    ;;
+  --help|-h)
+    cat <<'HELP'
+Usage (root inside the CT):
+  /usr/local/bin/matrix-maint.sh update [Synapse-vX.Y.Z] [--yes]
+  /usr/local/bin/matrix-maint.sh update-element [Element-vX.Y.Z|previous] [--yes]
+  /usr/local/bin/matrix-maint.sh update-postgres [18.MINOR-same-variant] [--yes]
+  /usr/local/bin/matrix-maint.sh auto-update
+  /usr/local/bin/matrix-maint.sh version
+
+PBS/PVE owns backups and recovery. No in-CT backup/restore/rollback commands.
+With FUSE use stop-mode PBS; a live CT freeze can deadlock FUSE mounts.
+Manual updates remind you of the checkpoint; --yes/timers do not verify one.
+A missing tag re-pulls that component's current tag. Auto-update re-pulls all
+three current tags in sequence and restarts only components whose ID changed.
+Element can move to an older pinned release without restoring the database.
+A failed Element switch automatically restores its actual pre-update image.
+update-element previous selects the captured previous ID without re-pulling a tag.
+Synapse/PostgreSQL are never automatically downgraded after a target start.
+Read Synapse release notes before changing versions; test real client/call
+compatibility after Element changes. HTTP readiness is not an end-to-end test.
+HELP
+    ;;
+  *) die "Unknown command: $cmd. Use --help." ;;
+esac
+MAINT
+pct push "$CT_ID" "$tmp" /usr/local/bin/matrix-maint.sh --perms 0755
+rm -f "$tmp"
+pct exec "$CT_ID" -- /usr/local/bin/matrix-maint.sh version
 
 # ── Auto-update timer (policy-driven) ─────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc "
@@ -1598,6 +1686,8 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 ExecStart=/usr/local/bin/matrix-maint.sh auto-update
+TimeoutStartSec=infinity
+TimeoutStopSec=180
 EOF2
 
   cat > /etc/systemd/system/matrix-update.timer <<EOF2
@@ -1615,10 +1705,10 @@ EOF2
   systemctl daemon-reload
 "
 if [[ "$AUTO_UPDATE" -eq 1 ]]; then
-  pct exec "$CT_ID" -- bash -lc 'systemctl enable --now matrix-update.timer'
+  pct exec "$CT_ID" -- bash -lc 'set -euo pipefail; systemctl enable --now matrix-update.timer'
   echo "  Auto-update timer enabled"
 else
-  pct exec "$CT_ID" -- bash -lc 'systemctl disable --now matrix-update.timer >/dev/null 2>&1 || true'
+  pct exec "$CT_ID" -- bash -lc 'set -euo pipefail; systemctl disable --now matrix-update.timer >/dev/null 2>&1 || true'
   echo "  Auto-update timer installed but disabled"
 fi
 
@@ -1694,83 +1784,63 @@ pct exec "$CT_ID" -- bash -lc '
 '
 
 # ── MOTD (dynamic drop-ins) ───────────────────────────────────────────────────
-pct exec "$CT_ID" -- bash -lc "
-  set -euo pipefail
-  > /etc/motd
-  chmod -x /etc/update-motd.d/* 2>/dev/null || true
-  rm -f /etc/update-motd.d/*
-
-  cat > /etc/update-motd.d/00-header <<'MOTD'
-#!/bin/sh
-printf '\\n  Matrix Synapse + Element (Podman/Quadlet)\\n'
-printf '  ────────────────────────────────────\\n'
-MOTD
-
-  cat > /etc/update-motd.d/10-sysinfo <<'MOTD'
-#!/bin/sh
-ip=\$(ip -4 -o addr show scope global 2>/dev/null | awk '{print \$4}' | cut -d/ -f1 | head -n1)
-printf '  Hostname:  %s\\n' \"\$(hostname)\"
-printf '  IP:        %s\\n' \"\${ip:-n/a}\"
-printf '  Uptime:    %s\\n' \"\$(uptime -p 2>/dev/null || uptime)\"
-printf '  Disk:      %s\\n' \"\$(df -h / | awk 'NR==2{printf \"%s/%s (%s used)\", \$3, \$2, \$5}')\"
-MOTD
-
-  cat > /etc/update-motd.d/30-app <<'MOTD'
-#!/bin/sh
-running=\$(podman ps --filter name=^matrix-synapse$ --filter name=^matrix-element$ --filter name=^matrix-postgres$ --format '{{.Names}}' 2>/dev/null | wc -l)
-sy_status=\$(systemctl is-active matrix-synapse.service 2>/dev/null); sy_status=\${sy_status:-unknown}
-el_status=\$(systemctl is-active matrix-element.service 2>/dev/null); el_status=\${el_status:-unknown}
-pg_status=\$(systemctl is-active matrix-postgres.service 2>/dev/null); pg_status=\${pg_status:-unknown}
-ip=\$(ip -4 -o addr show scope global 2>/dev/null | awk '{print \$4}' | cut -d/ -f1 | head -n1)
-sy_image=\$(awk -F= '/^SYNAPSE_IMAGE=/{print \$2}' /opt/matrix/.env 2>/dev/null | tail -n1)
-el_image=\$(awk -F= '/^ELEMENT_IMAGE=/{print \$2}' /opt/matrix/.env 2>/dev/null | tail -n1)
-pg_image=\$(awk -F= '/^POSTGRES_IMAGE=/{print \$2}' /opt/matrix/.env 2>/dev/null | tail -n1)
-auto=\$(awk -F= '/^AUTO_UPDATE=/{print \$2}' /opt/matrix/.env 2>/dev/null | tail -n1)
-server_name=\$(awk -F= '/^SYNAPSE_SERVER_NAME=/{print \$2}' /opt/matrix/.env 2>/dev/null | tail -n1)
-sy_fqdn=\$(awk -F= '/^SYNAPSE_FQDN=/{print \$2}' /opt/matrix/.env 2>/dev/null | tail -n1)
-el_fqdn=\$(awk -F= '/^ELEMENT_FQDN=/{print \$2}' /opt/matrix/.env 2>/dev/null | tail -n1)
-sy_port=\$(awk -F= '/^SYNAPSE_PORT=/{print \$2}' /opt/matrix/.env 2>/dev/null | tail -n1); sy_port=\${sy_port:-8008}
-el_port=\$(awk -F= '/^ELEMENT_PORT=/{print \$2}' /opt/matrix/.env 2>/dev/null | tail -n1); el_port=\${el_port:-8080}
-printf '  Containers: matrix-synapse + matrix-element + matrix-postgres (%s running)\\n' \"\$running\"
-printf '  Services:   synapse (%s) | element (%s) | postgres (%s)\\n' \"\$sy_status\" \"\$el_status\" \"\$pg_status\"
-printf '  Server:     %s  (user IDs @user:%s)\\n' \"\${server_name:-n/a}\" \"\${server_name:-n/a}\"
-printf '  Synapse:    %s\\n' \"\${sy_image:-n/a}\"
-printf '  Element:    %s\\n' \"\${el_image:-n/a}\"
-printf '  PostgreSQL: %s (127.0.0.1:5432)\\n' \"\${pg_image:-n/a}\"
-printf '  Policy:     %s\\n' \"\$([ \"\$auto\" = '1' ] && echo 'auto-update daily (re-pull current pinned tags)' || echo 'manual updates only')\"
-printf '  Data:       /opt/matrix/synapse (homeserver.yaml, media_store)  /opt/matrix/postgresdata\\n'
-printf '  Secrets:    /opt/matrix/postgres.env  /opt/matrix/synapse/homeserver.yaml\\n'
-printf '  Logs:       journalctl -u matrix-synapse.service -f\\n'
-printf '  Maintain:   /usr/local/bin/matrix-maint.sh [update|update-element|update-postgres|auto-update|version]\\n'
-printf '  Updates:    systemctl status matrix-update.timer\\n'
-printf '  Synapse:    https://%s/  |  http://%s:%s/\\n' \"\${sy_fqdn:-n/a}\" \"\${ip:-n/a}\" \"\$sy_port\"
-printf '  Element:    https://%s/  |  http://%s:%s/\\n' \"\${el_fqdn:-n/a}\" \"\${ip:-n/a}\" \"\$el_port\"
-printf '\\n'
-printf '  Admin:\\n'
-printf '    Create user (answer y to the admin prompt):\\n'
-printf '      podman exec -it matrix-synapse register_new_matrix_user -c /data/homeserver.yaml http://127.0.0.1:%s\\n' \"\$sy_port\"
-printf '    Registration token (needs an admin access token; admin API is LAN-only):\\n'
-printf '      curl -H \"Authorization: Bearer <ADMIN_TOKEN>\" -X POST http://%s:%s/_synapse/admin/v1/registration_tokens/new -d '\"'\"'{\"uses_allowed\": 1}'\"'\"'\\n' \"\${ip:-n/a}\" \"\$sy_port\"
-MOTD
-
-  cat > /etc/update-motd.d/99-footer <<'MOTD'
-#!/bin/sh
-printf '  ────────────────────────────────────\\n\\n'
-MOTD
-
-  chmod +x /etc/update-motd.d/*
-"
-
 pct exec "$CT_ID" -- bash -lc '
   set -euo pipefail
-  touch /root/.bashrc
-  grep -q "^export TERM=" /root/.bashrc 2>/dev/null || echo "export TERM=xterm-256color" >> /root/.bashrc
+  > /etc/motd
+  install -d /etc/update-motd.d
+  chmod -x /etc/update-motd.d/* 2>/dev/null || true
+  rm -f /etc/update-motd.d/*
 '
+tmp="$(mktemp)"
+cat > "$tmp" <<'MOTDHEADER'
+#!/bin/sh
+printf '\n  Matrix Synapse + Element (Podman/Quadlet)\n'
+printf '  ────────────────────────────────────\n'
+MOTDHEADER
+pct push "$CT_ID" "$tmp" /etc/update-motd.d/00-header --perms 0755
+cat > "$tmp" <<'MOTDSYSINFO'
+#!/bin/sh
+ip=$(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -n1)
+printf '  Hostname:  %s\n' "$(hostname)"
+printf '  IP:        %s\n' "${ip:-n/a}"
+printf '  Uptime:    %s\n' "$(uptime -p 2>/dev/null || uptime)"
+printf '  Disk:      %s\n' "$(df -h / | awk 'NR==2{printf "%s/%s (%s used)", $3, $2, $5}')"
+MOTDSYSINFO
+pct push "$CT_ID" "$tmp" /etc/update-motd.d/10-sysinfo --perms 0755
+cat > "$tmp" <<'MOTDAPP'
+#!/bin/sh
+printf '\n'
+for service in matrix-postgres matrix-synapse matrix-element; do
+  svc=$(systemctl is-active "$service.service" 2>/dev/null); svc=${svc:-unknown}
+  printf '  %-20s %s\n' "$service" "$svc"
+done
+if [ -r /opt/matrix/.env ]; then
+  server=$(sed -n 's/^SYNAPSE_FQDN=//p' /opt/matrix/.env)
+  chat=$(sed -n 's/^ELEMENT_FQDN=//p' /opt/matrix/.env)
+  printf '  Synapse: https://%s/ | Element: https://%s/\n' "$server" "$chat"
+  fuse=$(sed -n 's/^PODMAN_FUSE_OVERLAY=//p' /opt/matrix/.env)
+  if [ "$fuse" = 1 ]; then printf '  FUSE: stop-mode PBS backups; freezing a live CT can deadlock.\n'; fi
+fi
+printf '  Config: /opt/matrix/synapse/homeserver.yaml, /opt/matrix/.env\n'
+printf '  Maintenance: /usr/local/bin/matrix-maint.sh --help\n'
+printf '  Logs: journalctl -u matrix-synapse.service -f\n'
+printf '  Ingress: UFW inside this CT; only NPM may reach Matrix HTTP ports.\n'
+printf '  Firewall: ufw status verbose; manage locally through pct enter/exec.\n'
+printf '  Before updates: host PBS/PVE checkpoint. Synapse image reversal may be unsafe.\n'
+printf '  Element updates are independent; HTTP readiness does not verify calls.\n'
+MOTDAPP
+pct push "$CT_ID" "$tmp" /etc/update-motd.d/30-app --perms 0755
+cat > "$tmp" <<'MOTDFOOTER'
+#!/bin/sh
+printf '  ────────────────────────────────────\n\n'
+MOTDFOOTER
+pct push "$CT_ID" "$tmp" /etc/update-motd.d/99-footer --perms 0755
+rm -f "$tmp"
 
 # ── Proxmox UI description ────────────────────────────────────────────────────
 LINK_STYLE="text-decoration: none; color: #00617f;"
 MX_DESC="Public: <a href='https://${ELEMENT_FQDN}/' target='_blank' rel='noopener noreferrer' style='${LINK_STYLE}'>Element Web</a> · <a href='https://${SYNAPSE_FQDN}/' target='_blank' rel='noopener noreferrer' style='${LINK_STYLE}'>Synapse</a>
-Local: <a href='http://${CT_IP}:${ELEMENT_PORT}/' target='_blank' rel='noopener noreferrer' style='${LINK_STYLE}'>Element Web</a> · <a href='http://${CT_IP}:${SYNAPSE_PORT}/' target='_blank' rel='noopener noreferrer' style='${LINK_STYLE}'>Synapse</a>
+Backend ingress: UFW inside this CT; NPM source addresses only.
 <details><summary>Details</summary>Matrix Synapse + Element Web (Podman/Quadlet) on Debian ${DEBIAN_VERSION} LXC
 Server name: ${SYNAPSE_SERVER_NAME} | Synapse: ${SYNAPSE_TAG} | Element: ${ELEMENT_TAG} | PostgreSQL: ${POSTGRES_TAG}
 Created by matrix-quadlet.sh</details>"
@@ -1779,62 +1849,249 @@ pct set "$CT_ID" --description "$MX_DESC"
 # ── Protect container ─────────────────────────────────────────────────────────
 pct set "$CT_ID" --protection 1
 
+# ── Terminal quality of life ──────────────────────────────────────────────────
+pct exec "$CT_ID" -- bash -lc '
+  set -euo pipefail
+  touch /root/.bashrc
+  grep -q "^export TERM=" /root/.bashrc 2>/dev/null || echo "export TERM=xterm-256color" >> /root/.bashrc
+'
+
 # ── Summary ───────────────────────────────────────────────────────────────────
-echo ""
-echo "    CT: $CT_ID | IP: ${CT_IP} | Synapse: http://${CT_IP}:${SYNAPSE_PORT}/ | Element: http://${CT_IP}:${ELEMENT_PORT}/"
-echo "    Public:      https://${SYNAPSE_FQDN}/ (Synapse)  https://${ELEMENT_FQDN}/ (Element)"
-echo "    Server name: ${SYNAPSE_SERVER_NAME}  — user IDs are @user:${SYNAPSE_SERVER_NAME}; this can never be changed"
-echo "    Images:      ${SYNAPSE_IMAGE}"
-echo "                 ${ELEMENT_IMAGE}"
-echo "                 ${POSTGRES_IMAGE} (127.0.0.1:5432)"
-echo "    Quadlet:     ${SYNAPSE_QUADLET_FILE}"
-echo "                 ${ELEMENT_QUADLET_FILE}"
-echo "                 ${POSTGRES_QUADLET_FILE}"
-echo "    Config:      ${SYNAPSE_DATA_DIR}/homeserver.yaml  (0600 991:991 — DB password, secrets, TURN)"
-echo "                 ${ELEMENT_CONFIG_FILE}"
-echo "    Secrets:     ${POSTGRES_ENV_FILE}  (POSTGRES_PASSWORD — must match homeserver.yaml; initdb args)"
-echo "    Data:        ${SYNAPSE_DATA_DIR} (signing key, media_store)  ${APP_DIR}/postgresdata (cluster at ${PG_MAJOR}/docker)"
-echo "    Policy:      $([ "$AUTO_UPDATE" -eq 1 ] && echo "auto-update daily at ${UPDATE_TIME} (re-pull ${SYNAPSE_TAG} / ${ELEMENT_TAG} / ${POSTGRES_TAG})" || echo "manual updates only (${SYNAPSE_TAG} / ${ELEMENT_TAG} / ${POSTGRES_TAG})")"
-echo ""
-echo "    pct exec $CT_ID -- systemctl status matrix-synapse.service"
-echo "    pct exec $CT_ID -- journalctl -u matrix-synapse.service --no-pager -n 50"
-echo "    pct exec $CT_ID -- /usr/local/bin/matrix-maint.sh update <tag>           # Synapse, e.g. v1.161.0 — no :latest"
-echo "    pct exec $CT_ID -- /usr/local/bin/matrix-maint.sh update-element <tag>   # Element, e.g. v1.12.28"
-echo "    pct exec $CT_ID -- /usr/local/bin/matrix-maint.sh update-postgres <tag>  # same major only, e.g. 18.7-alpine"
-echo "    pct exec $CT_ID -- /usr/local/bin/matrix-maint.sh auto-update            # re-pull current tags now (if AUTO_UPDATE=1)"
-echo "    pct exec $CT_ID -- /usr/local/bin/matrix-maint.sh version"
-echo "    Backup/restore: use PBS or PVE snapshots (take one before every Synapse update — schema deltas are not always reversible)"
-echo ""
-echo "    First admin user (interactive, answer y to the admin prompt):"
-echo "      pct exec $CT_ID -- podman exec -it matrix-synapse register_new_matrix_user -c /data/homeserver.yaml http://127.0.0.1:${SYNAPSE_PORT}"
-echo "    Registration is token-gated. Create a token with an admin access token (Element -> Settings -> Help & About -> Access Token):"
-echo "      curl -H 'Authorization: Bearer <ADMIN_TOKEN>' -X POST http://${CT_IP}:${SYNAPSE_PORT}/_synapse/admin/v1/registration_tokens/new -d '{\"uses_allowed\": 1}'"
-echo ""
-echo "    NPM proxy hosts (scheme http, Websockets Support on):"
-echo "      ${SYNAPSE_FQDN} -> http://${CT_IP}:${SYNAPSE_PORT}"
-echo "        Custom Nginx Configuration:"
-echo "          set_real_ip_from 127.0.0.1;          # cloudflared runs natively next to NPM (Network=host)"
-echo "          real_ip_header CF-Connecting-IP;      # Synapse takes the LAST X-Forwarded-For entry — NPM appends the real IP"
-echo "          client_max_body_size ${MAX_UPLOAD_SIZE};"
-echo "          proxy_read_timeout 600s;"
-echo "          proxy_send_timeout 600s;"
-echo "          location ^~ /_synapse/admin { return 403; }"
-echo "      ${ELEMENT_FQDN} -> http://${CT_IP}:${ELEMENT_PORT}"
-echo "    Behind Cloudflare Tunnel (published route -> localhost:80): leave the SSL tab EMPTY on both hosts — Force SSL"
-echo "    would loop (tunnel delivers plain HTTP to :80). Publish both hostnames in the tunnel; disable Bot Fight Mode"
-echo "    or add a WAF skip for /_matrix/* — federation and some clients get challenged otherwise. Uploads are capped"
-echo "    at 100 MB by Cloudflare Free/Pro. If NPM terminates TLS itself instead: enable SSL + Force SSL and drop the"
-echo "    two real_ip lines."
-echo "    Well-known: Synapse serves /.well-known/matrix/server and /client itself — no custom locations needed."
-echo "    Federation needs only port 443 (delegation via well-known). Test: https://federationtester.matrix.org/#${SYNAPSE_SERVER_NAME}"
-echo "    Element talks to https://${SYNAPSE_FQDN} — DNS + proxy must exist first. For a LAN-only test, set base_url in"
-echo "    ${ELEMENT_CONFIG_FILE} to http://${CT_IP}:${SYNAPSE_PORT} and restart matrix-element.service."
-echo "    Ports ${SYNAPSE_PORT} and ${ELEMENT_PORT} listen on all CT interfaces (Network=host) — restrict with the PVE firewall if needed."
-echo ""
-echo "    TURN (VoIP relay): ${TURN_HOST} — openrelay free tier is 500 MB/month; replace TURN_HOST + TURN_SHARED_SECRET"
-echo "    in homeserver.yaml with your own coturn for production voice/video, then restart matrix-synapse.service."
-if [[ "$PODMAN_FUSE_OVERLAY" -eq 1 ]]; then
-  echo "    Backups: fuse=1 + fuse-overlayfs can deadlock under snapshot-mode vzdump/PBS (freezer)."
-  echo "             Use stop-mode backups for this CT, or test PODMAN_FUSE_OVERLAY=0."
+cat <<SUMMARY
+
+  MATRIX INSTALLATION COMPLETE
+
+  OPEN ELEMENT       https://${ELEMENT_FQDN}/
+  HOMESERVER         https://${SYNAPSE_FQDN}/
+  CONTAINER          $HN | CT $CT_ID | $CT_IP
+  LOGIN              root password set
+  PERMANENT ID       @user:${SYNAPSE_SERVER_NAME}
+
+  IMPORTANT: Keep this Matrix server name. It is part of every user's identity.
+
+  FIRST SETUP
+
+  1. RESERVE THE IP ADDRESSES
+
+     In your router/DHCP server, reserve the Matrix and NPM addresses:
+       Matrix IPv4   $CT_IP
+       NPM IPv4      ${BACKEND_ALLOWED_IPV4[*]}
+       NPM IPv6      ${BACKEND_ALLOWED_IPV6[*]:-(none)}
+     NPM is the only permitted source for the two backend HTTP ports.
+
+  2. CONFIGURE NGINX PROXY MANAGER (NPM)
+
+     Create these two proxy hosts:
+       ${SYNAPSE_FQDN} -> http://${CT_IP}:${SYNAPSE_PORT}
+       ${ELEMENT_FQDN} -> http://${CT_IP}:${ELEMENT_PORT}
+
+     For BOTH hosts:
+       Scheme               http
+       Forward Hostname/IP   $CT_IP
+       Forward Port          Synapse: ${SYNAPSE_PORT} | Element: ${ELEMENT_PORT}
+       Websockets Support    ON
+
+     Synapse proxy host > Advanced tab (paste these nginx settings):
+       client_max_body_size ${MAX_UPLOAD_SIZE};
+       proxy_read_timeout 600s;
+       proxy_send_timeout 600s;
+       location ^~ /_synapse/admin { return 403; }
+
+     HTTPS: Choose the setup that matches your ingress.
+
+       CLOUDFLARE TUNNEL -> NPM PORT 80
+         Leave NPM's SSL tab empty; Force SSL stays OFF.
+         Cloudflare provides public HTTPS. Exempt Matrix API/well-known paths
+         from browser challenges using the appropriate Cloudflare settings.
+
+       DIRECT INTERNET -> NPM
+         Configure a valid certificate and HTTPS in NPM.
+
+     Public DNS and HTTPS must work for BOTH domains before Element login.
+     Preserve Matrix request paths. Synapse serves its own discovery endpoints:
+       /.well-known/matrix/server
+       /.well-known/matrix/client
+
+  3. CHECK ACCESS
+
+     RUN INSIDE THE NPM CT -- each command should print HTTP 200:
+       curl -sS -o /dev/null -w 'HTTP %{http_code}\n' --max-time 5 http://${CT_IP}:${SYNAPSE_PORT}/health
+       curl -sS -o /dev/null -w 'HTTP %{http_code}\n' --max-time 5 http://${CT_IP}:${ELEMENT_PORT}/
+
+     From another LAN machine, the same backend URLs must be blocked.
+     Installer rule checks do not prove this full network path.
+
+     Federation test (open in a browser):
+       https://federationtester.matrix.org/#${SYNAPSE_SERVER_NAME}
+
+  4. CREATE YOUR FIRST ADMINISTRATOR
+
+     RUN ON THE PROXMOX HOST to enter the Matrix CT:
+       pct enter $CT_ID
+
+     THEN RUN INSIDE THE MATRIX CT:
+       podman exec -it matrix-synapse register_new_matrix_user -c /data/homeserver.yaml http://127.0.0.1:${SYNAPSE_PORT}
+
+     Answer y when asked whether the new account should be an administrator.
+     Then sign in at https://${ELEMENT_FQDN}/
+
+     Registration tokens: use an administrator access token with the admin API
+     on CT loopback (127.0.0.1). Keep bearer tokens off unencrypted LAN HTTP.
+
+  BEFORE UPDATING -- VERIFY YOUR BACKUP
+
+     PBS/PVE is responsible for backup and recovery. The maintenance helper
+     does not create or verify backups and has no full-stack restore command.
+
+     BACK UP THE FULL CT, including:
+       /opt/matrix                         database, media, keys and app config
+       /var/lib/containers/storage         locally pinned container images
+       Quadlets, maintenance files and UFW configuration
+
+     For stateful updates, verify a suitable preupd recovery checkpoint with
+     applications stopped. A live snapshot alone does not prove consistency.
+SUMMARY
+if (( PODMAN_FUSE_OVERLAY )); then
+  echo "     BACKUP MODE: STOP -- FUSE is enabled; do not freeze a running FUSE CT."
+else
+  echo "     BACKUP MODE: Native overlay -- validate snapshot backups under I/O load."
 fi
-echo ""
+cat <<SUMMARY
+
+  MAINTENANCE COMMANDS
+
+     RUN ON THE PROXMOX HOST -- show current versions:
+       pct exec $CT_ID -- /usr/local/bin/matrix-maint.sh version
+
+     For interactive updates, enter the CT from the Proxmox host:
+       pct enter $CT_ID
+
+     THEN RUN INSIDE THE MATRIX CT -- one component at a time:
+
+       Synapse:
+         /usr/local/bin/matrix-maint.sh update ${SYNAPSE_TAG}
+
+       Element:
+         /usr/local/bin/matrix-maint.sh update-element ${ELEMENT_TAG}
+
+       PostgreSQL:
+         /usr/local/bin/matrix-maint.sh update-postgres ${POSTGRES_TAG}
+
+     These are the installed tags. Reusing them checks for image rebuilds.
+     To change versions, replace the tag with the desired full release tag.
+     PostgreSQL must remain on major 18 and the same image variant.
+     The helper prompts for confirmation; read the checkpoint reminder first.
+
+     REVERT ELEMENT ONLY -- previous captured image, no registry pull:
+       /usr/local/bin/matrix-maint.sh update-element previous
+
+     Element updates/reverts preserve the database and media; check client
+     compatibility. Synapse/PostgreSQL NEVER auto-downgrade after target start.
+     If a stateful update fails, inspect migration logs and recover matching
+     PBS/PVE state if needed. Earlier successful component updates stay applied.
+
+     UNATTENDED UPDATES -- --yes skips confirmation; it does NOT verify a backup.
+     Proxmox-host example, after you have verified the checkpoint:
+       pct exec $CT_ID -- /usr/local/bin/matrix-maint.sh update ${SYNAPSE_TAG} --yes
+     The same form works with update-element and update-postgres.
+
+     Wait limits: first install ${INITIAL_WAIT_SECONDS}s; Synapse upgrades ${SYNAPSE_WAIT_SECONDS}s.
+     Crashes fail earlier. A migration timeout does not kill Synapse.
+
+  AUTOMATIC IMAGE UPDATES
+SUMMARY
+if (( AUTO_UPDATE )); then
+  echo "     STATUS: ENABLED -- daily at $UPDATE_TIME ($APP_TZ)."
+else
+  echo "     STATUS: DISABLED -- the installed timer is inactive."
+  echo "     Configured time if enabled: $UPDATE_TIME ($APP_TZ)."
+fi
+cat <<SUMMARY
+     Auto-refresh checks the current pinned tags; it does not select new tags.
+     Policy: AUTO_UPDATE in /opt/matrix/.env; timer enablement is separate.
+     Schedule: OnCalendar in /etc/systemd/system/matrix-update.timer.
+     After editing the timer, reload systemd and restart it if it is enabled.
+
+  FIREWALL AND TROUBLESHOOTING
+
+     UFW filters IPv4 and IPv6 inside this CT. Incoming connections are denied
+     by default; only NPM may reach ports ${SYNAPSE_PORT} and ${ELEMENT_PORT}.
+     Outgoing traffic is allowed. Standard loopback, replies, DHCP and ICMP remain.
+     PostgreSQL listens only on 127.0.0.1:5432, using SCRAM and a restricted role.
+     No Proxmox Datacenter firewall switch or PVE firewall rules are required.
+
+     RUN ON THE PROXMOX HOST:
+       pct exec $CT_ID -- ufw status verbose
+       pct enter $CT_ID
+
+     INSIDE THE MATRIX CT -- follow Synapse logs (Ctrl+C stops following):
+       journalctl -u matrix-synapse.service -f
+
+     NPM ADDRESS CHANGED? Run inside the Matrix CT.
+     Replace NEW_NPM_IP and OLD_NPM_IP with the exact host addresses.
+
+       FIRST add the new address:
+         ufw allow in proto tcp from NEW_NPM_IP to any port ${SYNAPSE_PORT}
+         ufw allow in proto tcp from NEW_NPM_IP to any port ${ELEMENT_PORT}
+
+       VERIFY access from NPM, THEN remove the old address:
+         ufw delete allow in proto tcp from OLD_NPM_IP to any port ${SYNAPSE_PORT}
+         ufw delete allow in proto tcp from OLD_NPM_IP to any port ${ELEMENT_PORT}
+
+     UFW allow/delete commands apply immediately. Do not restart ufw.service
+     for a rule edit: restarting it stops the dependent Matrix services.
+     If you did restart UFW, start those services again inside this CT:
+       systemctl start matrix-synapse.service matrix-element.service
+
+  CALLING
+
+     Legacy TURN mode: $TURN_MODE
+SUMMARY
+if [[ $TURN_MODE == disabled ]]; then
+  echo "     No TURN relay is configured for legacy calls."
+else
+  echo "     TURN URIs: ${TURN_URIS[*]}"
+  echo "     Test relay allocation from different networks; HTTP checks do not test calls."
+fi
+if [[ -n $MATRIX_RTC_AUTH_URL ]]; then
+  echo "     Modern Element Call: external MatrixRTC backend configured."
+  echo "     Authorization URL: $MATRIX_RTC_AUTH_URL"
+  echo "     LiveKit and authorization run separately; verify with a real call."
+else
+  echo "     Modern Element Call: NOT CONFIGURED."
+  echo "     It needs LiveKit + MatrixRTC authorization; TURN alone is insufficient."
+  echo "     Set both RTC URLs to integrate an existing backend."
+fi
+if [[ $TURN_MODE == openrelay ]]; then
+  echo "     Public test relay terms: https://www.metered.ca/tools/openrelay/"
+fi
+cat <<SUMMARY
+
+  CONFIGURATION REFERENCE
+
+     Maintenance policy     /opt/matrix/.env
+                            Comments and blank lines are accepted.
+     Synapse configuration  $SYNAPSE_DATA_DIR/homeserver.yaml
+     Database credentials   $POSTGRES_ENV_FILE
+     Element configuration  $ELEMENT_CONFIG_FILE
+     Quadlet units          /etc/containers/systemd/matrix-*.container
+
+     PRIVATE: homeserver.yaml and postgres.env contain secrets (permissions 0600).
+     Keep them private when sharing diagnostics.
+
+     Installed images:
+       Synapse     $SYNAPSE_IMAGE
+       Element     $ELEMENT_IMAGE
+       PostgreSQL  $POSTGRES_IMAGE
+     Quadlets use immutable image IDs with Pull=never.
+
+     Cloudflare client IP forwarding -- NPM Advanced settings:
+       ONLY if cloudflared reaches NPM through loopback in the same namespace:
+         set_real_ip_from 127.0.0.1;
+         real_ip_header CF-Connecting-IP;
+       Otherwise trust the actual cloudflared source address, never all sources.
+     Upload setting: ${MAX_UPLOAD_SIZE}; leave headroom below your upstream body cap.
+
+  NEXT: Complete FIRST SETUP above, then open https://${ELEMENT_FQDN}/
+
+SUMMARY
