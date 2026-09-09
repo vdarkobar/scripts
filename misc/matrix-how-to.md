@@ -1,385 +1,150 @@
-# Matrix Synapse — Podman LXC Deployment
+# Matrix + RTC — quick setup guide
 
-Self-hosted Matrix homeserver running in an unprivileged Proxmox LXC container with Podman. All traffic routes through Cloudflare Tunnel (cloudflared) — no open ports required.
+**Domain: `home-network.me` · Debian 13 RTC VPS · Updated 9 September 2026**
 
-## Architecture
+Matrix/Element stay at home behind **Cloudflare Tunnel → NPM**. LiveKit/MatrixRTC run on the **Hetzner VPS**. Use the corrected installer supplied with this guide. Your existing call test already works; these are setup/reference instructions.
 
+## 1. DNS — Cloudflare → home-network.me → DNS
+
+| Full hostname | Type | Target | Proxy |
+|---|---|---|---|
+| `matrix.home-network.me` | Existing tunnel CNAME | Keep the existing tunnel target | Proxied |
+| `chat.home-network.me` | Existing tunnel CNAME | Keep the existing tunnel target | Proxied |
+| `rtc.home-network.me` | A | Hetzner VPS public IPv4 | **DNS only** |
+| `turn.home-network.me` | A | Same Hetzner VPS public IPv4 | **DNS only** |
+
+Use **Auto TTL**. Leave RTC/TURN **AAAA records absent** with the default `PUBLIC_IPV6=""`. Publish AAAA only after configuring and externally testing IPv6. Keep the VPS machine FQDN distinct from `rtc` and `turn`.
+
+## 2. Cloudflare — allow Matrix API clients
+
+Open **Rules → Overview → Create rule → Configuration Rule**. Name it **Matrix API — BIC off**. In **Edit expression**, select all existing text and replace it with:
+
+```text
+(http.host eq "matrix.home-network.me" and (
+  starts_with(http.request.uri.path, "/_matrix/")
+  or http.request.uri.path eq "/.well-known/matrix/client"
+  or http.request.uri.path eq "/.well-known/matrix/server"
+))
 ```
-Internet
-  │
-  ▼
-Cloudflare (DNS + TLS termination)
-  │
-  ▼ (tunnel)
-cloudflared (on NPM LXC)
-  │
-  ▼
-Nginx Proxy Manager (NPM)
-  │
-  ├── matrix.example.com ──► Matrix LXC :8008 (Synapse)
-  └── chat.example.com   ──► Matrix LXC :8080 (Element Web)
-```
 
-Stack containers inside the Matrix LXC:
+Set **Browser Integrity Check → Off**, status **Active**, order **Last**, then **Deploy**. This is the rule that resolved your Python-client HTTP 403. Cloudflare documents the [rule creation steps](https://developers.cloudflare.com/rules/configuration-rules/create-dashboard/) and [BIC setting](https://developers.cloudflare.com/rules/configuration-rules/settings/#browser-integrity-check).
 
-| Container   | Image                              | Port        | Role                  |
-|-------------|------------------------------------|-----------  |-----------------------|
-| postgres_db | postgres:18-alpine                 | 5432 (int)  | Database              |
-| redis       | redis:8-alpine                     | 6379 (int)  | Cache / pub-sub       |
-| synapse     | ghcr.io/element-hq/synapse:latest  | 8008        | Homeserver            |
-| element-web | vectorim/element-web:latest        | 8080        | Web client            |
+If you have a broad caching rule covering Matrix, add a **Cache Rule** with the same expression, set **Cache eligibility → Bypass cache**, and ensure it takes precedence over that caching rule. [Cache settings](https://developers.cloudflare.com/cache/how-to/cache-rules/settings/#cache-eligibility).
 
-Ports marked `(int)` are internal to the Podman network only.
+Matrix API paths must work without an interactive Access login or browser challenge. Keep public `/_synapse/admin` blocked in NPM. RTC/TURN use DNS only and connect directly to the VPS.
 
+## 3. Firewall — RTC VPS only
 
-## Prerequisites
+Finish cloud-init and phase 2 first, including any required reboot. **UFW must already be active.** Keep the existing SSH port and management-source rules.
 
-- Proxmox VE 8.x host
-- NPM LXC with cloudflared already configured
-- A domain managed through Cloudflare
-- Podman is installed from Debian 13 repos by the script (no manual install needed)
+| Protocol | Inbound port | Purpose |
+|---|---|---|
+| TCP | 80 | Certificate issuance/renewal |
+| TCP | 443 | RTC HTTPS/WebSocket + TURN/TLS |
+| TCP | 7881 | Direct media over TCP |
+| UDP | 7882 | Direct media |
+| UDP | 3478 | TURN |
+| UDP | 40000–40199 | TURN relay range |
 
-
-## Step 1 — Run the Script
-
-Edit the Config section at the top of `matrix-podman.sh`:
+These are **this installer's defaults**. The installer adds the UFW rules automatically. To restore them on an installed VPS:
 
 ```bash
-MATRIX_DOMAIN="example.com"      # your domain
-MATRIX_TZ="Europe/Berlin"        # your timezone
-SYNAPSE_PORT=8008                 # Synapse published port
-ELEMENT_PORT=8080                 # Element published port
+sudo matrixrtc-maint firewall-repair
 ```
 
-Then run it on the Proxmox host:
+For manual setup, replace the IPv4 placeholder and run this whole block on the RTC VPS:
 
 ```bash
-chmod +x matrix-podman.sh
-./matrix-podman.sh
+RTC_VPS_IPV4="REPLACE_WITH_VPS_PUBLIC_IPV4"
+sudo ufw allow proto tcp from any to "$RTC_VPS_IPV4" port 80
+sudo ufw allow proto tcp from any to "$RTC_VPS_IPV4" port 443
+sudo ufw allow proto tcp from any to "$RTC_VPS_IPV4" port 7881
+sudo ufw allow proto udp from any to "$RTC_VPS_IPV4" port 7882
+sudo ufw allow proto udp from any to "$RTC_VPS_IPV4" port 3478
+sudo ufw allow proto udp from any to "$RTC_VPS_IPV4" port 40000:40199
+sudo ufw status numbered
 ```
 
-The script creates the LXC, installs Podman, generates all configs, pulls images, starts the stack, hardens the OS, and reboots. Note the CT ID and IP from the summary output.
+The destination-specific syntax matches the installer's runtime checks. [UFW command reference](https://manpages.debian.org/trixie/ufw/ufw.8.en.html).
 
+**If a Hetzner Cloud Firewall is attached:** allow the same six rows inbound from `0.0.0.0/0`, plus your existing restricted SSH access. If outbound traffic is restricted, allow the backend's required outbound traffic as well. Both firewalls must permit the connection.
 
-## Step 2 — Cloudflare Tunnel
+Keep TCP **5349, 7880, 8080, 6379, 18080 and 18081 closed externally**. The installer protects these internal services. Ports on the home Matrix LXC remain restricted to NPM.
 
-No manual DNS records needed — the tunnel creates them automatically.
+## 4. Install Matrix first, then RTC
 
-Go to **Cloudflare → Zero Trust → Networks → Connectors**, select your tunnel, then **Configure Tunnel → Published application routes**. Add two routes:
-
-| Subdomain  | Domain          | Type   | URL                      |
-|------------|-----------------|--------|--------------------------|
-| matrix     | example.com     | HTTP   | `<NPM_LXC_IP>:80`       |
-| chat       | example.com     | HTTP   | `<NPM_LXC_IP>:80`       |
-
-For each route: set the subdomain name (`matrix` or `chat`), select your domain from the list, set type to `HTTP`, and set the URL to your NPM container IP and port 80. This routes tunnel traffic to the NPM instance, which handles the routing based on hostname.
-
-Cloudflare automatically creates the corresponding CNAME DNS records when you add published routes.
-
-
-## Step 3 — Cloudflare SSL/TLS
-
-In the Cloudflare dashboard for your domain:
-
-1. Go to **SSL/TLS → Overview**
-2. Set encryption mode to **Full** (not "Full (strict)", not "Flexible")
-
-"Full" means Cloudflare encrypts traffic to the origin (NPM), but accepts NPM's self-signed or Let's Encrypt cert without strict validation. This works reliably with the tunnel.
-
-### Other Cloudflare settings to check
-
-**SSL/TLS → Edge Certificates:**
-- "Always Use HTTPS": ON
-- "Minimum TLS Version": TLS 1.2
-
-**Speed → Optimization:**
-- "Auto Minify": OFF for HTML (can break Element's SPA)
-
-**Caching:**
-- Matrix API paths should not be cached. If you use Page Rules or Cache Rules, exclude `matrix.example.com/*`
-
-
-## Step 4 — NPM Proxy Hosts
-
-Create two proxy hosts in the NPM admin interface.
-
-### Proxy Host: `matrix.example.com`
-
-**Details tab:**
-- Domain: `matrix.example.com`
-- Scheme: `http`
-- Forward Hostname/IP: `<MATRIX_CT_IP>` (e.g., 192.168.1.100)
-- Forward Port: `8008`
-- Websockets Support: **ON**
-
-**SSL tab:**
-- SSL Certificate: Request a new Let's Encrypt certificate using DNS challenge (Cloudflare provider)
-- Force SSL: ON
-
-**Custom Nginx Configuration** (under Proxy host > Settings) — paste this entire block:
-
-```nginx
-client_max_body_size 200M;
-proxy_read_timeout 600s;
-proxy_send_timeout 600s;
-
-location /.well-known/matrix/server {
-    default_type application/json;
-    add_header Access-Control-Allow-Origin *;
-    return 200 '{"m.server": "matrix.example.com:443"}';
-}
-
-location /.well-known/matrix/client {
-    default_type application/json;
-    add_header Access-Control-Allow-Origin *;
-    return 200 '{"m.homeserver": {"base_url": "https://matrix.example.com"}, "m.identity_server": {"base_url": "https://vector.im"}, "org.matrix.msc3575.proxy": {"url": "https://matrix.example.com"}}';
-}
-```
-
-Replace `example.com` with your actual domain in all three places.
-
-### Proxy Host: `chat.example.com`
-
-**Details tab:**
-- Domain: `chat.example.com`
-- Scheme: `http`
-- Forward Hostname/IP: `<MATRIX_CT_IP>` (same IP)
-- Forward Port: `8080`
-
-**SSL tab:**
-- SSL Certificate: Request a new Let's Encrypt certificate using DNS challenge (Cloudflare provider)
-- Force SSL: ON
-
-No advanced config needed for Element.
-
-### Why Scheme is `http` but Force SSL is ON
-
-These control different things. **Scheme: http** is how NPM connects to the container on your local network (plain HTTP on ports 8008/8080). **Force SSL** redirects public browser requests from `http://` to `https://` — the TLS is handled by Cloudflare (edge) and/or NPM (Let's Encrypt), not by the containers themselves.
-
-### Note on SSL certificates with Cloudflare Tunnel
-
-When using cloudflared, the tunnel terminates at NPM on port 80 (HTTP). The HTTP-01 challenge used by default for Let's Encrypt will fail because Cloudflare intercepts the request before it reaches NPM.
-
-Use the **DNS challenge** instead. In NPM, when requesting a Let's Encrypt certificate, select "Use a DNS Challenge" and choose **Cloudflare** as the provider. Enter your Cloudflare API token. This validates domain ownership via DNS records rather than HTTP, so it works regardless of how traffic reaches NPM. It also allows issuing wildcard certificates.
-
-If you don't want to set up DNS challenge, you can skip the certificate entirely in NPM and rely on Cloudflare's edge certificate. Set Cloudflare SSL to "Full" (not "Full strict") since NPM won't have a valid cert to verify.
-
-
-## Step 5 — Create Admin User
+**Fresh Matrix only — edit `matrix-quadlet.sh`, then run it on the Proxmox host:**
 
 ```bash
-pct exec <CT_ID> -- podman exec -it synapse register_new_matrix_user \
-  http://localhost:8008 -c /data/homeserver.yaml
+MATRIX_RTC_AUTH_URL="https://rtc.home-network.me/livekit/jwt"
+MATRIX_RTC_HEALTH_URL="https://rtc.home-network.me/livekit/jwt/healthz"
+MATRIX_RTC_REQUIRE_HEALTH=0
 ```
 
-It prompts for username, password, and admin status. Say yes to admin for the first user.
+Keep the other site/storage/NPM settings appropriate to your setup. Skip the creator if Matrix already exists.
 
-
-## Step 6 — Invite Users (Registration Tokens)
-
-Token-based registration is enabled by default — nobody can sign up without a valid invite code that only the admin can create.
-
-To manage tokens, you need your admin access token from Element Web: **Settings → Help & About → Access Token**.
-
-**Create a one-time invite token:**
+**From the RTC VPS**, confirm the public Matrix route works before installing RTC:
 
 ```bash
-pct exec <CT_ID> -- podman exec synapse curl -s -X POST \
-  -H "Authorization: Bearer <ADMIN_ACCESS_TOKEN>" \
-  -H "Content-Type: application/json" \
-  -d '{"uses_allowed": 1}' \
-  http://localhost:8008/_synapse/admin/v1/registration_tokens/new
+curl --http1.1 -fsS -A 'Python-urllib/3.13' \
+  https://matrix.home-network.me/_matrix/client/versions | python3 -m json.tool
 ```
 
-The response contains the token to share with the invited person. They enter it during signup in Element.
+Expected: JSON with a `versions` array. Public `/.well-known/matrix/server` must delegate to **`matrix.home-network.me:443`**; the installer also checks discovery and OpenID.
 
-**List all tokens:**
+**RTC installer settings — `matrix-rtc.sh`:**
 
 ```bash
-pct exec <CT_ID> -- podman exec synapse curl -s \
-  -H "Authorization: Bearer <ADMIN_ACCESS_TOKEN>" \
-  http://localhost:8008/_synapse/admin/v1/registration_tokens
+MATRIX_SERVER_NAME="matrix.home-network.me"
+HOMESERVER_URL="https://matrix.home-network.me"
+RTC_HOST="rtc.home-network.me"
+TURN_HOST="turn.home-network.me"
+PUBLIC_IPV4="REPLACE_WITH_VPS_PUBLIC_IPV4"
+PUBLIC_IPV6=""
+ACME_EMAIL="REPLACE_WITH_YOUR_EMAIL"
+REQUIRE_PHASE2=1
 ```
 
-**Delete a token:**
+Run on the **RTC VPS**:
 
 ```bash
-pct exec <CT_ID> -- podman exec synapse curl -s -X DELETE \
-  -H "Authorization: Bearer <ADMIN_ACCESS_TOKEN>" \
-  http://localhost:8008/_synapse/admin/v1/registration_tokens/<TOKEN>
+sudo bash matrix-rtc.sh
 ```
 
-Token options: `uses_allowed` (integer or null for unlimited), `expiry_time` (unix milliseconds or null for no expiry), `token` (custom string up to 64 chars, or omit for random).
+## 5. Integrate an existing Matrix server
 
-
-## Step 7 — Verify
-
-### Federation test
-
-Open: `https://federationtester.matrix.org/#matrix.example.com`
-
-All checks should be green. If you see connection errors on port 8448, the `.well-known/matrix/server` file is not being served correctly. Test it:
+If the revised Matrix creator already wrote the RTC settings, skip this step. Otherwise, copy `matrixrtc-integrate-existing.py` from the package into the Matrix LXC and run **inside that LXC as root**:
 
 ```bash
-curl https://matrix.example.com/.well-known/matrix/server
-# Should return: {"m.server": "matrix.example.com:443"}
-
-curl https://matrix.example.com/.well-known/matrix/client
-# Should return JSON with m.homeserver base_url
+apt-get install python3-yaml
+python3 matrixrtc-integrate-existing.py \
+  --rtc-url https://rtc.home-network.me/livekit/jwt --apply
 ```
 
-If these return 404 or HTML errors, check the Custom Nginx Configuration for `matrix.example.com`.
+Review the result and type **APPLY**. The helper validates, backs up and updates **`/opt/matrix/synapse/homeserver.yaml`**, then restarts Synapse. Alternatively, follow the manual YAML/backup steps printed in the RTC installer's summary.
 
-### Element Web
+If NPM serves a static client `.well-known` response, merge the RTC focus there too, preserving `m.homeserver`. No Element Web configuration change is needed for the supplied baseline.
 
-Open: `https://chat.example.com`
+## 6. Verify and keep working
 
-The homeserver should be pre-filled as `matrix.example.com`. Log in with the admin user you created.
-
-### Android / iOS
-
-Install Element from the app store. On the login screen, tap "Other" or "Custom server" and enter:
-
-```
-https://matrix.example.com
-```
-
-Log in with your credentials.
-
-
-## Troubleshooting
-
-### Element shows 502 Bad Gateway
-
-Check if the element-web container is running:
+**RTC VPS:**
 
 ```bash
-pct exec <CT_ID> -- podman ps | grep element
+sudo matrixrtc-maint check
+curl -sS -o /dev/null -w 'HTTP %{http_code}\n' \
+  https://rtc.home-network.me/livekit/sfu/rtc/v1/validate
+curl -fsS https://matrix.home-network.me/.well-known/matrix/client \
+  | python3 -m json.tool
 ```
 
-If status shows "Initialized" instead of "Up", check logs:
+Expected: maintenance checks pass; validation returns **401** without a token; discovery contains `org.matrix.msc4143.rtc_foci` with `livekit_service_url` **`https://rtc.home-network.me/livekit/jwt`**. Reopen **Element X on both phones**, then test a call across Wi-Fi/mobile data.
+
+**Older installer showing “Service unreachable” / v1 route 404:** run the corrected installer on the existing RTC VPS and choose **ROUTES**. It backs up and repairs the proxy rules.
+
+**Later hardening runs — preserve RTC firewall rules:**
 
 ```bash
-pct exec <CT_ID> -- podman logs element-web
+sudo env ENABLE_UFW=0 /usr/local/sbin/phase2-hardening.sh
 ```
 
-If you see `bind() to 0.0.0.0:80 failed (Permission denied)`, the custom nginx template isn't mounted. Verify `docker-compose.yml` has this in the element service:
-
-```yaml
-volumes:
-  - ./element-config.json:/app/config.json:ro
-  - ./element-nginx.conf:/etc/nginx/templates/default.conf.template:ro
-ports:
-  - "8080:8080"
-```
-
-And that `/opt/matrix/element-nginx.conf` exists with `listen 8080;`. This is required because unprivileged Podman inside an unprivileged LXC cannot bind to ports below 1024.
-
-### Federation test shows port 8448 timeout
-
-The `.well-known/matrix/server` response tells federation clients to connect on port 443 instead of the default 8448. If this file isn't served, clients fall back to 8448 which isn't open.
-
-Fix: ensure the Custom Nginx Configuration for `matrix.example.com` contains the `.well-known` location blocks (see Step 4).
-
-### Synapse not starting
-
-Check logs:
-
-```bash
-pct exec <CT_ID> -- podman logs synapse
-```
-
-Common issues:
-- Database connection refused: PostgreSQL hasn't finished initializing. Wait 30 seconds and check again.
-- YAML parse error in homeserver.yaml: the Python patch failed. Check `/opt/matrix/synapse/homeserver.yaml` for duplicate `database:` blocks.
-
-### Containers not starting after reboot
-
-```bash
-pct exec <CT_ID> -- systemctl status matrix-stack.service
-pct exec <CT_ID> -- journalctl -u matrix-stack.service --no-pager -n 50
-```
-
-To manually restart:
-
-```bash
-pct exec <CT_ID> -- bash -c 'cd /opt/matrix && podman-compose down && podman-compose up -d'
-```
-
-
-## Maintenance
-
-### View running containers
-
-```bash
-pct exec <CT_ID> -- bash -c 'cd /opt/matrix && podman-compose ps'
-```
-
-### View logs
-
-```bash
-pct exec <CT_ID> -- podman logs synapse
-pct exec <CT_ID> -- podman logs element-web
-pct exec <CT_ID> -- podman logs postgres_db
-pct exec <CT_ID> -- podman logs redis
-```
-
-### Manual update
-
-```bash
-pct exec <CT_ID> -- bash -c 'cd /opt/matrix && podman-compose pull && podman-compose up -d'
-```
-
-Auto-updates run biweekly (1st and 15th of each month at 05:30) via the `matrix-update.timer`.
-
-### Check update timer
-
-```bash
-pct exec <CT_ID> -- systemctl status matrix-update.timer
-```
-
-### Backup
-
-The data lives in `/opt/matrix/` inside the LXC. Key directories:
-- `synapse/` — homeserver config and media store
-- `postgresdata/` — PostgreSQL database files
-
-For a consistent backup, stop the stack first:
-
-```bash
-pct exec <CT_ID> -- bash -c 'cd /opt/matrix && podman-compose down'
-# Back up /opt/matrix/ via Proxmox Backup Server or manual copy
-pct exec <CT_ID> -- bash -c 'cd /opt/matrix && podman-compose up -d'
-```
-
-Or use Proxmox Backup Server to snapshot the entire LXC.
-
-
-## File Reference
-
-| File | Purpose |
-|------|---------|
-| `/opt/matrix/docker-compose.yml` | Podman Compose stack definition |
-| `/opt/matrix/.env` | Reference file (values baked into compose) |
-| `/opt/matrix/element-config.json` | Element Web client configuration |
-| `/opt/matrix/element-nginx.conf` | Nginx template for Element (listen 8080) |
-| `/opt/matrix/synapse/homeserver.yaml` | Synapse homeserver configuration |
-| `/opt/matrix/synapse/` | Synapse data and media store |
-| `/opt/matrix/postgresdata/` | PostgreSQL data directory |
-| `/opt/matrix/redis/` | Redis AOF persistence |
-| `/etc/systemd/system/matrix-stack.service` | Auto-start stack on boot |
-| `/etc/systemd/system/matrix-update.timer` | Biweekly auto-update |
-| `/etc/sysctl.d/99-hardening.conf` | Network hardening |
-
-
-## Notes
-
-**IPv6 is disabled.** The script disables IPv6 via sysctl as a hardening measure. Nothing in the stack requires IPv6. If your network requires IPv6 connectivity, remove the `net.ipv6.conf.*` lines from `/etc/sysctl.d/99-hardening.conf` and run `sysctl --system`.
-
-**Passwords are in config files.** The database and Redis passwords are baked into `docker-compose.yml` and `homeserver.yaml` at creation time. Both files are root-owned with restricted permissions inside the unprivileged LXC. There is no separate secrets file — the compose file is the source of truth.
-
-**No firewall inside the CT.** The container relies on host-level and network-level controls (Proxmox firewall, UniFi rules, Cloudflare Tunnel). All traffic enters through NPM — no ports are exposed directly to the internet.
-
-**Enabled by default:** Presence (online/offline status), remote media retention (cached media from other servers is purged after 90 days to save disk), and forgotten room cleanup (rooms abandoned by all local users are removed after 7 days). These can be tuned in `homeserver.yaml`.
-
-**Voice/video calls (TURN):** Calls between users on the same LAN work without TURN, but remote calls (e.g., mobile data, different networks) require a TURN relay to traverse NATs and firewalls — especially behind a Cloudflare Tunnel where there's no public IP for WebRTC to connect directly. The script configures the free [Open Relay](https://www.metered.ca/tools/openrelay/) TURN server by Metered (20GB/month, no signup needed, static shared secret). If you need higher volume or private credentials, replace the `turn_uris` and `turn_shared_secret` in `homeserver.yaml` with your own TURN provider.
+If phase 2 reset the firewall, run `sudo matrixrtc-maint firewall-repair`, then `sudo matrixrtc-maint check`.
