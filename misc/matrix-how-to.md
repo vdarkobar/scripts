@@ -1,17 +1,19 @@
 # Matrix + RTC — quick setup guide
 
-**Domain: `home-network.me` · Debian 13 RTC VPS · Updated 9 September 2026**
+**Domain: `your-domain.tld` · Debian 13 RTC VPS · Updated 9 September 2026**
 
-Matrix/Element stay at home behind **Cloudflare Tunnel → NPM**. LiveKit/MatrixRTC run on the **Hetzner VPS**. Use the corrected installer supplied with this guide. Your existing call test already works; these are setup/reference instructions.
+**Replace before use:** `your-domain.tld` → your domain; `REPLACE_WITH_VPS_PUBLIC_IPV4` → your VPS public IPv4; `REPLACE_WITH_YOUR_EMAIL` → your email. Apply these substitutions in DNS, Cloudflare rules, installer settings and commands.
 
-## 1. DNS — Cloudflare → home-network.me → DNS
+Matrix/Element stay at home behind **Cloudflare Tunnel → NPM**. LiveKit/MatrixRTC run on the **Hetzner VPS**. Use the corrected installer supplied with this guide.
+
+## 1. DNS — Cloudflare → your-domain.tld → DNS
 
 | Full hostname | Type | Target | Proxy |
 |---|---|---|---|
-| `matrix.home-network.me` | Existing tunnel CNAME | Keep the existing tunnel target | Proxied |
-| `chat.home-network.me` | Existing tunnel CNAME | Keep the existing tunnel target | Proxied |
-| `rtc.home-network.me` | A | Hetzner VPS public IPv4 | **DNS only** |
-| `turn.home-network.me` | A | Same Hetzner VPS public IPv4 | **DNS only** |
+| `matrix.your-domain.tld` | Existing tunnel CNAME | Keep the existing tunnel target | Proxied |
+| `chat.your-domain.tld` | Existing tunnel CNAME | Keep the existing tunnel target | Proxied |
+| `rtc.your-domain.tld` | A | Hetzner VPS public IPv4 | **DNS only** |
+| `turn.your-domain.tld` | A | Same Hetzner VPS public IPv4 | **DNS only** |
 
 Use **Auto TTL**. Leave RTC/TURN **AAAA records absent** with the default `PUBLIC_IPV6=""`. Publish AAAA only after configuring and externally testing IPv6. Keep the VPS machine FQDN distinct from `rtc` and `turn`.
 
@@ -20,14 +22,14 @@ Use **Auto TTL**. Leave RTC/TURN **AAAA records absent** with the default `PUBLI
 Open **Rules → Overview → Create rule → Configuration Rule**. Name it **Matrix API — BIC off**. In **Edit expression**, select all existing text and replace it with:
 
 ```text
-(http.host eq "matrix.home-network.me" and (
+(http.host eq "matrix.your-domain.tld" and (
   starts_with(http.request.uri.path, "/_matrix/")
   or http.request.uri.path eq "/.well-known/matrix/client"
   or http.request.uri.path eq "/.well-known/matrix/server"
 ))
 ```
 
-Set **Browser Integrity Check → Off**, status **Active**, order **Last**, then **Deploy**. This is the rule that resolved your Python-client HTTP 403. Cloudflare documents the [rule creation steps](https://developers.cloudflare.com/rules/configuration-rules/create-dashboard/) and [BIC setting](https://developers.cloudflare.com/rules/configuration-rules/settings/#browser-integrity-check).
+Set **Browser Integrity Check → Off**, status **Active**, order **Last**, then **Deploy**. Cloudflare documents the [rule creation steps](https://developers.cloudflare.com/rules/configuration-rules/create-dashboard/) and [BIC setting](https://developers.cloudflare.com/rules/configuration-rules/settings/#browser-integrity-check).
 
 If you have a broad caching rule covering Matrix, add a **Cache Rule** with the same expression, set **Cache eligibility → Bypass cache**, and ensure it takes precedence over that caching rule. [Cache settings](https://developers.cloudflare.com/cache/how-to/cache-rules/settings/#cache-eligibility).
 
@@ -76,8 +78,8 @@ Keep TCP **5349, 7880, 8080, 6379, 18080 and 18081 closed externally**. The inst
 **Fresh Matrix only — edit `matrix-quadlet.sh`, then run it on the Proxmox host:**
 
 ```bash
-MATRIX_RTC_AUTH_URL="https://rtc.home-network.me/livekit/jwt"
-MATRIX_RTC_HEALTH_URL="https://rtc.home-network.me/livekit/jwt/healthz"
+MATRIX_RTC_AUTH_URL="https://rtc.your-domain.tld/livekit/jwt"
+MATRIX_RTC_HEALTH_URL="https://rtc.your-domain.tld/livekit/jwt/healthz"
 MATRIX_RTC_REQUIRE_HEALTH=0
 ```
 
@@ -87,18 +89,18 @@ Keep the other site/storage/NPM settings appropriate to your setup. Skip the cre
 
 ```bash
 curl --http1.1 -fsS -A 'Python-urllib/3.13' \
-  https://matrix.home-network.me/_matrix/client/versions | python3 -m json.tool
+  https://matrix.your-domain.tld/_matrix/client/versions | python3 -m json.tool
 ```
 
-Expected: JSON with a `versions` array. Public `/.well-known/matrix/server` must delegate to **`matrix.home-network.me:443`**; the installer also checks discovery and OpenID.
+Expected: JSON with a `versions` array. Public `/.well-known/matrix/server` must delegate to **`matrix.your-domain.tld:443`**; the installer also checks discovery and OpenID.
 
 **RTC installer settings — `matrix-rtc.sh`:**
 
 ```bash
-MATRIX_SERVER_NAME="matrix.home-network.me"
-HOMESERVER_URL="https://matrix.home-network.me"
-RTC_HOST="rtc.home-network.me"
-TURN_HOST="turn.home-network.me"
+MATRIX_SERVER_NAME="matrix.your-domain.tld"
+HOMESERVER_URL="https://matrix.your-domain.tld"
+RTC_HOST="rtc.your-domain.tld"
+TURN_HOST="turn.your-domain.tld"
 PUBLIC_IPV4="REPLACE_WITH_VPS_PUBLIC_IPV4"
 PUBLIC_IPV6=""
 ACME_EMAIL="REPLACE_WITH_YOUR_EMAIL"
@@ -118,7 +120,7 @@ If the revised Matrix creator already wrote the RTC settings, skip this step. Ot
 ```bash
 apt-get install python3-yaml
 python3 matrixrtc-integrate-existing.py \
-  --rtc-url https://rtc.home-network.me/livekit/jwt --apply
+  --rtc-url https://rtc.your-domain.tld/livekit/jwt --apply
 ```
 
 Review the result and type **APPLY**. The helper validates, backs up and updates **`/opt/matrix/synapse/homeserver.yaml`**, then restarts Synapse. Alternatively, follow the manual YAML/backup steps printed in the RTC installer's summary.
@@ -132,12 +134,12 @@ If NPM serves a static client `.well-known` response, merge the RTC focus there 
 ```bash
 sudo matrixrtc-maint check
 curl -sS -o /dev/null -w 'HTTP %{http_code}\n' \
-  https://rtc.home-network.me/livekit/sfu/rtc/v1/validate
-curl -fsS https://matrix.home-network.me/.well-known/matrix/client \
+  https://rtc.your-domain.tld/livekit/sfu/rtc/v1/validate
+curl -fsS https://matrix.your-domain.tld/.well-known/matrix/client \
   | python3 -m json.tool
 ```
 
-Expected: maintenance checks pass; validation returns **401** without a token; discovery contains `org.matrix.msc4143.rtc_foci` with `livekit_service_url` **`https://rtc.home-network.me/livekit/jwt`**. Reopen **Element X on both phones**, then test a call across Wi-Fi/mobile data.
+Expected: maintenance checks pass; validation returns **401** without a token; discovery contains `org.matrix.msc4143.rtc_foci` with `livekit_service_url` **`https://rtc.your-domain.tld/livekit/jwt`**. Reopen **Element X on both phones**, then test a call across Wi-Fi/mobile data.
 
 **Older installer showing “Service unreachable” / v1 route 404:** run the corrected installer on the existing RTC VPS and choose **ROUTES**. It backs up and repairs the proxy rules.
 
