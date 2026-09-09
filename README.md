@@ -111,7 +111,7 @@
 ## Communication
 <details>
   <summary>Matrix</summary>
-  <p><a href="https://github.com/vdarkobar/scripts/blob/main/misc/matrix-how-to.md">Decentralised communication platform.</a></p>
+  <p>Decentralised communication platform<a href="https://github.com/vdarkobar/scripts/blob/main/misc/matrix-how-to.md">how-to.</a></p>
   <pre><code>bash &lt;(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/bash/matrix-quadlet.sh)</code></pre>
   <p><a href="https://github.com/vdarkobar/scripts/blob/main/misc/matrix-how-to.md">Decentralised communication platform.</a></p>
   <pre><code>bash &lt;(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/bash/matrix-rtc.sh)</code></pre>
