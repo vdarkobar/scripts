@@ -113,7 +113,7 @@
   <summary>Matrix</summary>
   <p>Decentralised communication platform. Read first >> <a href="https://github.com/vdarkobar/scripts/blob/main/misc/matrix-how-to.md"> how-to.</a></p>
   <pre><code>bash &lt;(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/bash/matrix-quadlet.sh)</code></pre>
-  <p>Companion script. RTC/TURN installer</p>
+  <p>Companion script. RTC/TURN installer.</p>
   <pre><code>bash &lt;(curl -fsSL https://raw.githubusercontent.com/vdarkobar/scripts/main/bash/matrix-rtc.sh)</code></pre>
 </details>
 
