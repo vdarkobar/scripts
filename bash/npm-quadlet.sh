@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
 set -Eeo pipefail
+umask 022
+export LC_ALL=C
+# Safety revision: 2026-09-11. Fresh Proxmox CT creator; maintenance runs inside the CT.
 
 # ── Config ────────────────────────────────────────────────────────────────────
 CT_ID=""                             # empty = auto-assign via pvesh; set e.g. CT_ID=120 to pin
@@ -50,6 +53,23 @@ EXTRA_PACKAGES=(
 # Behavior
 CLEANUP_ON_FAIL=1
 
+
+# Service verification and in-CT firewall
+INITIAL_WAIT_SECONDS=180
+UPDATE_WAIT_SECONDS=1800             # permit migrations; a timeout does not stop the app
+# Bare IPs (192.168.1.20) or network CIDRs (192.168.1.0/24).
+# Empty arrays prompt separately before CT creation; Enter allows any source
+# on that prompt's ports (IPv4/IPv6). UFW stays enabled in either case.
+# Admin TCP 81: administrator devices or management/VPN subnets.
+UFW_ALLOWED_SOURCES=()
+# Proxy TCP 80/443: LAN/VPN clients or the source IP of a tunnel connector.
+# Pre-filled arrays skip their own prompt. To preselect any source, use
+# ("0.0.0.0/0" "::/0"). Installing cloudflared does not change these choices.
+NPM_PUBLIC_SOURCES=()
+UPDATE_TIME="03:00"                  # daily at CT local time
+SCRIPT_URL="https://raw.githubusercontent.com/vdarkobar/scripts/main/bash/npm-quadlet.sh"
+SCRIPT_LOCAL="/root/npm-quadlet.sh"
+
 # Derived
 APP_DIR="/opt/npm"
 APP_IMAGE="${APP_IMAGE_REPO}:${APP_TAG}"
@@ -57,6 +77,11 @@ QUADLET_FILE="/etc/containers/systemd/npm.container"
 QUADLET_SERVICE="npm.service"
 
 # ── Custom configs created by this script ─────────────────────────────────────
+#   /usr/local/sbin/npm-ufw-check                  (service-start firewall guard)
+#   /usr/local/sbin/npm-listener-check             (post-start listener verification)
+#   /etc/ufw/npm-expected-sources.conf              (expected TCP port/source pairs)
+#   /etc/default/ufw, /etc/ufw/ufw.conf               (in-CT IPv4/IPv6 policy)
+#   /etc/ufw/user.rules, /etc/ufw/user6.rules         (configured source allows)
 #   /etc/containers/systemd/npm.container        (Quadlet unit — source of truth)
 #   /opt/npm/.env                                (runtime state — read by maint script)
 #   /opt/npm/data/                               (NPM data — SQLite DB, nginx configs, access lists)
@@ -74,12 +99,12 @@ QUADLET_SERVICE="npm.service"
 
 # ── Config validation ─────────────────────────────────────────────────────────
 [[ "$HN" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$ ]] || { echo "  ERROR: HN is not a valid hostname: $HN" >&2; exit 1; }
-[[ "$CPU" =~ ^[0-9]+$ ]] && (( CPU >= 1 )) || { echo "  ERROR: CPU must be a positive integer." >&2; exit 1; }
-[[ "$RAM" =~ ^[0-9]+$ ]] && (( RAM >= 256 )) || { echo "  ERROR: RAM must be >= 256 MB." >&2; exit 1; }
-[[ "$DISK" =~ ^[0-9]+$ ]] && (( DISK >= 1 )) || { echo "  ERROR: DISK must be >= 1 GB." >&2; exit 1; }
-[[ "$DEBIAN_VERSION" =~ ^[0-9]+$ ]] || { echo "  ERROR: DEBIAN_VERSION must be numeric." >&2; exit 1; }
-[[ "$APP_PORT" =~ ^[0-9]+$ ]] || { echo "  ERROR: APP_PORT must be numeric." >&2; exit 1; }
-(( APP_PORT >= 1 && APP_PORT <= 65535 )) || { echo "  ERROR: APP_PORT must be between 1 and 65535." >&2; exit 1; }
+[[ "$CPU" =~ ^(0|[1-9][0-9]*)$ ]] && (( CPU >= 1 )) || { echo "  ERROR: CPU must be a positive integer." >&2; exit 1; }
+[[ "$RAM" =~ ^(0|[1-9][0-9]*)$ ]] && (( RAM >= 256 )) || { echo "  ERROR: RAM must be >= 256 MB." >&2; exit 1; }
+[[ "$DISK" =~ ^(0|[1-9][0-9]*)$ ]] && (( DISK >= 1 )) || { echo "  ERROR: DISK must be >= 1 GB." >&2; exit 1; }
+[[ "$DEBIAN_VERSION" == 13 ]] || { echo "  ERROR: This creator requires Debian 13." >&2; exit 1; }
+[[ "$APP_PORT" =~ ^(0|[1-9][0-9]*)$ ]] || { echo "  ERROR: APP_PORT must be numeric." >&2; exit 1; }
+(( APP_PORT == 81 )) || { echo "  ERROR: NPM admin port is fixed at 81." >&2; exit 1; }
 [[ "$AUTO_UPDATE" =~ ^[01]$ ]] || { echo "  ERROR: AUTO_UPDATE must be 0 or 1." >&2; exit 1; }
 [[ "$INSTALL_CLOUDFLARED" =~ ^[01]$ ]] || { echo "  ERROR: INSTALL_CLOUDFLARED must be 0 or 1." >&2; exit 1; }
 [[ "$NPM_DISABLE_IPV6" =~ ^[01]$ ]] || { echo "  ERROR: NPM_DISABLE_IPV6 must be 0 or 1." >&2; exit 1; }
@@ -103,10 +128,17 @@ for pkg in "${EXTRA_PACKAGES[@]}"; do
   [[ "$pkg" =~ ^[a-z0-9][a-z0-9+.-]*$ ]] || { echo "  ERROR: Invalid package name in EXTRA_PACKAGES: $pkg" >&2; exit 1; }
 done
 
+
+for wait_var in INITIAL_WAIT_SECONDS UPDATE_WAIT_SECONDS; do
+  [[ ${!wait_var} =~ ^[1-9][0-9]{1,4}$ ]] && (( ${!wait_var} >= 30 && ${!wait_var} <= 86400 )) \
+    || { echo "ERROR: $wait_var must be 30..86400 seconds." >&2; exit 1; }
+done
+[[ $UPDATE_TIME =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]] || { echo "ERROR: Invalid UPDATE_TIME." >&2; exit 1; }
+
 # ── Trap cleanup ──────────────────────────────────────────────────────────────
 trap 'rc=$?;
   trap - ERR
-  echo "  ERROR: failed (rc=$rc) near line ${BASH_LINENO[0]:-?}" >&2
+  echo "  ERROR: failed (rc=$rc) near line ${LINENO:-?}" >&2
   echo "  Command: $BASH_COMMAND" >&2
   if [[ "${CLEANUP_ON_FAIL:-0}" -eq 1 && "${CREATED:-0}" -eq 1 ]]; then
     echo "  Cleanup: stopping/destroying CT ${CT_ID} ..." >&2
@@ -116,7 +148,8 @@ trap 'rc=$?;
   exit "$rc"
 ' ERR
 
-trap 'rc=$?;
+trap 'rc=130;
+  trap - ERR INT TERM HUP
   echo "  Interrupted (rc=$rc)" >&2
   echo "  Command: $BASH_COMMAND" >&2
   if [[ "${CLEANUP_ON_FAIL:-0}" -eq 1 && "${CREATED:-0}" -eq 1 ]]; then
@@ -125,18 +158,22 @@ trap 'rc=$?;
     pct destroy "${CT_ID}" >/dev/null 2>&1 || true
   fi
   exit "$rc"
-' INT TERM
+' INT TERM HUP
 
 # ── Preflight — root & commands ───────────────────────────────────────────────
 [[ "$(id -u)" -eq 0 ]] || { echo "  ERROR: Run as root on the Proxmox host." >&2; exit 1; }
 
-for cmd in pvesh pveam pct pvesm qm curl python3 ip awk grep sed sort paste seq readlink cp chmod dpkg head tr; do
+for cmd in pvesh pveam pct pvesm qm curl python3 ip awk grep sed sort paste seq readlink cp chmod dpkg head tr flock mktemp mv rm tail bash stat timeout; do
   command -v "$cmd" >/dev/null 2>&1 || { echo "  ERROR: Missing required command: $cmd" >&2; exit 1; }
 done
 
 # pveam lists templates for more than one CPU architecture. Selecting only by
 # Debian version can pick an ARM64 rootfs on an AMD64 host (or vice versa),
 # which creates successfully but fails when LXC executes /sbin/init.
+# Serialize this creator before assigning an ID or checking its hostname.
+exec 7>/run/lock/npm-creator.lock
+flock -n 7 || { echo "ERROR: Another npm creator is running." >&2; exit 1; }
+
 HOST_ARCH="$(dpkg --print-architecture)"
 case "$HOST_ARCH" in
   amd64|arm64) ;;
@@ -150,8 +187,10 @@ if ! exec 8</dev/tty; then
   exit 1
 fi
 
+[[ -t 8 ]] || { echo "ERROR: Prompt input must be a terminal." >&2; exit 1; }
+
 if [[ -n "$CT_ID" ]]; then
-  [[ "$CT_ID" =~ ^[0-9]+$ ]] && (( CT_ID >= 100 && CT_ID <= 999999999 )) \
+  [[ "$CT_ID" =~ ^(0|[1-9][0-9]*)$ ]] && (( CT_ID >= 100 && CT_ID <= 999999999 )) \
     || { echo "  ERROR: CT_ID must be an integer >= 100." >&2; exit 1; }
   if pct status "$CT_ID" >/dev/null 2>&1 || qm status "$CT_ID" >/dev/null 2>&1; then
     echo "  ERROR: CT_ID $CT_ID is already in use on this node." >&2
@@ -168,7 +207,7 @@ fi
 EXISTING_CT="$(pct list 2>/dev/null | awk -v h="$HN" 'NR>1 && $NF==h {print $1}' | head -n1)"
 if [[ -n "$EXISTING_CT" ]]; then
   echo "  ERROR: A CT with hostname '${HN}' already exists on this node (CT ${EXISTING_CT})." >&2
-  echo "  Destroy it (pct set ${EXISTING_CT} --protection 0; pct destroy ${EXISTING_CT}) or change HN, then re-run." >&2
+  echo "  Fresh creator: use the existing CT maintenance helper, or review the retained CT before removing it." >&2
   exit 1
 fi
 
@@ -200,11 +239,12 @@ cat <<EOF2
   Timezone:          $APP_TZ
   Disable IPv6 app:  $([ "$NPM_DISABLE_IPV6" -eq 1 ] && echo "yes" || echo "no")
   Cloudflare Tunnel: $([ "$INSTALL_CLOUDFLARED" -eq 1 ] && echo "yes" || echo "no")
-  Listens on:        0.0.0.0:80, :443, :${APP_PORT} inside the CT (Network=host) — reachable from the whole LAN
+  Listens on:        0.0.0.0:80, :443, :${APP_PORT} inside the CT (Network=host)
+  Firewall sources: admin TCP ${APP_PORT} and proxy TCP 80/443 are selected separately below
   Podman storage:    $([ "$PODMAN_FUSE_OVERLAY" -eq 1 ] && echo "fuse-overlayfs (fuse=1)" || echo "native overlay (no FUSE)")
   Tags:              $TAGS
   Auto-update:       $([ "$AUTO_UPDATE" -eq 1 ] && echo "enabled (re-pull pinned $APP_TAG)" || echo "disabled (pinned $APP_TAG, manual)")
-  Cleanup on fail:   $CLEANUP_ON_FAIL (until first service start; CT preserved after that)
+  Cleanup on fail:   $CLEANUP_ON_FAIL (disarmed before first persistent start)
   ────────────────────────────────────────
   To change defaults, press Enter and
   edit the Config section at the top of
@@ -212,38 +252,130 @@ cat <<EOF2
 
 EOF2
 
-SCRIPT_URL="https://raw.githubusercontent.com/vdarkobar/scripts/main/bash/npm-quadlet.sh"
-SCRIPT_LOCAL="/root/npm-quadlet.sh"
 SCRIPT_SELF="$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")"
 
-read -r -p "  Continue with these settings? [y/N]: " response <&8
+response=""
+read -r -p "  Continue with these settings? [y/N]: " response <&8 || response=""
 case "$response" in
   [yY][eE][sS]|[yY]) ;;
   *)
     echo ""
-    echo "  Saving current script to ${SCRIPT_LOCAL} for editing..."
-    # Shebang check: when run as 'curl | bash', $0 is the bash binary, not this script.
-    if [[ -f "$SCRIPT_SELF" ]] && head -n1 "$SCRIPT_SELF" 2>/dev/null | grep -q '^#!/usr/bin/env bash$' \
-      && cp -f -- "$SCRIPT_SELF" "$SCRIPT_LOCAL"; then
-      chmod +x "$SCRIPT_LOCAL"
-      echo "  Edit:  nano ${SCRIPT_LOCAL}"
-      echo "  Run:   bash ${SCRIPT_LOCAL}"
-      echo ""
-    elif curl -fsSL "$SCRIPT_URL" -o "$SCRIPT_LOCAL"; then
-      chmod +x "$SCRIPT_LOCAL"
-      echo "  WARNING: Could not copy the running script; downloaded fallback from GitHub instead."
-      echo "  Edit:  nano ${SCRIPT_LOCAL}"
-      echo "  Run:   bash ${SCRIPT_LOCAL}"
-      echo ""
+    echo "  Keeping an editable script copy..."
+    if [[ -f "$SCRIPT_SELF" ]] && head -n 1 "$SCRIPT_SELF" | grep -q '^#!/usr/bin/env bash$'; then
+      # The running local file is already the correct editable copy. In particular,
+      # never cp a file onto itself and then fetch a replacement over user edits.
+      echo "  Edit: nano $SCRIPT_SELF"
+      echo "  Run:  bash $SCRIPT_SELF"
     else
-      echo "  ERROR: Failed to save a local editable copy of the script." >&2
-      exit 1
+      [[ ! -e $SCRIPT_LOCAL ]] || SCRIPT_LOCAL="/root/npm-quadlet-downloaded.$$.sh"
+      DOWNLOAD_TEMP=$(mktemp /root/npm-download.XXXXXX)
+      if curl -fLsS --retry 3 --connect-timeout 10 --max-time 120 "$SCRIPT_URL" -o "$DOWNLOAD_TEMP" \
+        && head -n 1 "$DOWNLOAD_TEMP" | grep -q '^#!/usr/bin/env bash$' \
+        && bash -n "$DOWNLOAD_TEMP"; then
+        chmod 0700 "$DOWNLOAD_TEMP"
+        mv -T "$DOWNLOAD_TEMP" "$SCRIPT_LOCAL"
+        echo "  Downloaded a separate upstream copy; it may differ from the piped script."
+        echo "  Edit: nano $SCRIPT_LOCAL"
+      else
+        rm -f -- "$DOWNLOAD_TEMP"
+        echo "  ERROR: Could not save a validated upstream copy. Existing files were preserved." >&2
+        exit 1
+      fi
     fi
     exit 0
     ;;
 esac
 
 echo ""
+
+
+# ── Firewall access sources ───────────────────────────────────────────────────
+# Administrator access and proxy traffic have independent source lists.
+# Enter without sources opens only the ports named in that prompt.
+FIREWALL_ACCESS_LABEL=""
+if (( ${#UFW_ALLOWED_SOURCES[@]} == 0 )); then
+  cat <<FIREWALL_HELP
+  Firewall access for NPM administration on TCP $APP_PORT:
+  Enter administrator device IPs or management/VPN subnets.
+  This choice applies only to the admin interface. Proxy TCP 80/443 is separate.
+
+    One device:       192.168.1.20
+    Whole subnet:     192.168.1.0/24
+    Multiple sources: 192.168.1.20 192.168.2.0/24
+    IPv6 examples:    fd00::20 or fd00::/64
+
+  CIDR format: network-address/prefix-length
+  Example: 192.168.1.0/24 covers the 192.168.1.x subnet.
+  Use the network address (no host bits); replace examples with your addresses.
+
+  Press Enter to allow any source on TCP $APP_PORT (IPv4 and IPv6).
+  UFW stays enabled. Any source includes the internet if this CT is reachable.
+
+FIREWALL_HELP
+  if ! read -r -p "  Admin sources (space-separated) [Enter = any]: " firewall_input <&8; then
+    echo "ERROR: Firewall input interrupted; no access policy selected." >&2
+    exit 1
+  fi
+  read -r -a UFW_ALLOWED_SOURCES <<< "$firewall_input"
+  if (( ${#UFW_ALLOWED_SOURCES[@]} == 0 )); then
+    UFW_ALLOWED_SOURCES=("0.0.0.0/0" "::/0")
+    FIREWALL_ACCESS_LABEL="Any source (IPv4 and IPv6)"
+  fi
+fi
+
+NPM_PUBLIC_ACCESS_LABEL=""
+if (( ${#NPM_PUBLIC_SOURCES[@]} == 0 )); then
+  cat <<FIREWALL_HELP
+
+  Firewall access for NPM proxy traffic on TCP 80 and 443:
+  Enter LAN/VPN client IPs or subnets, or the source IP of your tunnel connector.
+  For direct public internet access, press Enter to allow any source.
+  This choice does not change access to the admin interface on TCP $APP_PORT.
+
+    One device:       192.168.1.20
+    Whole subnet:     192.168.1.0/24
+    Multiple sources: 192.168.1.20 192.168.2.0/24
+    IPv6 examples:    fd00::20 or fd00::/64
+
+  CIDR format: network-address/prefix-length
+  Example: 192.168.1.0/24 covers the 192.168.1.x subnet.
+  Use the network address (no host bits); replace examples with your addresses.
+  If cloudflared runs in this CT and uses localhost, loopback is already allowed.
+  Select any additional devices/networks that should reach NPM directly.
+
+  Press Enter to allow any source on TCP 80/443 (IPv4 and IPv6).
+  UFW stays enabled. Any source includes the internet if this CT is reachable.
+
+FIREWALL_HELP
+  if ! read -r -p "  Proxy sources (space-separated) [Enter = any]: " firewall_input <&8; then
+    echo "ERROR: Firewall input interrupted; no proxy access policy selected." >&2
+    exit 1
+  fi
+  read -r -a NPM_PUBLIC_SOURCES <<< "$firewall_input"
+  if (( ${#NPM_PUBLIC_SOURCES[@]} == 0 )); then
+    NPM_PUBLIC_SOURCES=("0.0.0.0/0" "::/0")
+    NPM_PUBLIC_ACCESS_LABEL="Any source (IPv4 and IPv6)"
+  fi
+fi
+if ! python3 - "${UFW_ALLOWED_SOURCES[@]}" "${NPM_PUBLIC_SOURCES[@]}" <<'FIREWALL_VALIDATE'
+import ipaddress, sys
+for value in sys.argv[1:]:
+    try:
+        network = ipaddress.ip_network(value, strict=True)
+    except ValueError:
+        print(f"ERROR: Invalid firewall source {value!r}. Use a host IP (192.168.1.20) or network CIDR (192.168.1.0/24, no host bits).", file=sys.stderr)
+        sys.exit(1)
+    if network.network_address.is_multicast or network.network_address.is_loopback:
+        print(f"ERROR: Expected a client/proxy source, got {value!r}.", file=sys.stderr)
+        sys.exit(1)
+FIREWALL_VALIDATE
+then
+  exit 1
+fi
+FIREWALL_ACCESS_LABEL="${FIREWALL_ACCESS_LABEL:-${UFW_ALLOWED_SOURCES[*]}}"
+NPM_PUBLIC_ACCESS_LABEL="${NPM_PUBLIC_ACCESS_LABEL:-${NPM_PUBLIC_SOURCES[*]}}"
+echo "  UFW admin TCP $APP_PORT allowed sources: $FIREWALL_ACCESS_LABEL"
+echo "  UFW proxy TCP 80/443 allowed sources: $NPM_PUBLIC_ACCESS_LABEL"
 
 # ── Preflight — environment ───────────────────────────────────────────────────
 pvesm status | awk -v s="$TEMPLATE_STORAGE" '$1==s{f=1} END{exit(!f)}' \
@@ -348,14 +480,14 @@ CREATED=1
 # ── Start & wait for IPv4 ─────────────────────────────────────────────────────
 pct start "$CT_ID"
 CT_IP=""
-for i in $(seq 1 30); do
+for i in $(seq 1 60); do
   CT_IP="$(pct exec "$CT_ID" -- sh -lc '
     ip -4 -o addr show scope global 2>/dev/null | awk "{print \$4}" | cut -d/ -f1 | head -n1
   ' 2>/dev/null || true)"
   [[ -n "$CT_IP" ]] && break
   sleep 1
 done
-[[ -n "$CT_IP" ]] || { echo "  ERROR: No IPv4 address acquired via DHCP within timeout." >&2; exit 1; }
+[[ -n "$CT_IP" ]] || { echo "  ERROR: No IPv4 address acquired via DHCP within timeout." >&2; false; }
 echo "  CT $CT_ID is up — IP: $CT_IP"
 
 printf 'root:%s\n' "$PASSWORD" | pct exec "$CT_ID" -- chpasswd
@@ -382,7 +514,7 @@ pct exec "$CT_ID" -- bash -lc "
   set -euo pipefail
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -qq
-  apt-get install -y locales curl ca-certificates iproute2 podman tar gzip ${PODMAN_FUSE_PKG}
+  apt-get install -y locales curl ca-certificates iproute2 python3 ufw iptables util-linux podman tar gzip ${PODMAN_FUSE_PKG}
   sed -i 's/^# *en_US.UTF-8/en_US.UTF-8/' /etc/locale.gen
   locale-gen
   update-locale LANG=en_US.UTF-8
@@ -399,6 +531,139 @@ pct exec "$CT_ID" -- bash -lc '
   apt-get purge -y openssh-server postfix 2>/dev/null || true
   apt-get -y autoremove
 '
+
+# ── UFW inside the CT ─────────────────────────────────────────────────────────
+# Fresh CT only. Network=host uses this CT's INPUT chain.
+pct exec "$CT_ID" -- bash -s -- "$APP_PORT" "${UFW_ALLOWED_SOURCES[@]}" <<'UFWSETUP'
+set -euo pipefail
+export LC_ALL=C
+port=$1; shift
+(( $# > 0 )) || { echo "ERROR: No allowed source addresses."; false; }
+iptables -w 5 -S INPUT >/dev/null
+ip6tables -w 5 -S INPUT >/dev/null
+ufw --force reset
+sed -i 's/^IPV6=.*/IPV6=yes/' /etc/default/ufw
+grep -qx 'IPV6=yes' /etc/default/ufw
+# The creator owns sysctl hardening; avoid a second writer in ufw-init.
+grep -q '^IPT_SYSCTL=' /etc/default/ufw
+sed -i 's|^IPT_SYSCTL=.*|IPT_SYSCTL=|' /etc/default/ufw
+ufw default deny incoming
+ufw default allow outgoing
+ufw default deny routed
+ufw logging off
+for source in "$@"; do
+  ufw allow in proto tcp from "$source" to any port "$port"
+done
+ufw --force enable
+systemctl enable ufw.service
+systemctl restart ufw.service
+for source in "$@"; do
+  tool=iptables; prefix=ufw
+  if [[ $source == *:* ]]; then tool=ip6tables; prefix=ufw6; fi
+  "$tool" -w 5 -C "$prefix-user-input" -s "$source" -p tcp -m tcp --dport "$port" -j ACCEPT
+done
+UFWSETUP
+
+pct exec "$CT_ID" -- bash -s -- "${NPM_PUBLIC_SOURCES[@]}" <<'NPM_PUBLIC_RULES'
+set -euo pipefail
+for source in "$@"; do
+  for port in 80 443; do
+    ufw allow in proto tcp from "$source" to any port "$port"
+    tool=iptables; prefix=ufw
+    if [[ $source == *:* ]]; then tool=ip6tables; prefix=ufw6; fi
+    "$tool" -w 5 -C "$prefix-user-input" -s "$source" -p tcp -m tcp --dport "$port" -j ACCEPT
+  done
+done
+NPM_PUBLIC_RULES
+
+# Persist the selected policy as data for service-start and maintenance checks.
+# This file records expected allows; editing it does not apply UFW rules.
+tmp=$(mktemp)
+{
+  printf '# Expected NPM inbound TCP allows: port source\n'
+  printf '# Keep this file and UFW rules aligned when changing access.\n'
+  printf '# This file is parsed as data, never sourced as a shell script.\n'
+  for source in "${UFW_ALLOWED_SOURCES[@]}"; do
+    printf '%s %s\n' "$APP_PORT" "$source"
+  done
+  for source in "${NPM_PUBLIC_SOURCES[@]}"; do
+    printf '80 %s\n443 %s\n' "$source" "$source"
+  done
+} > "$tmp"
+pct push "$CT_ID" "$tmp" /etc/ufw/npm-expected-sources.conf --perms 0644
+rm -f -- "$tmp"
+
+tmp=$(mktemp)
+cat > "$tmp" <<'UFWCHECK'
+#!/usr/bin/env bash
+set -euo pipefail
+export LC_ALL=C
+# Startup guard: active filtering and default-deny in both address families.
+# Also verify every saved port/source allow. This is not an exhaustive audit
+# of additional rules or network reachability; test from client hosts too.
+trap 'printf "ERROR: NPM firewall check failed near line %s. Inspect ufw status verbose and /etc/ufw/npm-expected-sources.conf.\n" "$LINENO" >&2' ERR
+grep -qx 'ENABLED=yes' /etc/ufw/ufw.conf
+grep -qx 'IPV6=yes' /etc/default/ufw
+status=$(/usr/sbin/ufw status)
+grep -qx 'Status: active' <<< "$status"
+for tool in /usr/sbin/iptables /usr/sbin/ip6tables; do
+  prefix=ufw
+  [[ ${tool##*/} != ip6tables ]] || prefix=ufw6
+  rules=$("$tool" -w 5 -S INPUT)
+  grep -qx -- '-P INPUT DROP' <<< "$rules"
+  "$tool" -w 5 -C INPUT -j "$prefix-before-input"
+  "$tool" -w 5 -S "$prefix-user-input" >/dev/null
+done
+policy=/etc/ufw/npm-expected-sources.conf
+[[ -r $policy ]] || { printf 'ERROR: Missing firewall policy: %s\n' "$policy" >&2; exit 1; }
+declare -A seen=()
+while read -r port source extra || [[ -n ${port:-} ]]; do
+  [[ -n $port && $port != \#* ]] || continue
+  if [[ ! $port =~ ^(80|81|443)$ || -z $source || -n $extra || ! $source =~ ^[0-9A-Fa-f.:/]+$ ]]; then
+    printf 'ERROR: Invalid port/source row in %s.\n' "$policy" >&2
+    exit 1
+  fi
+  tool=/usr/sbin/iptables; prefix=ufw
+  if [[ $source == *:* ]]; then tool=/usr/sbin/ip6tables; prefix=ufw6; fi
+  if ! "$tool" -w 5 -C "$prefix-user-input" -s "$source" -p tcp -m tcp --dport "$port" -j ACCEPT; then
+    printf 'ERROR: Missing expected UFW allow: TCP %s from %s.\n' "$port" "$source" >&2
+    exit 1
+  fi
+  seen[$port]=1
+done < "$policy"
+for port in 80 81 443; do
+  [[ ${seen[$port]:-0} == 1 ]] || { printf 'ERROR: No expected sources recorded for TCP %s.\n' "$port" >&2; exit 1; }
+done
+UFWCHECK
+pct push "$CT_ID" "$tmp" /usr/local/sbin/npm-ufw-check --perms 0755
+rm -f -- "$tmp"
+pct exec "$CT_ID" -- /usr/local/sbin/npm-ufw-check
+
+tmp=$(mktemp)
+cat > "$tmp" <<'LISTENERCHECK'
+#!/usr/bin/env bash
+set -euo pipefail
+export LC_ALL=C
+# Called only after the app starts, never from ExecStartPre.
+# Argument: NPM_DISABLE_IPV6 (0 = verify IPv4 and IPv6; 1 = IPv4 only).
+(( $# == 1 )) && [[ $1 =~ ^[01]$ ]] || { echo "Usage: $0 <NPM_DISABLE_IPV6: 0|1>" >&2; exit 1; }
+for family in 4 6; do
+  [[ $family != 6 || $1 == 0 ]] || continue
+  listeners=$(ss -H -ltn"$family") || { echo "ERROR: Cannot inspect IPv$family TCP listeners." >&2; exit 1; }
+  for port in 80 443; do
+    if ! awk -v family="$family" -v port="$port" '
+      $4 == "0.0.0.0:" port && family == 4 {found=1}
+      ($4 == "[::]:" port || $4 == "*:" port) && family == 6 {found=1}
+      END {exit !found}
+    ' <<< "$listeners"; then
+      printf 'ERROR: Missing NPM wildcard IPv%s TCP listener on port %s. Check ss -ltnp and journalctl -u npm.service.\n' "$family" "$port" >&2
+      exit 1
+    fi
+  done
+done
+LISTENERCHECK
+pct push "$CT_ID" "$tmp" /usr/local/sbin/npm-listener-check --perms 0755
+rm -f -- "$tmp"
 
 # ── Podman configuration ──────────────────────────────────────────────────────
 OVERLAY_OPTIONS=""
@@ -432,9 +697,9 @@ pct exec "$CT_ID" -- podman --version
 # Quadlet requires cgroup v2 and the overlay driver must actually be active
 # (a silent fallback to vfs would work but eat disk and be very slow).
 CGROUPS_VERSION="$(pct exec "$CT_ID" -- podman info --format '{{.Host.CgroupsVersion}}' 2>/dev/null || echo "?")"
-[[ "$CGROUPS_VERSION" == "v2" ]] || { echo "  ERROR: Quadlet requires cgroup v2 inside the CT; podman reports '${CGROUPS_VERSION}'." >&2; exit 1; }
+[[ "$CGROUPS_VERSION" == "v2" ]] || { echo "  ERROR: Quadlet requires cgroup v2 inside the CT; podman reports '${CGROUPS_VERSION}'." >&2; false; }
 GRAPH_DRIVER="$(pct exec "$CT_ID" -- podman info --format '{{.Store.GraphDriverName}}' 2>/dev/null || echo "?")"
-[[ "$GRAPH_DRIVER" == "overlay" ]] || { echo "  ERROR: Podman storage driver is '${GRAPH_DRIVER}', expected overlay." >&2; exit 1; }
+[[ "$GRAPH_DRIVER" == "overlay" ]] || { echo "  ERROR: Podman storage driver is '${GRAPH_DRIVER}', expected overlay." >&2; false; }
 echo "  Podman: cgroup ${CGROUPS_VERSION}, storage driver ${GRAPH_DRIVER}$([ "$PODMAN_FUSE_OVERLAY" -eq 1 ] && echo " (fuse-overlayfs)" || echo " (native)")"
 
 # ── Pull image ────────────────────────────────────────────────────────────────
@@ -443,6 +708,16 @@ pct exec "$CT_ID" -- bash -lc "
   set -euo pipefail
   podman pull '${APP_IMAGE}'
 "
+
+
+# ── Resolve immutable runtime images ──────────────────────────────────────────
+for component in APP; do
+  reference_var=${component}_IMAGE
+  resolved=$(pct exec "$CT_ID" -- podman image inspect --format '{{.Id}}' "${!reference_var}")
+  resolved=${resolved#sha256:}
+  [[ $resolved =~ ^[a-f0-9]{64}$ ]] || { echo "ERROR: Invalid image ID for $component." >&2; false; }
+  printf -v "${component}_IMAGE_ID" 'sha256:%s' "$resolved"
+done
 
 # ── Prepare persistent paths ──────────────────────────────────────────────────
 # NPM persistent state (SQLite mode):
@@ -472,21 +747,28 @@ pct exec "$CT_ID" -- bash -lc "
   cat > '${QUADLET_FILE}' <<EOF2
 [Unit]
 Description=Nginx Proxy Manager
-After=network-online.target
+After=network-online.target ufw.service
 Wants=network-online.target
+Requires=ufw.service
 
 [Container]
-Image=${APP_IMAGE}
+# LabTag=${APP_TAG}
+# LabImage=${APP_IMAGE}
+Image=${APP_IMAGE_ID}
+Pull=never
 ContainerName=npm
 Network=host
 Environment=TZ=${APP_TZ}
 ${DISABLE_IPV6_LINE}
 Volume=${APP_DIR}/data:/data
 Volume=${APP_DIR}/letsencrypt:/etc/letsencrypt
+StopTimeout=110
 LogDriver=journald
 
 [Service]
+ExecStartPre=/usr/local/sbin/npm-ufw-check
 Restart=always
+RestartSec=5
 TimeoutStopSec=120
 
 [Install]
@@ -506,270 +788,412 @@ pct exec "$CT_ID" -- bash -lc "
 APP_IMAGE_REPO=${APP_IMAGE_REPO}
 APP_TAG=${APP_TAG}
 APP_IMAGE=${APP_IMAGE}
+APP_IMAGE_ID=${APP_IMAGE_ID}
 APP_PORT=${APP_PORT}
 APP_TZ=${APP_TZ}
 NPM_DISABLE_IPV6=${NPM_DISABLE_IPV6}
 AUTO_UPDATE=${AUTO_UPDATE}
+PODMAN_FUSE_OVERLAY=${PODMAN_FUSE_OVERLAY}
+INITIAL_WAIT_SECONDS=${INITIAL_WAIT_SECONDS}
+UPDATE_WAIT_SECONDS=${UPDATE_WAIT_SECONDS}
+UPDATE_TIME=${UPDATE_TIME}
 EOF2
   chmod 0600 '${APP_DIR}/.env'
 "
 
 # ── Maintenance script ────────────────────────────────────────────────────────
-# update <tag>: pull → sed Image= in Quadlet file → sed .env → daemon-reload →
-#   restart → health check; rollback restores both files, daemon-reload, restart.
-# auto-update:  re-pull the CURRENT PINNED TAG; restart only if the image ID
-#   changed; rollback re-tags the previous image ID and restarts.
-pct exec "$CT_ID" -- bash -lc 'cat > /usr/local/bin/npm-maint.sh && chmod 0755 /usr/local/bin/npm-maint.sh' <<'MAINT'
+# One component per update; immutable IDs, atomic control files and explicit
+# recovery policy. The helper never archives or restores application data.
+tmp="$(mktemp)"
+cat > "$tmp" <<'MAINT'
 #!/usr/bin/env bash
 set -Eeo pipefail
+umask 077
+export LC_ALL=C
 
-APP_DIR="${APP_DIR:-/opt/npm}"
-QUADLET_FILE="/etc/containers/systemd/npm.container"
-SERVICE="npm.service"
-CONTAINER="npm"
-ENV_FILE="${APP_DIR}/.env"
+# Generated with this application's creator; no shared runtime library.
+APP_DIR=/opt/npm
+ENV_FILE=$APP_DIR/.env
+UNIT_DIR=/etc/containers/systemd
+MAIN_SERVICE=npm.service
+LOCK=/run/lock/npm-maint.lock
+GENERATOR=/usr/lib/systemd/system-generators/podman-system-generator
+# Only temporary control-file copies are made. PBS/PVE owns data recovery.
+# Atomic rename protects each file; this is not a multi-file disk transaction.
+# The Quadlet contains the authoritative tag/reference/ID. Metadata is reconciled
+# under the maintenance lock after an interruption.
+WORK=""
+SWITCHED=0
+START_ATTEMPTED=0
+APP_STOPPED=0
+COMPONENT=""
+DB_TYPE_BEFORE=""
+declare -A STATE=()
 
-need_root() { [[ $EUID -eq 0 ]] || { echo "  ERROR: Run as root." >&2; exit 1; }; }
-die() { echo "  ERROR: $*" >&2; exit 1; }
-
-usage() {
-  cat <<EOF2
-  NPM Maintenance (Quadlet)
-  ─────────────────────────
-  Usage:
-    $0 update <tag> [--yes]   # e.g. 2.15.2 — pinned version required, no :latest
-    $0 auto-update            # re-pull current pinned tag (only if AUTO_UPDATE=1)
-    $0 version
-
-  Notes:
-    - update pulls the pinned tag, updates the Quadlet unit and .env, restarts the service
-    - auto-update is called by npm-update.timer; it never changes the tag
-    - :latest and floating tags (2, 2.15) are not permitted — always specify X.Y.Z
-    - backup and restore are handled by PBS and PVE snapshots
-    - take a PVE snapshot before manual updates: pct snapshot <CT_ID> pre-update-\$(date +%Y%m%d)
-EOF2
+die() { printf '  ERROR: %s\n' "$*" >&2; exit 1; }
+read_state() {
+  local line key value
+  STATE=()
+  while IFS= read -r line || [[ -n $line ]]; do
+    [[ $line =~ ^[[:space:]]*(#.*)?$ ]] && continue
+    [[ $line =~ ^([A-Z][A-Z0-9_]*)=(.*)$ ]] || die "Malformed state line."
+    key=${BASH_REMATCH[1]}; value=${BASH_REMATCH[2]}
+    [[ ! ${STATE[$key]+yes} ]] || die "Duplicate state key: $key"
+    STATE[$key]=$value
+  done < "$ENV_FILE"
+  # State is parsed as data. Never source an editable .env as root.
+  for key in APP_PORT INITIAL_WAIT_SECONDS UPDATE_WAIT_SECONDS PODMAN_FUSE_OVERLAY AUTO_UPDATE; do
+    [[ ${STATE[$key]:-} =~ ^(0|[1-9][0-9]{0,5})$ ]] || die "Invalid $key."
+  done
+  (( STATE[APP_PORT] >= 81 && STATE[APP_PORT] <= 65535 )) || die "Invalid APP_PORT."
+  (( STATE[INITIAL_WAIT_SECONDS] >= 30 && STATE[INITIAL_WAIT_SECONDS] <= 86400 )) || die "Invalid initial wait."
+  (( STATE[UPDATE_WAIT_SECONDS] >= 30 && STATE[UPDATE_WAIT_SECONDS] <= 86400 )) || die "Invalid update wait."
+  [[ ${STATE[AUTO_UPDATE]} =~ ^[01]$ && ${STATE[PODMAN_FUSE_OVERLAY]} =~ ^[01]$ ]] || die "Invalid policy flag."
+  [[ ${STATE[NPM_DISABLE_IPV6]:-} =~ ^[01]$ ]] || die "Invalid NPM_DISABLE_IPV6."
+  (( STATE[APP_PORT] == 81 )) || die "NPM admin port is fixed at 81."
 }
-
-[[ -d "$APP_DIR" ]]      || die "APP_DIR not found: $APP_DIR"
-[[ -f "$ENV_FILE" ]]     || die "Missing env file: $ENV_FILE"
-[[ -f "$QUADLET_FILE" ]] || die "Missing Quadlet unit: $QUADLET_FILE"
-
-# One maintenance operation at a time — a manual update must not overlap the timer.
-LOCK_FILE="/run/lock/npm-maint.lock"
-mkdir -p /run/lock
-exec 9>"$LOCK_FILE"
-flock -n 9 || die "Another npm-maint.sh operation is already running."
-
-env_val() {
-  awk -F= -v key="$1" '$1==key{print substr($0, length(key)+2)}' "$ENV_FILE" | tail -n1
+unit_value() {
+  local prefix=$1 file=$2
+  awk -v p="$prefix" 'index($0,p)==1 {value=substr($0,length(p)+1); n++} END {if(n!=1) exit 1; print value}' "$file"
 }
-
-env_flag() {
-  local raw
-  raw="$(env_val "$1" | tr -d '[:space:]')"
-  [[ "$raw" =~ ^[01]$ ]] && printf '%s' "$raw" || printf '0'
+image_id() {
+  local value
+  value=$(podman image inspect --format '{{.Id}}' "$1") || return 1
+  value=${value#sha256:}
+  [[ $value =~ ^[a-f0-9]{64}$ ]] || return 1
+  printf 'sha256:%s\n' "$value"
 }
-
-app_port() {
-  local port
-  port="$(env_val APP_PORT | tr -d '[:space:]')"
-  [[ "$port" =~ ^[0-9]+$ ]] && printf '%s' "$port" || printf '81'
+select_component() {
+  COMPONENT=$1
+  case $COMPONENT in
+    APP) CONTAINER=npm; KIND=app; IMAGE_RECOVERY=0 ;;
+    *) die "Unknown component: $COMPONENT" ;;
+  esac
+  SERVICE=$CONTAINER.service
+  UNIT=$UNIT_DIR/$CONTAINER.container
 }
-
-current_image() { env_val APP_IMAGE; }
-current_repo()  { env_val APP_IMAGE_REPO; }
-current_tag()   { local img; img="$(current_image)"; echo "${img##*:}"; }
-
-running_image_id() {
-  podman inspect --format '{{.Image}}' "$CONTAINER" 2>/dev/null || true
+valid_tag() {
+  case $1 in
+    APP) [[ $2 =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9._-]+)?$ ]] ;;
+    *) return 1 ;;
+  esac
 }
-
-image_id_of() {
-  podman image inspect --format '{{.Id}}' "$1" 2>/dev/null || true
+load_unit() {
+  OLD_TAG=$(unit_value '# LabTag=' "$UNIT") || die "Missing LabTag metadata; use the matching upgraded creator."
+  OLD_IMAGE=$(unit_value '# LabImage=' "$UNIT") || die "Missing LabImage metadata."
+  OLD_ID=$(unit_value 'Image=' "$UNIT") || die "Missing image ID."
+  [[ $OLD_IMAGE == *:* ]] || die "Invalid image reference."
+  REPO=${OLD_IMAGE%:*}
+  [[ $REPO =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*[A-Za-z0-9]$ ]] || die "Invalid repository."
+  valid_tag "$COMPONENT" "$OLD_TAG" || die "Configured tag violates this component's policy."
+  [[ $OLD_IMAGE == "$REPO:$OLD_TAG" && $OLD_ID =~ ^sha256:[a-f0-9]{64}$ ]] || die "Inconsistent unit metadata."
+  [[ $(unit_value 'Pull=' "$UNIT") == never ]] || die "Expected Pull=never."
 }
-
-# /api/ is answered by the Node backend (200 + JSON) only when it is actually up;
-# / on port 81 is the static admin SPA and returns 200 even with a dead backend.
-wait_for_app() {
-  local port code
-  port="$(app_port)"
-  for i in $(seq 1 45); do
-    code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 "http://127.0.0.1:${port}/api/" 2>/dev/null || echo 000)"
-    [[ "$code" == "200" ]] && return 0
+write_env() {
+  local tag=$1 reference=$2 id=$3 temp
+  temp=$(mktemp "${ENV_FILE}.XXXXXX") || return 1
+  if ! awk -v c="$COMPONENT" -v repo="$REPO" -v t="$tag" -v r="$reference" -v id="$id" '
+    $0 ~ ("^" c "_(IMAGE_REPO|TAG|IMAGE|IMAGE_ID)=") {next}
+    {print}
+    END {print c "_IMAGE_REPO=" repo; print c "_TAG=" t; print c "_IMAGE=" r; print c "_IMAGE_ID=" id}
+  ' "$ENV_FILE" > "$temp" || ! chmod 0600 "$temp" || ! mv -fT "$temp" "$ENV_FILE"; then
+    rm -f -- "$temp"; return 1
+  fi
+}
+write_unit() {
+  local tag=$1 reference=$2 id=$3 temp
+  temp=$(mktemp "${UNIT}.XXXXXX") || return 1
+  if ! sed -e "s|^# LabTag=.*|# LabTag=$tag|" \
+      -e "s|^# LabImage=.*|# LabImage=$reference|" \
+      -e "s|^Image=.*|Image=$id|" "$UNIT" > "$temp" \
+      || ! chmod 0644 "$temp" || ! mv -fT "$temp" "$UNIT"; then
+    rm -f -- "$temp"; return 1
+  fi
+}
+copy_control_file() {
+  local source=$1 destination=$2 temp
+  temp=$(mktemp "${destination}.XXXXXX") || return 1
+  if ! cp --preserve=mode,ownership "$source" "$temp" || ! mv -fT "$temp" "$destination"; then
+    rm -f -- "$temp"; return 1
+  fi
+}
+wait_service() {
+  local container=$1 kind=$2 budget=$3 started=$SECONDS state restarts first code value
+  local healthy_since=-1
+  first=$(systemctl show "$container.service" -p NRestarts --value) || return 1
+  while (( SECONDS - started < budget )); do
+    state=$(systemctl show "$container.service" -p ActiveState --value) || return 1
+    restarts=$(systemctl show "$container.service" -p NRestarts --value) || return 1
+    [[ $state != failed && $state != inactive && $restarts == "$first" ]] || return 1
+    value=0
+    if [[ $state == active ]]; then
+      case $kind in
+        app)
+          code=$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 2 --max-time 3 \
+            "http://127.0.0.1:${STATE[APP_PORT]}/api/") || code=000
+          if [[ $code == 200 ]] && /usr/local/sbin/npm-listener-check "${STATE[NPM_DISABLE_IPV6]}" >/dev/null 2>&1; then
+            value=1
+          fi
+          ;;
+        postgres)
+          timeout 5 podman exec "$container" pg_isready -q -h 127.0.0.1 -U postgres -d postgres && value=1
+          ;;
+        valkey|redis)
+          code=$(timeout 5 podman exec "$container" "$kind-cli" -h 127.0.0.1 ping 2>/dev/null) || code=""
+          [[ $code == PONG ]] && value=1
+          ;;
+      esac
+    fi
+    if (( value )); then
+      (( healthy_since >= 0 )) || healthy_since=$SECONDS
+      (( SECONDS - healthy_since >= 6 )) && return 0
+    else
+      healthy_since=-1
+    fi
     sleep 2
   done
+  if [[ $kind == app ]]; then
+    /usr/local/sbin/npm-listener-check "${STATE[NPM_DISABLE_IPV6]}" || true
+  fi
   return 1
 }
+validate_candidate() {
+  local id=$1 old_user new_user actual major uid gid path version
+  # Only the image shell runs, without network or data mounts. The candidate
+  # application never gets production data during validation.
+  podman run --rm --pull=never --network none --entrypoint /bin/sh "$id" -c true
+  old_user=$(podman image inspect --format '{{.Config.User}}' "$OLD_ID")
+  new_user=$(podman image inspect --format '{{.Config.User}}' "$id")
+  [[ $old_user == "$new_user" ]] || die "Image USER changed; review ownership before updating."
 
-# update <tag> [--yes] — switch to a pinned version
-update_app() {
-  local new_tag="" skip_confirm=0
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      -y|--yes) skip_confirm=1; shift ;;
-      *) new_tag="$1"; shift ;;
-    esac
-  done
+}
+pre_update_checks() {
 
-  local old_tag repo old_image new_image old_id tmp_env tmp_quadlet
-  [[ -n "$new_tag" ]] || die "Usage: npm-maint.sh update <tag>"
-  [[ "$new_tag" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9._-]+)?$ ]] \
-    || die "Invalid tag: $new_tag — pinned version required (e.g. 2.15.2), ':latest' is not permitted."
+  :
+}
+post_update_checks() {
+  /usr/local/sbin/npm-ufw-check || die "Expected UFW rules failed verification after update."
+}
+finish() {
+  local rc=$? restored=1
+  trap - EXIT ERR INT TERM HUP
+  set +e
+  if (( rc != 0 && SWITCHED )); then
+    if (( START_ATTEMPTED == 0 || IMAGE_RECOVERY == 1 )); then
+      copy_control_file "$WORK/old.container" "$UNIT" || restored=0
+      copy_control_file "$WORK/old.env" "$ENV_FILE" || restored=0
+      systemctl daemon-reload || restored=0
+      if (( restored && START_ATTEMPTED )); then
+        systemctl restart "$SERVICE" && wait_service "$CONTAINER" "$KIND" "${STATE[UPDATE_WAIT_SECONDS]}" || restored=0
+      fi
+      if (( restored && APP_STOPPED )); then
+        systemctl start "$MAIN_SERVICE" && wait_service npm app "${STATE[UPDATE_WAIT_SECONDS]}" || restored=0
+      fi
+      if (( restored )); then
+        printf '  Previous control files/image restored; this does not undo application data changes.\n' >&2
+      else
+        printf '  CRITICAL: Recovery was not confirmed. Inspect %s and %s.\n' "$UNIT" "$WORK" >&2
+      fi
+    else
+      printf '  Target %s image retained: persistent state may already have changed.\n' "$COMPONENT" >&2
+      printf '  No automatic image/database downgrade. Inspect journalctl -u %s -u %s.\n' "$SERVICE" "$MAIN_SERVICE" >&2
+      printf '  Recover matching PBS/PVE state if needed. A readiness timeout does not stop a migration.\n' >&2
+      (( APP_STOPPED == 0 )) || printf '  After the backend is healthy: systemctl start %s\n' "$MAIN_SERVICE" >&2
+    fi
+  elif (( rc != 0 && APP_STOPPED )); then
+    systemctl start "$MAIN_SERVICE" || restored=0
+  fi
+  if [[ -n $WORK ]]; then
+    if (( restored )); then rm -rf -- "$WORK"; else printf '  Retained control-file copies: %s\n' "$WORK" >&2; fi
+  fi
+  exit "$rc"
+}
+trap finish EXIT
+trap 'printf "  Maintenance failed near line %s.\n" "$LINENO" >&2' ERR
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
 
-  old_tag="$(current_tag)"
-  repo="$(current_repo)"
-  [[ -n "$repo" ]] || die "Could not read APP_IMAGE_REPO from .env"
-  old_image="$(current_image)"
-  new_image="${repo}:${new_tag}"
-  # Capture the current image ID before pulling: if new_tag == old_tag, the pull
-  # moves the tag and the old ref would otherwise resolve to the NEW image on rollback.
-  old_id="$(image_id_of "$old_image")"
-  tmp_env="$(mktemp)"
-  tmp_quadlet="$(mktemp)"
-
-  echo "  Current tag: $old_tag"
-  echo "  Target  tag: $new_tag"
-
-  if [[ "$skip_confirm" -eq 0 ]]; then
-    echo ""
-    echo "  IMPORTANT: Take a PVE snapshot before proceeding."
-    echo "  Use: pct snapshot <CT_ID> pre-update-$(date +%Y%m%d)"
-    echo ""
-    read -r -p "  Continue? [y/N]: " confirm
-    case "$confirm" in
-      [yY][eE][sS]|[yY]) ;;
-      *) echo "  Aborted."; rm -f "$tmp_env" "$tmp_quadlet"; exit 0 ;;
-    esac
+update_component() {
+  local requested=${2:-} actual new_id target old_variant new_variant
+  select_component "$1"
+  load_unit
+  SWITCHED=0; START_ATTEMPTED=0; APP_STOPPED=0
+  target=${requested:-$OLD_TAG}
+  valid_tag "$COMPONENT" "$target" || die "Invalid target tag for $COMPONENT."
+# Semantic version downgrades of persistent components require a separate review.
+  if (( IMAGE_RECOVERY == 0 )) && [[ $target != latest && $OLD_TAG != latest ]]; then
+    [[ $(printf '%s\n%s\n' "$OLD_TAG" "$target" | sort -V | head -n 1) == "$OLD_TAG" ]] \
+      || die "Persistent-component downgrade requires matching data recovery."
   fi
 
-  cp -a "$ENV_FILE"     "$tmp_env"
-  cp -a "$QUADLET_FILE" "$tmp_quadlet"
-
-  cleanup() { rm -f "$tmp_env" "$tmp_quadlet"; }
-  rollback() {
-    echo "  !! Update failed — rolling back and restarting ..." >&2
-    cp -a "$tmp_env"     "$ENV_FILE"
-    cp -a "$tmp_quadlet" "$QUADLET_FILE"
-    [[ -n "$old_id" ]] && podman tag "$old_id" "$old_image" >/dev/null 2>&1 || true
-    systemctl daemon-reload
-    systemctl restart "$SERVICE" || true
-    rm -f "$tmp_env" "$tmp_quadlet"
-    if wait_for_app; then
-      echo "  Rollback complete — ${old_image} is healthy again." >&2
-    else
-      echo "  CRITICAL: rollback to ${old_image} did not become healthy. Restore the CT from the PVE snapshot / PBS." >&2
-    fi
-  }
-  trap rollback ERR
-
-  echo "  Pulling target image ..."
-  podman pull "$new_image"
-
-  sed -i "s|^Image=.*|Image=${new_image}|" "$QUADLET_FILE"
-  sed -i \
-    -e "s|^APP_TAG=.*|APP_TAG=$new_tag|" \
-    -e "s|^APP_IMAGE=.*|APP_IMAGE=$new_image|" \
-    "$ENV_FILE"
-
-  echo "  Reloading Quadlet and restarting service ..."
+  if [[ $COMPONENT == APP ]]; then
+    [[ ${OLD_TAG%%.*} == ${target%%.*} ]] || die "Application major changes require a separate migration review."
+  fi
+  /usr/local/sbin/npm-ufw-check || die "Restore active UFW filtering and expected source rules before maintenance."
+  actual=$(podman inspect --format '{{.Image}}' "$CONTAINER") || die "Cannot inspect running image."
+  [[ $(image_id "$actual") == "$OLD_ID" ]] || die "Running/configured image mismatch; inspect the service."
+  wait_service "$CONTAINER" "$KIND" 30 || die "$SERVICE is unhealthy before update."
+  if [[ $COMPONENT != APP ]]; then
+    wait_service npm app 30 || die "Application is unhealthy before backend update."
+  fi
+  if [[ ${STATE[${COMPONENT}_TAG]:-} != "$OLD_TAG" ||
+        ${STATE[${COMPONENT}_IMAGE]:-} != "$OLD_IMAGE" ||
+        ${STATE[${COMPONENT}_IMAGE_ID]:-} != "$OLD_ID" ||
+        ${STATE[${COMPONENT}_IMAGE_REPO]:-} != "$REPO" ]]; then
+    write_env "$OLD_TAG" "$OLD_IMAGE" "$OLD_ID"
+    read_state
+    printf '  Reconciled metadata from the authoritative Quadlet.\n'
+  fi
+  pre_update_checks
+  if (( YES == 0 )); then
+    [[ -t 8 ]] || die "Interactive terminal or --yes is required."
+    printf '  Verify a matching PBS/PVE recovery checkpoint on the host before updating.\n'
+    (( STATE[PODMAN_FUSE_OVERLAY] == 0 )) || printf '  FUSE is enabled: use stop-mode PBS; do not freeze this running CT.\n'
+    :
+    (( IMAGE_RECOVERY )) || printf '  Once the target starts, automatic image downgrade is disabled.\n'
+    read -r -p "  Update $COMPONENT $OLD_TAG -> $target? [y/N]: " answer <&8 || return 0
+    [[ $answer =~ ^([Yy]|[Yy][Ee][Ss])$ ]] || return 0
+  else
+    printf '  --yes skips confirmation; no backup is created or verified.\n'
+  fi
+  podman pull "$REPO:$target"
+  new_id=$(image_id "$REPO:$target") || die "Cannot resolve target image."
+  if [[ $new_id == "$OLD_ID" && $target == "$OLD_TAG" ]]; then
+    printf '  %s unchanged; no restart.\n' "$COMPONENT"
+    return 0
+  fi
+  validate_candidate "$new_id"
+  WORK=$(mktemp -d /run/npm-update.XXXXXX)
+  cp --preserve=mode,ownership "$UNIT" "$WORK/old.container"
+  cp --preserve=mode,ownership "$ENV_FILE" "$WORK/old.env"
+  SWITCHED=1
+  write_unit "$target" "$REPO:$target" "$new_id"
+  write_env "$target" "$REPO:$target" "$new_id"
+  "$GENERATOR" --dryrun > "$WORK/generator.txt"
+  grep -Fq "$CONTAINER.service" "$WORK/generator.txt" || die "Generator omitted $SERVICE."
   systemctl daemon-reload
-  systemctl restart "$SERVICE"
-
-  echo "  Waiting for NPM ..."
-  if ! wait_for_app; then
-    trap - ERR
-    rollback
-    die "NPM did not become healthy after update."
-  fi
-
-  trap - ERR
-  cleanup
-  if [[ -n "$old_id" && "$old_id" != "$(image_id_of "$new_image")" ]]; then
-    podman rmi "$old_id" >/dev/null 2>&1 || true
-  fi
-  echo "  OK: NPM updated to $new_tag"
-}
-
-# auto-update — re-pull the current pinned tag; restart only if the image changed
-auto_update_app() {
-  if [[ "$(env_flag AUTO_UPDATE)" != "1" ]]; then
-    echo "  Auto-update disabled in ${ENV_FILE}; nothing to do."
-    return 0
-  fi
-
-  local image old_id new_id
-  image="$(current_image)"
-  [[ -n "$image" ]] || die "Could not read APP_IMAGE from .env"
-  old_id="$(running_image_id)"
-
-  echo "  Auto-update: re-pulling pinned ${image} ..."
-  podman pull "$image"
-  new_id="$(image_id_of "$image")"
-  [[ -n "$new_id" ]] || die "Could not inspect pulled image ${image}"
-
-  if [[ -n "$old_id" && "$new_id" == "$old_id" ]]; then
-    echo "  OK: ${image} is already current — no restart needed."
-    return 0
-  fi
-
-  rollback() {
-    echo "  !! Auto-update failed — restoring previous image and restarting ..." >&2
-    [[ -n "$old_id" ]] && podman tag "$old_id" "$image" >/dev/null 2>&1 || true
-    systemctl restart "$SERVICE" || true
-    if wait_for_app; then
-      echo "  Rollback complete — previous image is healthy again." >&2
-    else
-      echo "  CRITICAL: rollback did not become healthy. Restore the CT from the PVE snapshot / PBS." >&2
+  [[ $(systemctl show "$SERVICE" -p LoadState --value) == loaded ]] || die "Unit did not load."
+  if [[ $new_id != "$OLD_ID" ]]; then
+    if [[ $COMPONENT != APP ]]; then
+      APP_STOPPED=1
+      systemctl stop "$MAIN_SERVICE"
     fi
-  }
-  trap rollback ERR
-
-  echo "  Image changed — restarting service ..."
-  systemctl restart "$SERVICE"
-
-  echo "  Waiting for NPM ..."
-  if ! wait_for_app; then
-    trap - ERR
-    rollback
-    die "NPM did not become healthy after auto-update."
+    START_ATTEMPTED=1
+    systemctl restart "$SERVICE"
+    wait_service "$CONTAINER" "$KIND" "${STATE[UPDATE_WAIT_SECONDS]}" || die "$SERVICE failed readiness or restarted."
+    if [[ $COMPONENT != APP ]]; then
+      systemctl start "$MAIN_SERVICE"
+      wait_service npm app "${STATE[UPDATE_WAIT_SECONDS]}" || die "Application did not recover after backend update."
+    fi
   fi
-
-  trap - ERR
-  [[ -n "$old_id" ]] && podman rmi "$old_id" >/dev/null 2>&1 || true
-  echo "  OK: NPM refreshed on ${image}"
+  actual=$(podman inspect --format '{{.Image}}' "$CONTAINER")
+  [[ $(image_id "$actual") == "$new_id" ]] || die "Running image differs from target."
+  post_update_checks
+  SWITCHED=0; START_ATTEMPTED=0; APP_STOPPED=0
+  rm -rf -- "$WORK"; WORK=""
+  # Retain the prior image for inspection/recovery. No broad image prune.
+  read_state
+  printf '  Updated %s: %s (%s).\n' "$COMPONENT" "$target" "$new_id"
 }
 
-need_root
-cmd="${1:-}"
-case "$cmd" in
-  update)      shift; update_app "$@" ;;
-  auto-update) auto_update_app ;;
-  version)
-    echo "Configured image: $(current_image)"
-    echo "Running image ID: $(running_image_id)"
-    echo "AUTO_UPDATE=$(env_flag AUTO_UPDATE)"
+[[ $EUID == 0 ]] || die "Run as root inside the npm CT."
+for command in podman systemctl curl awk sed sort head cat stat grep mktemp cp chmod mv rm flock timeout python3 ss; do
+  command -v "$command" >/dev/null || die "Missing command: $command"
+done
+[[ -f $ENV_FILE ]] || die "Missing $ENV_FILE."
+exec 9>"$LOCK"
+flock -n 9 || die "Another maintenance operation is running."
+YES=0
+ARGS=()
+for arg in "$@"; do
+  case $arg in --yes|-y) YES=1 ;; *) ARGS+=("$arg") ;; esac
+done
+set -- "${ARGS[@]}"
+cmd=${1:---help}
+read_state
+case $cmd in
+  update)
+    (( $# <= 2 )) || die "Usage: $0 $cmd [tag] [--yes]"
+    if (( YES == 0 )); then
+      exec 8</dev/tty || die "Interactive terminal or --yes is required."
+    fi
+    case $cmd in
+      update) update_component APP "${2:-}" ;;
+    esac
     ;;
-  ""|-h|--help) usage ;;
-  *) usage; die "Unknown command: $cmd" ;;
+  auto-update)
+    (( $# == 1 )) || die "auto-update takes no tag."
+    [[ ${STATE[AUTO_UPDATE]} == 1 ]] || { printf '  Auto-update is disabled.\n'; exit 0; }
+    YES=1
+    for component in APP; do
+      update_component "$component"
+    done
+    ;;
+  check)
+    (( $# <= 2 )) && [[ ${2:-} == "" || ${2:-} == --initial ]] || die "Usage: $0 check [--initial]"
+    /usr/local/sbin/npm-ufw-check
+    budget=${STATE[UPDATE_WAIT_SECONDS]}
+    [[ ${2:-} != --initial ]] || budget=${STATE[INITIAL_WAIT_SECONDS]}
+    for component in APP; do
+      select_component "$component"
+      load_unit
+      if [[ ${2:-} == --initial ]]; then
+        [[ $(systemctl show "$SERVICE" -p NRestarts --value) == 0 ]] || die "$SERVICE restarted during initial startup."
+      fi
+      wait_service "$CONTAINER" "$KIND" "$budget" || die "$SERVICE failed readiness or restarted."
+      actual=$(podman inspect --format '{{.Image}}' "$CONTAINER")
+      [[ $(image_id "$actual") == "$OLD_ID" ]] || die "Running/configured image mismatch: $SERVICE"
+    done
+    /usr/local/sbin/npm-ufw-check
+    printf '  Admin API, proxy listeners, stable restart counts, image IDs and expected UFW source rules passed.\n'
+    ;;
+  version)
+    (( $# == 1 )) || die "version takes no argument."
+    for component in APP; do
+      select_component "$component"; load_unit
+      printf '  %s\n    tag: %s\n    configured ID: %s\n    running ID: ' "$CONTAINER" "$OLD_TAG" "$OLD_ID"
+      podman inspect --format '{{.Image}}' "$CONTAINER" || true
+    done
+    ;;
+  --help|-h|'')
+    printf 'Usage: %s update [tag] [--yes] | auto-update | check [--initial] | version\n' "$0"
+    printf '  Exact image IDs; one component per operation; PBS/PVE handles data recovery.\n'
+    printf '  Fresh-creator helper: do not replace an older deployed helper without migrating its control files.\n'
+    ;;
+  *) die "Unknown command: $cmd" ;;
 esac
 MAINT
-echo "  Maintenance script deployed: /usr/local/bin/npm-maint.sh"
+pct push "$CT_ID" "$tmp" /usr/local/bin/npm-maint.sh --perms 0755
+rm -f -- "$tmp"
 
 # ── Start via Quadlet ─────────────────────────────────────────────────────────
-# daemon-reload triggers the Quadlet generator which produces npm.service
-# as a transient systemd unit. WantedBy=multi-user.target handles boot restarts.
-# Transient units cannot be systemctl-enabled; daemon-reload is sufficient.
-pct exec "$CT_ID" -- bash -lc "
-  set -euo pipefail
-  systemctl daemon-reload
-  systemctl start '${QUADLET_SERVICE}'
-"
-
-# ── Disarm destructive cleanup ────────────────────────────────────────────────
+pct exec "$CT_ID" -- bash -s -- npm <<'QUADLET_VALIDATE'
+set -euo pipefail
+output=$(mktemp)
+trap 'rm -f -- "$output"' EXIT
+/usr/lib/systemd/system-generators/podman-system-generator --dryrun > "$output"
+for service in "$@"; do
+  grep -Fq "$service.service" "$output" || { echo "ERROR: Quadlet generator omitted $service." >&2; exit 1; }
+done
+systemctl daemon-reload
+for service in "$@"; do
+  [[ $(systemctl show "$service.service" -p LoadState --value) == loaded ]] || exit 1
+done
+QUADLET_VALIDATE
+pct exec "$CT_ID" -- /usr/local/sbin/npm-ufw-check
+# Preserve the CT even if the first persistent start fails partway through.
 CLEANUP_ON_FAIL=0
+pct exec "$CT_ID" -- systemctl start npm.service
+
+# Destructive cleanup was disarmed before the first persistent service start.
 
 # ── Verification ──────────────────────────────────────────────────────────────
-sleep 3
+sleep 30
+if ! pct exec "$CT_ID" -- /usr/local/bin/npm-maint.sh check --initial; then
+  echo "ERROR: Initial readiness/image/firewall verification failed; CT $CT_ID is preserved." >&2
+  exit 1
+fi
 VERIFY_FAIL=0
 
 if pct exec "$CT_ID" -- systemctl is-active --quiet "${QUADLET_SERVICE}" 2>/dev/null; then
@@ -876,41 +1300,34 @@ if [[ "$INSTALL_CLOUDFLARED" -eq 1 && -n "$TUNNEL_TOKEN" ]]; then
 fi
 
 # ── Auto-update timer (policy-driven) ─────────────────────────────────────────
-pct exec "$CT_ID" -- bash -lc '
-  set -euo pipefail
-  cat > /etc/systemd/system/npm-update.service <<EOF2
+pct exec "$CT_ID" -- bash -s -- "$UPDATE_TIME" <<'TIMER_INSTALL'
+set -euo pipefail
+cat > /etc/systemd/system/npm-update.service <<EOF2
 [Unit]
-Description=NPM auto-update maintenance run
+Description=npm image maintenance
 After=network-online.target
 Wants=network-online.target
-
 [Service]
 Type=oneshot
 ExecStart=/usr/local/bin/npm-maint.sh auto-update
+TimeoutStartSec=infinity
+TimeoutStopSec=180
 EOF2
-
-  cat > /etc/systemd/system/npm-update.timer <<EOF2
+cat > /etc/systemd/system/npm-update.timer <<EOF2
 [Unit]
-Description=NPM auto-update timer
-
+Description=npm daily image maintenance
 [Timer]
-OnCalendar=*-*-01 05:30:00
-OnCalendar=*-*-15 05:30:00
+OnCalendar=*-*-* $1:00
 Persistent=true
-RandomizedDelaySec=300
-
 [Install]
 WantedBy=timers.target
 EOF2
-
-  systemctl daemon-reload
-'
-if [[ "$AUTO_UPDATE" -eq 1 ]]; then
-  pct exec "$CT_ID" -- bash -lc 'systemctl enable --now npm-update.timer'
-  echo "  Auto-update timer enabled"
+systemctl daemon-reload
+TIMER_INSTALL
+if [[ $AUTO_UPDATE == 1 ]]; then
+  pct exec "$CT_ID" -- systemctl enable --now npm-update.timer
 else
-  pct exec "$CT_ID" -- bash -lc 'systemctl disable --now npm-update.timer >/dev/null 2>&1 || true'
-  echo "  Auto-update timer installed but disabled"
+  pct exec "$CT_ID" -- systemctl disable --now npm-update.timer
 fi
 
 # ── Unattended upgrades ───────────────────────────────────────────────────────
@@ -1022,7 +1439,7 @@ printf '  Database:  SQLite (embedded)\\n'
 printf '  Policy:    %s\\n' \"\$([ \"\$auto\" = '1' ] && echo 'auto-update (re-pull pinned tag)' || echo 'pinned (manual)')\"
 printf '  Data:      /opt/npm/data  /opt/npm/letsencrypt\\n'
 printf '  Logs:      journalctl -u npm.service -f\\n'
-printf '  Maintain:  /usr/local/bin/npm-maint.sh [update|auto-update|version]\\n'
+printf '  Maintain:  /usr/local/bin/npm-maint.sh [check|update|auto-update|version]\\n'
 printf '  Updates:   systemctl status npm-update.timer\\n'
 printf '  Admin UI:  http://%s:%s/\\n' \"\${ip:-n/a}\" \"\$port\"
 printf '  Proxy:     :80 / :443 on %s\\n' \"\${ip:-n/a}\"
@@ -1064,6 +1481,52 @@ pct set "$CT_ID" --description "$NPM_DESC"
 # ── Protect container ─────────────────────────────────────────────────────────
 pct set "$CT_ID" --protection 1
 
+
+cat <<OPERATIONS
+
+  NPM — OPERATIONS
+
+  CONTAINER     $HN | CT $CT_ID | $CT_IP
+  ADMIN         http://$CT_IP:$APP_PORT/
+  ADMIN SOURCES $FIREWALL_ACCESS_LABEL
+  FIREWALL      UFW inside the CT, IPv4 and IPv6; no PVE firewall dependency
+  PROXY SOURCES TCP 80/443: $NPM_PUBLIC_ACCESS_LABEL
+  SOURCE POLICY /etc/ufw/npm-expected-sources.conf
+  AUTO-UPDATE   $AUTO_UPDATE | daily $UPDATE_TIME ($APP_TZ)
+  IMAGES        exact local IDs, Pull=never; old images retained for review
+
+  RUN ON THE PROXMOX HOST
+    pct enter $CT_ID
+    pct exec $CT_ID -- /usr/local/bin/npm-maint.sh version
+
+  RUN INSIDE THE CT
+    /usr/local/bin/npm-maint.sh check
+    /usr/local/bin/npm-maint.sh update $APP_TAG
+    ufw status verbose
+    journalctl -u npm.service --no-pager -n 80
+
+  STREAMS       Add UFW rules for any TCP/UDP stream ports you configure.
+
+  ACCESS CHECK
+    Test proxy ports 80/443 from your intended LAN/VPN client or tunnel connector.
+    Test admin TCP $APP_PORT from your administrator device.
+    If you restricted sources, also test each port group from outside its list.
+    These checks do not audit all additional rules or prove the full network path.
+    Add/delete UFW rules directly; do not restart ufw.service while apps run.
+    When changing these source choices, update /etc/ufw/npm-expected-sources.conf
+    to match (one TCP port and source per line), then run:
+      /usr/local/bin/npm-maint.sh check
+    Editing that policy file alone does not change UFW access.
+
+  RECOVERY
+    Verify a matching PBS/PVE checkpoint before updates; --yes only skips prompts.
+    If FUSE is enabled, use stop-mode PBS. Back up external bind mounts separately.
+    For persistent components, failed updates retain the target after it may start.
+    The helper changes one component at a time; earlier successes remain applied.
+    Creators build new CTs. Existing CTs require a reviewed control-file migration.
+
+OPERATIONS
+
 # ── Summary ───────────────────────────────────────────────────────────────────
 echo ""
 echo "    CT: $CT_ID | IP: ${CT_IP} | Admin: http://${CT_IP}:${APP_PORT}/"
@@ -1085,7 +1548,7 @@ echo "    Backup/restore: use PBS or PVE snapshots"
 echo ""
 echo "    First visit to the admin UI opens the setup wizard to create the admin account."
 echo "    Proxy hosts (from another CT): http | <ct-ip>:<port> | enable Websockets Support where needed"
-echo "    Ports 80, 443 and ${APP_PORT} listen on all CT interfaces (Network=host) — restrict ${APP_PORT} with the PVE firewall if needed."
+echo "    Ports 80, 443 and ${APP_PORT} use Network=host; admin and proxy sources are controlled separately by UFW."
 echo "    2.15.x note: Debian Trixie base + new Certbot — verify DNS-challenge cert renewals after upgrading from 2.14."
 if [[ "$PODMAN_FUSE_OVERLAY" -eq 1 ]]; then
   echo "    Backups: fuse=1 + fuse-overlayfs can deadlock under snapshot-mode vzdump/PBS (freezer)."
