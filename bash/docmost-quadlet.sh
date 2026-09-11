@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
 set -Eeo pipefail
+umask 022
+export LC_ALL=C
+# Safety revision: 2026-09-11. Fresh Proxmox CT creator; maintenance runs inside the CT.
+# Verification fix: privileged PostgreSQL settings are checked as postgres.
 
 # ── Config ────────────────────────────────────────────────────────────────────
 CT_ID=""                             # empty = auto-assign via pvesh; set e.g. CT_ID=120 to pin
@@ -22,17 +26,17 @@ TAGS="docmost;podman;quadlet;lxc"
 
 # Images / versions
 # Docmost: full version (default) from https://hub.docker.com/r/docmost/docmost/tags
-# or "latest" to track upstream. Floating minors (0.95) are rejected.
+# floating tags are rejected. Floating minors (0.95) are rejected.
 APP_IMAGE_REPO="docker.io/docmost/docmost"
-APP_TAG="0.95.0"                     # full version like 0.95.0, or "latest"
+APP_TAG="0.95.0"                     # full version like 0.95.0
 # PostgreSQL: MAJOR.MINOR only (18.6). "latest" and major-only tags are rejected —
 # a major jump (18 → 19) cannot start on the old data directory and needs
 # pg_upgrade / dump+restore, which this script does not automate.
 POSTGRES_IMAGE_REPO="docker.io/library/postgres"
 POSTGRES_TAG="18.6"                  # MAJOR.MINOR like 18.6 (optional -trixie/-alpine suffix)
-# Redis: full version (default) or "latest". Major-only tags (8) are rejected.
+# Redis: pinned full version. Major-only tags (8) are rejected.
 REDIS_IMAGE_REPO="docker.io/library/redis"
-REDIS_TAG="8.10.1"                   # full version like 8.10.1, or "latest"
+REDIS_TAG="8.10.1"                   # full version like 8.10.1
 DEBIAN_VERSION=13
 
 # Auto-update policy
@@ -40,7 +44,7 @@ DEBIAN_VERSION=13
 #   docmost-maint.sh update <tag> / update-postgres <tag> / update-redis <tag>
 # AUTO_UPDATE=1: docmost-update.timer re-pulls the CURRENT tags of all three
 #   images daily at UPDATE_TIME and restarts only the services whose image ID
-#   changed; a failed health check rolls back to the previous images.
+#   changed; stateful failures retain the target after startup.
 AUTO_UPDATE=0
 UPDATE_TIME="03:00"                  # local CT time (APP_TZ), HH:MM; timer runs daily
 
@@ -61,6 +65,17 @@ EXTRA_PACKAGES=(
 # Behavior
 CLEANUP_ON_FAIL=1
 
+
+# Service verification and in-CT firewall
+INITIAL_WAIT_SECONDS=180
+UPDATE_WAIT_SECONDS=1800             # permit migrations; a timeout does not stop the app
+# Bare IPs (192.168.1.20) or network CIDRs (192.168.1.0/24).
+# Empty array prompts before CT creation; pressing Enter allows any source
+# on APP_PORT (IPv4/IPv6). UFW stays enabled. Set client/NPM sources to restrict.
+UFW_ALLOWED_SOURCES=()
+SCRIPT_URL="https://raw.githubusercontent.com/vdarkobar/scripts/main/bash/docmost-quadlet.sh"
+SCRIPT_LOCAL="/root/docmost-quadlet.sh"
+
 # Derived
 APP_DIR="/opt/docmost"
 APP_IMAGE="${APP_IMAGE_REPO}:${APP_TAG}"
@@ -78,6 +93,10 @@ APP_URL=""
 [[ -n "$APP_FQDN" ]] && APP_URL="https://${APP_FQDN}"
 
 # ── Custom configs created by this script ─────────────────────────────────────
+#   /usr/local/sbin/docmost-ufw-check                  (service-start firewall guard)
+#   /etc/default/ufw, /etc/ufw/ufw.conf               (in-CT IPv4/IPv6 policy)
+#   /etc/ufw/user.rules, /etc/ufw/user6.rules         (configured source allows)
+#   /opt/docmost/postgres-init/10-docmost.sh        (restricted application role bootstrap)
 #   /etc/containers/systemd/docmost.container           (Quadlet unit — source of truth)
 #   /etc/containers/systemd/docmost-postgres.container  (Quadlet unit — PostgreSQL, loopback only)
 #   /etc/containers/systemd/docmost-redis.container     (Quadlet unit — Redis, loopback only)
@@ -99,12 +118,12 @@ APP_URL=""
 
 # ── Config validation ─────────────────────────────────────────────────────────
 [[ "$HN" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$ ]] || { echo "  ERROR: HN is not a valid hostname: $HN" >&2; exit 1; }
-[[ "$CPU" =~ ^[0-9]+$ ]] && (( CPU >= 1 )) || { echo "  ERROR: CPU must be a positive integer." >&2; exit 1; }
-[[ "$RAM" =~ ^[0-9]+$ ]] && (( RAM >= 1024 )) || { echo "  ERROR: RAM must be >= 1024 MB (Node app + PostgreSQL + Redis)." >&2; exit 1; }
-[[ "$DISK" =~ ^[0-9]+$ ]] && (( DISK >= 4 )) || { echo "  ERROR: DISK must be >= 4 GB." >&2; exit 1; }
-[[ "$DEBIAN_VERSION" =~ ^[0-9]+$ ]] || { echo "  ERROR: DEBIAN_VERSION must be numeric." >&2; exit 1; }
-[[ "$APP_PORT" =~ ^[0-9]+$ ]] || { echo "  ERROR: APP_PORT must be numeric." >&2; exit 1; }
-(( APP_PORT >= 1 && APP_PORT <= 65535 )) || { echo "  ERROR: APP_PORT must be between 1 and 65535." >&2; exit 1; }
+[[ "$CPU" =~ ^(0|[1-9][0-9]*)$ ]] && (( CPU >= 1 )) || { echo "  ERROR: CPU must be a positive integer." >&2; exit 1; }
+[[ "$RAM" =~ ^(0|[1-9][0-9]*)$ ]] && (( RAM >= 1024 )) || { echo "  ERROR: RAM must be >= 1024 MB (Node app + PostgreSQL + Redis)." >&2; exit 1; }
+[[ "$DISK" =~ ^(0|[1-9][0-9]*)$ ]] && (( DISK >= 4 )) || { echo "  ERROR: DISK must be >= 4 GB." >&2; exit 1; }
+[[ "$DEBIAN_VERSION" == 13 ]] || { echo "  ERROR: This creator requires Debian 13." >&2; exit 1; }
+[[ "$APP_PORT" =~ ^(0|[1-9][0-9]*)$ ]] || { echo "  ERROR: APP_PORT must be numeric." >&2; exit 1; }
+(( APP_PORT >= 1024 && APP_PORT <= 65535 )) || { echo "  ERROR: APP_PORT must be between 1024 and 65535." >&2; exit 1; }
 (( APP_PORT != 5432 && APP_PORT != 6379 )) || { echo "  ERROR: APP_PORT collides with PostgreSQL (5432) or Redis (6379) on the shared host network." >&2; exit 1; }
 [[ "$AUTO_UPDATE" =~ ^[01]$ ]] || { echo "  ERROR: AUTO_UPDATE must be 0 or 1." >&2; exit 1; }
 [[ "$DOCMOST_DISABLE_TELEMETRY" =~ ^[01]$ ]] || { echo "  ERROR: DOCMOST_DISABLE_TELEMETRY must be 0 or 1." >&2; exit 1; }
@@ -117,20 +136,20 @@ for v in APP_IMAGE_REPO POSTGRES_IMAGE_REPO REDIS_IMAGE_REPO; do
     exit 1
   }
 done
-# Docmost: "latest" or full version (0.95.0, 0.96.0-beta-2). Floating minors (0.95) are rejected.
-[[ "$APP_TAG" == "latest" || "$APP_TAG" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9._-]+)?$ ]] || {
-  echo "  ERROR: APP_TAG must be 'latest' or a full version like 0.95.0 (floating tags like 0.95 are not accepted)." >&2
+# Docmost: pinned full version (0.95.0, 0.96.0-beta-2). Floating minors (0.95) are rejected.
+[[ "$APP_TAG" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9._-]+)?$ ]] || {
+  echo "  ERROR: APP_TAG must be a pinned full version like 0.95.0 (floating tags like 0.95 are not accepted)." >&2
   exit 1
 }
 # PostgreSQL: MAJOR.MINOR (18.6), optional variant suffix. No "latest", no major-only:
 # a silent major bump would leave a cluster the new binaries cannot open.
-[[ "$POSTGRES_TAG" =~ ^[0-9]+\.[0-9]+(-[A-Za-z0-9.]+)?$ ]] || {
+[[ "$POSTGRES_TAG" =~ ^18\.[0-9]+(-[A-Za-z0-9.]+)?$ ]] || {
   echo "  ERROR: POSTGRES_TAG must be MAJOR.MINOR like 18.6 — 'latest' and major-only tags (18) are not accepted." >&2
   exit 1
 }
-# Redis: "latest" or full version (8.10.1). Major-only tags (8) are rejected.
-[[ "$REDIS_TAG" == "latest" || "$REDIS_TAG" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9._-]+)?$ ]] || {
-  echo "  ERROR: REDIS_TAG must be 'latest' or a full version like 8.10.1 (floating tags like 8 are not accepted)." >&2
+# Redis: pinned full version (8.10.1). Major-only tags (8) are rejected.
+[[ "$REDIS_TAG" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9._-]+)?$ ]] || {
+  echo "  ERROR: REDIS_TAG must be a pinned full version like 8.10.1 (floating tags like 8 are not accepted)." >&2
   exit 1
 }
 [[ "$FILE_UPLOAD_SIZE_LIMIT" =~ ^[0-9]+(kb|mb|gb)$ ]] || { echo "  ERROR: FILE_UPLOAD_SIZE_LIMIT must look like 50mb or 1gb." >&2; exit 1; }
@@ -145,6 +164,13 @@ fi
 for pkg in "${EXTRA_PACKAGES[@]}"; do
   [[ "$pkg" =~ ^[a-z0-9][a-z0-9+.-]*$ ]] || { echo "  ERROR: Invalid package name in EXTRA_PACKAGES: $pkg" >&2; exit 1; }
 done
+
+
+for wait_var in INITIAL_WAIT_SECONDS UPDATE_WAIT_SECONDS; do
+  [[ ${!wait_var} =~ ^[1-9][0-9]{1,4}$ ]] && (( ${!wait_var} >= 30 && ${!wait_var} <= 86400 )) \
+    || { echo "ERROR: $wait_var must be 30..86400 seconds." >&2; exit 1; }
+done
+[[ $UPDATE_TIME =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]] || { echo "ERROR: Invalid UPDATE_TIME." >&2; exit 1; }
 
 # ── Trap cleanup ──────────────────────────────────────────────────────────────
 # rc is captured before the trap is reset; $LINENO is the failing line at top
@@ -162,7 +188,8 @@ trap 'rc=$?;
   exit "$rc"
 ' ERR
 
-trap 'rc=$?;
+trap 'rc=130;
+  trap - ERR INT TERM HUP
   echo "  Interrupted (rc=$rc)" >&2
   echo "  Command: $BASH_COMMAND" >&2
   if [[ "${CLEANUP_ON_FAIL:-0}" -eq 1 && "${CREATED:-0}" -eq 1 ]]; then
@@ -171,18 +198,22 @@ trap 'rc=$?;
     pct destroy "${CT_ID}" >/dev/null 2>&1 || true
   fi
   exit "$rc"
-' INT TERM
+' INT TERM HUP
 
 # ── Preflight — root & commands ───────────────────────────────────────────────
 [[ "$(id -u)" -eq 0 ]] || { echo "  ERROR: Run as root on the Proxmox host." >&2; exit 1; }
 
-for cmd in pvesh pveam pct pvesm qm curl python3 ip awk grep sed sort paste seq readlink cp chmod dpkg head tr; do
+for cmd in pvesh pveam pct pvesm qm curl python3 ip awk grep sed sort paste seq readlink cp chmod dpkg head tr flock mktemp mv rm tail bash stat timeout; do
   command -v "$cmd" >/dev/null 2>&1 || { echo "  ERROR: Missing required command: $cmd" >&2; exit 1; }
 done
 
 # pveam lists templates for more than one CPU architecture. Selecting only by
 # Debian version can pick an ARM64 rootfs on an AMD64 host (or vice versa),
 # which creates successfully but fails when LXC executes /sbin/init.
+# Serialize this creator before assigning an ID or checking its hostname.
+exec 7>/run/lock/docmost-creator.lock
+flock -n 7 || { echo "ERROR: Another docmost creator is running." >&2; exit 1; }
+
 HOST_ARCH="$(dpkg --print-architecture)"
 case "$HOST_ARCH" in
   amd64|arm64) ;;
@@ -196,8 +227,10 @@ if ! exec 8</dev/tty; then
   exit 1
 fi
 
+[[ -t 8 ]] || { echo "ERROR: Prompt input must be a terminal." >&2; exit 1; }
+
 if [[ -n "$CT_ID" ]]; then
-  [[ "$CT_ID" =~ ^[0-9]+$ ]] && (( CT_ID >= 100 && CT_ID <= 999999999 )) \
+  [[ "$CT_ID" =~ ^(0|[1-9][0-9]*)$ ]] && (( CT_ID >= 100 && CT_ID <= 999999999 )) \
     || { echo "  ERROR: CT_ID must be an integer >= 100." >&2; exit 1; }
   if pct status "$CT_ID" >/dev/null 2>&1 || qm status "$CT_ID" >/dev/null 2>&1; then
     echo "  ERROR: CT_ID $CT_ID is already in use on this node." >&2
@@ -214,7 +247,7 @@ fi
 EXISTING_CT="$(pct list 2>/dev/null | awk -v h="$HN" 'NR>1 && $NF==h {print $1}' | head -n1)"
 if [[ -n "$EXISTING_CT" ]]; then
   echo "  ERROR: A CT with hostname '${HN}' already exists on this node (CT ${EXISTING_CT})." >&2
-  echo "  Destroy it (pct set ${EXISTING_CT} --protection 0; pct destroy ${EXISTING_CT}) or change HN, then re-run." >&2
+  echo "  Fresh creator: use the existing CT maintenance helper, or review the retained CT before removing it." >&2
   exit 1
 fi
 
@@ -248,11 +281,11 @@ cat <<EOF2
   Telemetry:         $([ "$DOCMOST_DISABLE_TELEMETRY" -eq 1 ] && echo "disabled" || echo "enabled (upstream default)")
   Timezone:          $APP_TZ
   FQDN:              $([ -n "$APP_FQDN" ] && echo "$APP_FQDN (APP_URL=https://${APP_FQDN})" || echo "(no public FQDN — APP_URL=http://<CT-IP>:${APP_PORT})")
-  Listens on:        0.0.0.0:${APP_PORT} inside the CT (Network=host) — reachable from the whole LAN
+  Listens on:        0.0.0.0:${APP_PORT} inside the CT (Network=host) — access follows the UFW source choice below
   Podman storage:    $([ "$PODMAN_FUSE_OVERLAY" -eq 1 ] && echo "fuse-overlayfs (fuse=1)" || echo "native overlay (no FUSE)")
   Tags:              $TAGS
   Auto-update:       $([ "$AUTO_UPDATE" -eq 1 ] && echo "enabled — daily at ${UPDATE_TIME} (re-pull ${APP_TAG} / ${POSTGRES_TAG} / ${REDIS_TAG})" || echo "disabled (${APP_TAG} / ${POSTGRES_TAG} / ${REDIS_TAG}, manual)")
-  Cleanup on fail:   $CLEANUP_ON_FAIL (until first service start; CT preserved after that)
+  Cleanup on fail:   $CLEANUP_ON_FAIL (disarmed before first persistent start)
   ────────────────────────────────────────
   To change defaults, press Enter and
   edit the Config section at the top of
@@ -260,38 +293,91 @@ cat <<EOF2
 
 EOF2
 
-SCRIPT_URL="https://raw.githubusercontent.com/vdarkobar/scripts/main/bash/docmost-quadlet.sh"
-SCRIPT_LOCAL="/root/docmost-quadlet.sh"
 SCRIPT_SELF="$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")"
 
-read -r -p "  Continue with these settings? [y/N]: " response <&8
+response=""
+read -r -p "  Continue with these settings? [y/N]: " response <&8 || response=""
 case "$response" in
   [yY][eE][sS]|[yY]) ;;
   *)
     echo ""
-    echo "  Saving current script to ${SCRIPT_LOCAL} for editing..."
-    # Shebang check: when run as 'curl | bash', $0 is the bash binary, not this script.
-    if [[ -f "$SCRIPT_SELF" ]] && head -n1 "$SCRIPT_SELF" 2>/dev/null | grep -q '^#!/usr/bin/env bash$' \
-      && cp -f -- "$SCRIPT_SELF" "$SCRIPT_LOCAL"; then
-      chmod +x "$SCRIPT_LOCAL"
-      echo "  Edit:  nano ${SCRIPT_LOCAL}"
-      echo "  Run:   bash ${SCRIPT_LOCAL}"
-      echo ""
-    elif curl -fsSL "$SCRIPT_URL" -o "$SCRIPT_LOCAL"; then
-      chmod +x "$SCRIPT_LOCAL"
-      echo "  WARNING: Could not copy the running script; downloaded fallback from GitHub instead."
-      echo "  Edit:  nano ${SCRIPT_LOCAL}"
-      echo "  Run:   bash ${SCRIPT_LOCAL}"
-      echo ""
+    echo "  Keeping an editable script copy..."
+    if [[ -f "$SCRIPT_SELF" ]] && head -n 1 "$SCRIPT_SELF" | grep -q '^#!/usr/bin/env bash$'; then
+      # The running local file is already the correct editable copy. In particular,
+      # never cp a file onto itself and then fetch a replacement over user edits.
+      echo "  Edit: nano $SCRIPT_SELF"
+      echo "  Run:  bash $SCRIPT_SELF"
     else
-      echo "  ERROR: Failed to save a local editable copy of the script." >&2
-      exit 1
+      [[ ! -e $SCRIPT_LOCAL ]] || SCRIPT_LOCAL="/root/docmost-quadlet-downloaded.$$.sh"
+      DOWNLOAD_TEMP=$(mktemp /root/docmost-download.XXXXXX)
+      if curl -fLsS --retry 3 --connect-timeout 10 --max-time 120 "$SCRIPT_URL" -o "$DOWNLOAD_TEMP" \
+        && head -n 1 "$DOWNLOAD_TEMP" | grep -q '^#!/usr/bin/env bash$' \
+        && bash -n "$DOWNLOAD_TEMP"; then
+        chmod 0700 "$DOWNLOAD_TEMP"
+        mv -T "$DOWNLOAD_TEMP" "$SCRIPT_LOCAL"
+        echo "  Downloaded a separate upstream copy; it may differ from the piped script."
+        echo "  Edit: nano $SCRIPT_LOCAL"
+      else
+        rm -f -- "$DOWNLOAD_TEMP"
+        echo "  ERROR: Could not save a validated upstream copy. Existing files were preserved." >&2
+        exit 1
+      fi
     fi
     exit 0
     ;;
 esac
 
 echo ""
+
+
+# ── Firewall access sources ───────────────────────────────────────────────────
+# Enter NPM host addresses for proxy-only access, or client subnets for direct
+# LAN access. Enter without sources opens only APP_PORT, not the whole firewall.
+FIREWALL_ACCESS_LABEL=""
+if (( ${#UFW_ALLOWED_SOURCES[@]} == 0 )); then
+  cat <<FIREWALL_HELP
+  Firewall access for TCP $APP_PORT:
+
+    One device:       192.168.1.20
+    Whole subnet:     192.168.1.0/24
+    Multiple sources: 192.168.1.20 192.168.2.0/24
+    IPv6 examples:    fd00::20 or fd00::/64
+
+  CIDR format: network-address/prefix-length
+  Example: 192.168.1.0/24 covers the 192.168.1.x subnet.
+  Use the network address (no host bits); replace examples with your addresses.
+
+  Press Enter to allow any source on TCP $APP_PORT (IPv4 and IPv6).
+  UFW stays enabled. Any source includes the internet if this CT is reachable.
+
+FIREWALL_HELP
+  if ! read -r -p "  Allowed sources (space-separated) [Enter = any]: " firewall_input <&8; then
+    echo "ERROR: Firewall input interrupted; no access policy selected." >&2
+    exit 1
+  fi
+  read -r -a UFW_ALLOWED_SOURCES <<< "$firewall_input"
+  if (( ${#UFW_ALLOWED_SOURCES[@]} == 0 )); then
+    UFW_ALLOWED_SOURCES=("0.0.0.0/0" "::/0")
+    FIREWALL_ACCESS_LABEL="Any source (IPv4 and IPv6)"
+  fi
+fi
+if ! python3 - "${UFW_ALLOWED_SOURCES[@]}"  <<'FIREWALL_VALIDATE'
+import ipaddress, sys
+for value in sys.argv[1:]:
+    try:
+        network = ipaddress.ip_network(value, strict=True)
+    except ValueError:
+        print(f"ERROR: Invalid firewall source {value!r}. Use a host IP (192.168.1.20) or network CIDR (192.168.1.0/24, no host bits).", file=sys.stderr)
+        sys.exit(1)
+    if network.network_address.is_multicast or network.network_address.is_loopback:
+        print(f"ERROR: Expected a client/proxy source, got {value!r}.", file=sys.stderr)
+        sys.exit(1)
+FIREWALL_VALIDATE
+then
+  exit 1
+fi
+FIREWALL_ACCESS_LABEL="${FIREWALL_ACCESS_LABEL:-${UFW_ALLOWED_SOURCES[*]}}"
+echo "  UFW TCP $APP_PORT allowed sources: $FIREWALL_ACCESS_LABEL"
 
 # ── Preflight — environment ───────────────────────────────────────────────────
 pvesm status | awk -v s="$TEMPLATE_STORAGE" '$1==s{f=1} END{exit(!f)}' \
@@ -331,6 +417,8 @@ DB_PASSWORD="$(head -c 4096 /dev/urandom | tr -dc 'A-Za-z0-9' | head -c 40)"
 APP_SECRET="$(head -c 4096 /dev/urandom | tr -dc 'a-f0-9' | head -c 64)"
 set -o pipefail
 [[ ${#DB_PASSWORD} -eq 40 && ${#APP_SECRET} -eq 64 ]] || { echo "  ERROR: Failed to generate secrets." >&2; exit 1; }
+
+PG_ADMIN_PASSWORD="$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
 
 # ── Template discovery & download ─────────────────────────────────────────────
 pveam update
@@ -378,7 +466,7 @@ CREATED=1
 # ── Start & wait for IPv4 ─────────────────────────────────────────────────────
 pct start "$CT_ID"
 CT_IP=""
-for i in $(seq 1 30); do
+for i in $(seq 1 60); do
   CT_IP="$(pct exec "$CT_ID" -- sh -lc '
     ip -4 -o addr show scope global 2>/dev/null | awk "{print \$4}" | cut -d/ -f1 | head -n1
   ' 2>/dev/null || true)"
@@ -418,7 +506,7 @@ pct exec "$CT_ID" -- bash -lc "
   set -euo pipefail
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -qq
-  apt-get install -y locales curl ca-certificates iproute2 podman tar gzip ${PODMAN_FUSE_PKG}
+  apt-get install -y locales curl ca-certificates iproute2 python3 ufw iptables util-linux podman tar gzip ${PODMAN_FUSE_PKG}
   sed -i 's/^# *en_US.UTF-8/en_US.UTF-8/' /etc/locale.gen
   locale-gen
   update-locale LANG=en_US.UTF-8
@@ -435,6 +523,62 @@ pct exec "$CT_ID" -- bash -lc '
   apt-get purge -y openssh-server postfix 2>/dev/null || true
   apt-get -y autoremove
 '
+
+# ── UFW inside the CT ─────────────────────────────────────────────────────────
+# Fresh CT only. Network=host uses this CT's INPUT chain.
+pct exec "$CT_ID" -- bash -s -- "$APP_PORT" "${UFW_ALLOWED_SOURCES[@]}" <<'UFWSETUP'
+set -euo pipefail
+export LC_ALL=C
+port=$1; shift
+(( $# > 0 )) || { echo "ERROR: No allowed source addresses."; false; }
+iptables -w 5 -S INPUT >/dev/null
+ip6tables -w 5 -S INPUT >/dev/null
+ufw --force reset
+sed -i 's/^IPV6=.*/IPV6=yes/' /etc/default/ufw
+grep -qx 'IPV6=yes' /etc/default/ufw
+# The creator owns sysctl hardening; avoid a second writer in ufw-init.
+grep -q '^IPT_SYSCTL=' /etc/default/ufw
+sed -i 's|^IPT_SYSCTL=.*|IPT_SYSCTL=|' /etc/default/ufw
+ufw default deny incoming
+ufw default allow outgoing
+ufw default deny routed
+ufw logging off
+for source in "$@"; do
+  ufw allow in proto tcp from "$source" to any port "$port"
+done
+ufw --force enable
+systemctl enable ufw.service
+systemctl restart ufw.service
+for source in "$@"; do
+  tool=iptables; prefix=ufw
+  if [[ $source == *:* ]]; then tool=ip6tables; prefix=ufw6; fi
+  "$tool" -w 5 -C "$prefix-user-input" -s "$source" -p tcp -m tcp --dport "$port" -j ACCEPT
+done
+UFWSETUP
+
+tmp=$(mktemp)
+cat > "$tmp" <<'UFWCHECK'
+#!/usr/bin/env bash
+set -euo pipefail
+export LC_ALL=C
+# Startup guard: active filtering and default-deny in both address families.
+# Installation verifies specific allow rules; test access from client hosts too.
+grep -qx 'ENABLED=yes' /etc/ufw/ufw.conf
+grep -qx 'IPV6=yes' /etc/default/ufw
+status=$(/usr/sbin/ufw status)
+grep -qx 'Status: active' <<< "$status"
+for tool in /usr/sbin/iptables /usr/sbin/ip6tables; do
+  prefix=ufw
+  [[ ${tool##*/} != ip6tables ]] || prefix=ufw6
+  rules=$("$tool" -w 5 -S INPUT)
+  grep -qx -- '-P INPUT DROP' <<< "$rules"
+  "$tool" -w 5 -C INPUT -j "$prefix-before-input"
+  "$tool" -w 5 -S "$prefix-user-input" >/dev/null
+done
+UFWCHECK
+pct push "$CT_ID" "$tmp" /usr/local/sbin/docmost-ufw-check --perms 0755
+rm -f -- "$tmp"
+pct exec "$CT_ID" -- /usr/local/sbin/docmost-ufw-check
 
 # ── Podman configuration ──────────────────────────────────────────────────────
 OVERLAY_OPTIONS=""
@@ -482,20 +626,30 @@ for img in "$POSTGRES_IMAGE" "$REDIS_IMAGE" "$APP_IMAGE"; do
   "
 done
 
+
+# ── Resolve immutable runtime images ──────────────────────────────────────────
+for component in POSTGRES REDIS APP; do
+  reference_var=${component}_IMAGE
+  resolved=$(pct exec "$CT_ID" -- podman image inspect --format '{{.Id}}' "${!reference_var}")
+  resolved=${resolved#sha256:}
+  [[ $resolved =~ ^[a-f0-9]{64}$ ]] || { echo "ERROR: Invalid image ID for $component." >&2; false; }
+  printf -v "${component}_IMAGE_ID" 'sha256:%s' "$resolved"
+done
+
 # ── Detect container UIDs/GIDs for bind mounts ────────────────────────────────
 # Each image drops privileges to its own service user before touching the
 # mount (postgres → postgres, redis → redis via gosu, docmost → node via USER).
 # Bind mounts must be owned by those UIDs as seen from inside the LXC; read
 # them from the images instead of hardcoding 999/1000.
-POSTGRES_UID="$(pct exec "$CT_ID" -- podman run --rm --entrypoint sh "$POSTGRES_IMAGE" -c 'id -u postgres 2>/dev/null || id -u' 2>/dev/null | tr -d '\r')"
-POSTGRES_GID="$(pct exec "$CT_ID" -- podman run --rm --entrypoint sh "$POSTGRES_IMAGE" -c 'id -g postgres 2>/dev/null || id -g' 2>/dev/null | tr -d '\r')"
-REDIS_UID="$(pct exec "$CT_ID" -- podman run --rm --entrypoint sh "$REDIS_IMAGE" -c 'id -u redis 2>/dev/null || id -u' 2>/dev/null | tr -d '\r')"
-REDIS_GID="$(pct exec "$CT_ID" -- podman run --rm --entrypoint sh "$REDIS_IMAGE" -c 'id -g redis 2>/dev/null || id -g' 2>/dev/null | tr -d '\r')"
-DOCMOST_UID="$(pct exec "$CT_ID" -- podman run --rm --entrypoint sh "$APP_IMAGE" -c 'id -u node 2>/dev/null || id -u' 2>/dev/null | tr -d '\r')"
-DOCMOST_GID="$(pct exec "$CT_ID" -- podman run --rm --entrypoint sh "$APP_IMAGE" -c 'id -g node 2>/dev/null || id -g' 2>/dev/null | tr -d '\r')"
+POSTGRES_UID="$(pct exec "$CT_ID" -- podman run --rm --pull=never --network none --entrypoint sh "$POSTGRES_IMAGE_ID" -c 'id -u postgres' 2>/dev/null | tr -d '\r')"
+POSTGRES_GID="$(pct exec "$CT_ID" -- podman run --rm --pull=never --network none --entrypoint sh "$POSTGRES_IMAGE_ID" -c 'id -g postgres' 2>/dev/null | tr -d '\r')"
+REDIS_UID="$(pct exec "$CT_ID" -- podman run --rm --pull=never --network none --entrypoint sh "$REDIS_IMAGE_ID" -c 'id -u redis' 2>/dev/null | tr -d '\r')"
+REDIS_GID="$(pct exec "$CT_ID" -- podman run --rm --pull=never --network none --entrypoint sh "$REDIS_IMAGE_ID" -c 'id -g redis' 2>/dev/null | tr -d '\r')"
+DOCMOST_UID="$(pct exec "$CT_ID" -- podman run --rm --pull=never --network none --entrypoint sh "$APP_IMAGE_ID" -c 'id -u node' 2>/dev/null | tr -d '\r')"
+DOCMOST_GID="$(pct exec "$CT_ID" -- podman run --rm --pull=never --network none --entrypoint sh "$APP_IMAGE_ID" -c 'id -g node' 2>/dev/null | tr -d '\r')"
 
 for v in POSTGRES_UID POSTGRES_GID REDIS_UID REDIS_GID DOCMOST_UID DOCMOST_GID; do
-  [[ "${!v}" =~ ^[0-9]+$ ]] || { echo "  ERROR: Failed to detect numeric $v from container images." >&2; false; }
+  [[ "${!v}" =~ ^(0|[1-9][0-9]*)$ ]] || { echo "  ERROR: Failed to detect numeric $v from container images." >&2; false; }
 done
 echo "  Bind-mount ownership: postgres=${POSTGRES_UID}:${POSTGRES_GID} redis=${REDIS_UID}:${REDIS_GID} docmost=${DOCMOST_UID}:${DOCMOST_GID}"
 
@@ -509,11 +663,28 @@ echo "  Bind-mount ownership: postgres=${POSTGRES_UID}:${POSTGRES_GID} redis=${R
 # initialize their own subdirectories on first start.
 pct exec "$CT_ID" -- bash -lc "
   set -euo pipefail
-  install -d -m 0755 '${APP_DIR}'
+  install -d -m 0755 '${APP_DIR}' '${APP_DIR}/postgres-init'
   install -d -m 0750 -o ${POSTGRES_UID} -g ${POSTGRES_GID} '${APP_DIR}/postgresdata'
   install -d -m 0750 -o ${REDIS_UID}    -g ${REDIS_GID}    '${APP_DIR}/redis'
   install -d -m 0750 -o ${DOCMOST_UID}  -g ${DOCMOST_GID}  '${APP_DIR}/storage'
 "
+
+
+# ── PostgreSQL restricted application role ─────────────────────────────────────
+# The bootstrap administrator and the application use separate credentials.
+tmp=$(mktemp)
+cat > "$tmp" <<'POSTGRES_INIT'
+#!/usr/bin/env bash
+set -euo pipefail
+[[ ${DOCMOST_DB_PASSWORD:-} =~ ^[A-Za-z0-9]{40}$ ]] || { echo "Invalid application bootstrap secret." >&2; exit 1; }
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<SQL
+CREATE ROLE docmost LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS PASSWORD '${DOCMOST_DB_PASSWORD}';
+ALTER DATABASE docmost OWNER TO docmost;
+GRANT ALL ON SCHEMA public TO docmost;
+SQL
+POSTGRES_INIT
+pct push "$CT_ID" "$tmp" "${APP_DIR}/postgres-init/10-docmost.sh" --perms 0755
+rm -f -- "$tmp"
 
 # ── Quadlet unit files ────────────────────────────────────────────────────────
 # Rootful Quadlet: /etc/containers/systemd/ — no linger, no --user flags needed.
@@ -546,25 +717,31 @@ After=network-online.target
 Wants=network-online.target
 
 [Container]
-Image=${POSTGRES_IMAGE}
+# LabTag=${POSTGRES_TAG}
+# LabImage=${POSTGRES_IMAGE}
+Image=${POSTGRES_IMAGE_ID}
+Pull=never
 ContainerName=docmost-postgres
 Network=host
 Exec=postgres -c listen_addresses=127.0.0.1
 Environment=TZ=${APP_TZ}
 Environment=POSTGRES_DB=docmost
-Environment=POSTGRES_USER=docmost
+Environment=POSTGRES_USER=postgres
 EnvironmentFile=${POSTGRES_ENV_FILE}
 Volume=${APP_DIR}/postgresdata:/var/lib/postgresql
+Volume=${APP_DIR}/postgres-init:/docker-entrypoint-initdb.d:ro
 HealthCmd=pg_isready -h 127.0.0.1 -U docmost -d docmost
 HealthInterval=10s
 HealthTimeout=5s
 HealthRetries=5
 HealthStartPeriod=30s
 Notify=healthy
+StopTimeout=110
 LogDriver=journald
 
 [Service]
 Restart=always
+RestartSec=5
 TimeoutStartSec=180
 TimeoutStopSec=120
 
@@ -579,7 +756,10 @@ After=network-online.target
 Wants=network-online.target
 
 [Container]
-Image=${REDIS_IMAGE}
+# LabTag=${REDIS_TAG}
+# LabImage=${REDIS_IMAGE}
+Image=${REDIS_IMAGE_ID}
+Pull=never
 ContainerName=docmost-redis
 Network=host
 Exec=redis-server --bind 127.0.0.1 --protected-mode yes --appendonly yes --maxmemory-policy noeviction --loglevel warning
@@ -591,10 +771,12 @@ HealthTimeout=5s
 HealthRetries=5
 HealthStartPeriod=10s
 Notify=healthy
+StopTimeout=50
 LogDriver=journald
 
 [Service]
 Restart=always
+RestartSec=5
 TimeoutStartSec=120
 TimeoutStopSec=60
 
@@ -605,12 +787,16 @@ EOF2
   cat > '${QUADLET_FILE}' <<EOF2
 [Unit]
 Description=Docmost
-After=network-online.target ${POSTGRES_QUADLET_SERVICE} ${REDIS_QUADLET_SERVICE}
+After=network-online.target ufw.service ${POSTGRES_QUADLET_SERVICE} ${REDIS_QUADLET_SERVICE}
 Wants=network-online.target
+Requires=ufw.service
 Requires=${POSTGRES_QUADLET_SERVICE} ${REDIS_QUADLET_SERVICE}
 
 [Container]
-Image=${APP_IMAGE}
+# LabTag=${APP_TAG}
+# LabImage=${APP_IMAGE}
+Image=${APP_IMAGE_ID}
+Pull=never
 ContainerName=docmost
 Network=host
 Environment=TZ=${APP_TZ}
@@ -622,9 +808,11 @@ Environment=REDIS_URL=redis://127.0.0.1:6379
 ${TELEMETRY_LINE}
 EnvironmentFile=${APP_ENV_FILE}
 Volume=${APP_DIR}/storage:/app/data/storage
+StopTimeout=50
 LogDriver=journald
 
 [Service]
+ExecStartPre=/usr/local/sbin/docmost-ufw-check
 Restart=always
 RestartSec=5
 TimeoutStopSec=60
@@ -653,14 +841,17 @@ EOF2
 
 {
   printf '# PostgreSQL container secrets — managed by docmost-quadlet.sh\n'
-  printf 'POSTGRES_PASSWORD=%s\n' "$DB_PASSWORD"
+  printf 'POSTGRES_PASSWORD=%s\n' "$PG_ADMIN_PASSWORD"
+  printf 'DOCMOST_DB_PASSWORD=%s\n' "$DB_PASSWORD"
+  printf 'POSTGRES_INITDB_ARGS=--auth-host=scram-sha-256\n'
+  printf 'POSTGRES_HOST_AUTH_METHOD=scram-sha-256\n'
 } | pct exec "$CT_ID" -- bash -lc "
   set -euo pipefail
   umask 077
   cat > '${POSTGRES_ENV_FILE}'
   chmod 0600 '${POSTGRES_ENV_FILE}'
 "
-unset APP_SECRET DB_PASSWORD
+unset APP_SECRET DB_PASSWORD PG_ADMIN_PASSWORD
 
 # ── Runtime state file ────────────────────────────────────────────────────────
 # .env is not read by Quadlet or systemd. It is the maint script's source of
@@ -672,548 +863,449 @@ pct exec "$CT_ID" -- bash -lc "
 APP_IMAGE_REPO=${APP_IMAGE_REPO}
 APP_TAG=${APP_TAG}
 APP_IMAGE=${APP_IMAGE}
+APP_IMAGE_ID=${APP_IMAGE_ID}
 POSTGRES_IMAGE_REPO=${POSTGRES_IMAGE_REPO}
 POSTGRES_TAG=${POSTGRES_TAG}
 POSTGRES_IMAGE=${POSTGRES_IMAGE}
+POSTGRES_IMAGE_ID=${POSTGRES_IMAGE_ID}
 REDIS_IMAGE_REPO=${REDIS_IMAGE_REPO}
 REDIS_TAG=${REDIS_TAG}
 REDIS_IMAGE=${REDIS_IMAGE}
+REDIS_IMAGE_ID=${REDIS_IMAGE_ID}
 APP_PORT=${APP_PORT}
 APP_TZ=${APP_TZ}
 APP_FQDN=${APP_FQDN}
 APP_URL=${APP_URL}
 AUTO_UPDATE=${AUTO_UPDATE}
+PODMAN_FUSE_OVERLAY=${PODMAN_FUSE_OVERLAY}
+INITIAL_WAIT_SECONDS=${INITIAL_WAIT_SECONDS}
+UPDATE_WAIT_SECONDS=${UPDATE_WAIT_SECONDS}
+UPDATE_TIME=${UPDATE_TIME}
 EOF2
   chmod 0600 '${APP_DIR}/.env'
 "
 
 # ── Maintenance script ────────────────────────────────────────────────────────
-# update <tag>:          Docmost — pull → sed Image= in Quadlet file → sed .env →
-#   daemon-reload → restart → /api/health check; rollback restores both files,
-#   daemon-reload, restart. Docmost migrations are forward-only: once a new
-#   version has migrated the schema, the old image may not start — the PVE
-#   snapshot taken before the update is the real rollback.
-# update-postgres <tag>: same flow for the PostgreSQL unit, same MAJOR only
-#   (minor releases share the data format; a major jump needs pg_upgrade).
-#   Docmost is restarted afterwards (Requires= stops it with the DB).
-# update-redis <tag>:    same flow for the Redis unit; Docmost restarted afterwards.
-# auto-update:  re-pull ALL THREE current tags; restart only what changed
-#   (+ Docmost whenever a backend changed); rollback re-tags the previous
-#   image IDs and restarts.
-pct exec "$CT_ID" -- bash -lc 'cat > /usr/local/bin/docmost-maint.sh && chmod 0755 /usr/local/bin/docmost-maint.sh' <<'MAINT'
+# One component per update; immutable IDs, atomic control files and explicit
+# recovery policy. The helper never archives or restores application data.
+tmp="$(mktemp)"
+cat > "$tmp" <<'MAINT'
 #!/usr/bin/env bash
 set -Eeo pipefail
+umask 077
+export LC_ALL=C
 
-APP_DIR="${APP_DIR:-/opt/docmost}"
-QUADLET_FILE="/etc/containers/systemd/docmost.container"
-POSTGRES_QUADLET_FILE="/etc/containers/systemd/docmost-postgres.container"
-REDIS_QUADLET_FILE="/etc/containers/systemd/docmost-redis.container"
-SERVICE="docmost.service"
-POSTGRES_SERVICE="docmost-postgres.service"
-REDIS_SERVICE="docmost-redis.service"
-CONTAINER="docmost"
-POSTGRES_CONTAINER="docmost-postgres"
-REDIS_CONTAINER="docmost-redis"
-ENV_FILE="${APP_DIR}/.env"
+# Generated with this application's creator; no shared runtime library.
+APP_DIR=/opt/docmost
+ENV_FILE=$APP_DIR/.env
+UNIT_DIR=/etc/containers/systemd
+MAIN_SERVICE=docmost.service
+LOCK=/run/lock/docmost-maint.lock
+GENERATOR=/usr/lib/systemd/system-generators/podman-system-generator
+# Only temporary control-file copies are made. PBS/PVE owns data recovery.
+# Atomic rename protects each file; this is not a multi-file disk transaction.
+# The Quadlet contains the authoritative tag/reference/ID. Metadata is reconciled
+# under the maintenance lock after an interruption.
+WORK=""
+SWITCHED=0
+START_ATTEMPTED=0
+APP_STOPPED=0
+COMPONENT=""
+DB_TYPE_BEFORE=""
+declare -A STATE=()
 
-need_root() { [[ $EUID -eq 0 ]] || { echo "  ERROR: Run as root." >&2; exit 1; }; }
-die() { echo "  ERROR: $*" >&2; exit 1; }
-
-usage() {
-  cat <<EOF2
-  Docmost Maintenance (Quadlet)
-  ─────────────────────────────
-  Usage:
-    $0 update <tag> [--yes]            # Docmost:    latest, or pin e.g. 0.96.0
-    $0 update-postgres <tag> [--yes]   # PostgreSQL: MAJOR.MINOR only, same major (e.g. 18.7)
-    $0 update-redis <tag> [--yes]      # Redis:      latest, or pin e.g. 8.10.2
-    $0 auto-update                     # re-pull all current tags (only if AUTO_UPDATE=1)
-    $0 version
-
-  Notes:
-    - update pulls the tag, updates the Quadlet unit and .env, restarts the service
-    - Docmost runs DB migrations on start; they are forward-only. Rolling the image
-      back after a migrated start may fail — restore the PVE snapshot in that case.
-    - PostgreSQL major upgrades (18 → 19) are NOT automated: dump/restore or
-      pg_upgrade manually, then set the new tag.
-    - auto-update is called by docmost-update.timer; it never changes the tags
-    - to switch between tracking and pinning: update latest / update <full tag>
-    - backup and restore are handled by PBS and PVE snapshots
-    - take a PVE snapshot before manual updates: pct snapshot <CT_ID> pre-update-\$(date +%Y%m%d)
-EOF2
-}
-
-[[ -d "$APP_DIR" ]]               || die "APP_DIR not found: $APP_DIR"
-[[ -f "$ENV_FILE" ]]              || die "Missing env file: $ENV_FILE"
-[[ -f "$QUADLET_FILE" ]]          || die "Missing Quadlet unit: $QUADLET_FILE"
-[[ -f "$POSTGRES_QUADLET_FILE" ]] || die "Missing Quadlet unit: $POSTGRES_QUADLET_FILE"
-[[ -f "$REDIS_QUADLET_FILE" ]]    || die "Missing Quadlet unit: $REDIS_QUADLET_FILE"
-
-# One maintenance operation at a time — a manual update must not overlap the timer.
-LOCK_FILE="/run/lock/docmost-maint.lock"
-mkdir -p /run/lock
-exec 9>"$LOCK_FILE"
-flock -n 9 || die "Another docmost-maint.sh operation is already running."
-
-env_val() {
-  awk -F= -v key="$1" '$1==key{print substr($0, length(key)+2)}' "$ENV_FILE" | tail -n1
-}
-
-env_flag() {
-  local raw
-  raw="$(env_val "$1" | tr -d '[:space:]')"
-  [[ "$raw" =~ ^[01]$ ]] && printf '%s' "$raw" || printf '0'
-}
-
-app_port() {
-  local port
-  port="$(env_val APP_PORT | tr -d '[:space:]')"
-  [[ "$port" =~ ^[0-9]+$ ]] && printf '%s' "$port" || printf '3000'
-}
-
-current_image()  { env_val APP_IMAGE; }
-current_repo()   { env_val APP_IMAGE_REPO; }
-current_tag()    { local img; img="$(current_image)"; echo "${img##*:}"; }
-postgres_image() { env_val POSTGRES_IMAGE; }
-postgres_repo()  { env_val POSTGRES_IMAGE_REPO; }
-postgres_tag()   { local img; img="$(postgres_image)"; echo "${img##*:}"; }
-redis_image()    { env_val REDIS_IMAGE; }
-redis_repo()     { env_val REDIS_IMAGE_REPO; }
-redis_tag()      { local img; img="$(redis_image)"; echo "${img##*:}"; }
-
-running_image_id() {
-  podman inspect --format '{{.Image}}' "$1" 2>/dev/null || true
-}
-
-image_id_of() {
-  podman image inspect --format '{{.Id}}' "$1" 2>/dev/null || true
-}
-
-# /api/health returns 200 only after migrations ran and the app is serving.
-# Long loop: migrations on a big workspace can take a while.
-wait_for_app() {
-  local port code
-  port="$(app_port)"
-  for i in $(seq 1 60); do
-    code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 "http://127.0.0.1:${port}/api/health" 2>/dev/null || echo 000)"
-    [[ "$code" == "200" ]] && return 0
-    sleep 2
+die() { printf '  ERROR: %s\n' "$*" >&2; exit 1; }
+read_state() {
+  local line key value
+  STATE=()
+  while IFS= read -r line || [[ -n $line ]]; do
+    [[ $line =~ ^[[:space:]]*(#.*)?$ ]] && continue
+    [[ $line =~ ^([A-Z][A-Z0-9_]*)=(.*)$ ]] || die "Malformed state line."
+    key=${BASH_REMATCH[1]}; value=${BASH_REMATCH[2]}
+    [[ ! ${STATE[$key]+yes} ]] || die "Duplicate state key: $key"
+    STATE[$key]=$value
+  done < "$ENV_FILE"
+  # State is parsed as data. Never source an editable .env as root.
+  for key in APP_PORT INITIAL_WAIT_SECONDS UPDATE_WAIT_SECONDS PODMAN_FUSE_OVERLAY AUTO_UPDATE; do
+    [[ ${STATE[$key]:-} =~ ^(0|[1-9][0-9]{0,5})$ ]] || die "Invalid $key."
   done
-  return 1
+  (( STATE[APP_PORT] >= 1024 && STATE[APP_PORT] <= 65535 )) || die "Invalid APP_PORT."
+  (( STATE[INITIAL_WAIT_SECONDS] >= 30 && STATE[INITIAL_WAIT_SECONDS] <= 86400 )) || die "Invalid initial wait."
+  (( STATE[UPDATE_WAIT_SECONDS] >= 30 && STATE[UPDATE_WAIT_SECONDS] <= 86400 )) || die "Invalid update wait."
+  [[ ${STATE[AUTO_UPDATE]} =~ ^[01]$ && ${STATE[PODMAN_FUSE_OVERLAY]} =~ ^[01]$ ]] || die "Invalid policy flag."
+  (( STATE[APP_PORT] != 5432 && STATE[APP_PORT] != 6379 )) || die "Backend port collision."
 }
-
-wait_for_postgres() {
-  for i in $(seq 1 30); do
-    if podman exec "$POSTGRES_CONTAINER" pg_isready -h 127.0.0.1 -U docmost -d docmost >/dev/null 2>&1; then
-      return 0
-    fi
-    sleep 2
-  done
-  return 1
+unit_value() {
+  local prefix=$1 file=$2
+  awk -v p="$prefix" 'index($0,p)==1 {value=substr($0,length(p)+1); n++} END {if(n!=1) exit 1; print value}' "$file"
 }
-
-wait_for_redis() {
-  local pong
-  for i in $(seq 1 20); do
-    pong="$(podman exec "$REDIS_CONTAINER" redis-cli -h 127.0.0.1 ping 2>/dev/null || true)"
-    [[ "$pong" == "PONG" ]] && return 0
-    sleep 2
-  done
-  return 1
+image_id() {
+  local value
+  value=$(podman image inspect --format '{{.Id}}' "$1") || return 1
+  value=${value#sha256:}
+  [[ $value =~ ^[a-f0-9]{64}$ ]] || return 1
+  printf 'sha256:%s\n' "$value"
 }
-
-confirm_or_exit() {
-  echo ""
-  echo "  IMPORTANT: Take a PVE snapshot before proceeding."
-  echo "  Use: pct snapshot <CT_ID> pre-update-$(date +%Y%m%d)"
-  echo ""
-  read -r -p "  Continue? [y/N]: " confirm
-  case "$confirm" in
-    [yY][eE][sS]|[yY]) return 0 ;;
-    *) echo "  Aborted."; return 1 ;;
+select_component() {
+  COMPONENT=$1
+  case $COMPONENT in
+    POSTGRES) CONTAINER=docmost-postgres; KIND=postgres; IMAGE_RECOVERY=0 ;;
+    REDIS) CONTAINER=docmost-redis; KIND=redis; IMAGE_RECOVERY=0 ;;
+    APP) CONTAINER=docmost; KIND=app; IMAGE_RECOVERY=0 ;;
+    *) die "Unknown component: $COMPONENT" ;;
+  esac
+  SERVICE=$CONTAINER.service
+  UNIT=$UNIT_DIR/$CONTAINER.container
+}
+valid_tag() {
+  case $1 in
+    POSTGRES) [[ $2 =~ ^18\.[0-9]+(-[A-Za-z0-9.]+)?$ ]] ;;
+    REDIS) [[ $2 =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9._-]+)?$ ]] ;;
+    APP) [[ $2 =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9._-]+)?$ ]] ;;
+    *) return 1 ;;
   esac
 }
-
-# update <tag> [--yes] — switch Docmost to "latest" or a pinned version
-update_app() {
-  local new_tag="" skip_confirm=0
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      -y|--yes) skip_confirm=1; shift ;;
-      *) new_tag="$1"; shift ;;
-    esac
-  done
-
-  local old_tag repo old_image new_image old_id tmp_env tmp_quadlet
-  [[ -n "$new_tag" ]] || die "Usage: docmost-maint.sh update <tag>"
-  [[ "$new_tag" == "latest" || "$new_tag" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9._-]+)?$ ]] \
-    || die "Invalid tag: $new_tag — use 'latest' or a full version like 0.96.0."
-
-  old_tag="$(current_tag)"
-  repo="$(current_repo)"
-  [[ -n "$repo" ]] || die "Could not read APP_IMAGE_REPO from .env"
-  old_image="$(current_image)"
-  new_image="${repo}:${new_tag}"
-  # Capture the current image ID before pulling: if new_tag == old_tag, the pull
-  # moves the tag and the old ref would otherwise resolve to the NEW image on rollback.
-  old_id="$(image_id_of "$old_image")"
-  tmp_env="$(mktemp)"
-  tmp_quadlet="$(mktemp)"
-
-  echo "  Current tag: $old_tag"
-  echo "  Target  tag: $new_tag"
-
-  # Pre-update guard: a Docmost restart re-runs migrations; refuse if the DB is not there.
-  wait_for_postgres || die "PostgreSQL is not ready — fix ${POSTGRES_SERVICE} before updating Docmost."
-
-  if [[ "$skip_confirm" -eq 0 ]]; then
-    confirm_or_exit || { rm -f "$tmp_env" "$tmp_quadlet"; exit 0; }
-  fi
-
-  cp -a "$ENV_FILE"     "$tmp_env"
-  cp -a "$QUADLET_FILE" "$tmp_quadlet"
-
-  cleanup() { rm -f "$tmp_env" "$tmp_quadlet"; }
-  rollback() {
-    echo "  !! Update failed — rolling back and restarting ..." >&2
-    cp -a "$tmp_env"     "$ENV_FILE"
-    cp -a "$tmp_quadlet" "$QUADLET_FILE"
-    [[ -n "$old_id" ]] && podman tag "$old_id" "$old_image" >/dev/null 2>&1 || true
-    systemctl daemon-reload
-    systemctl restart "$SERVICE" || true
-    rm -f "$tmp_env" "$tmp_quadlet"
-    if wait_for_app; then
-      echo "  Rollback complete — ${old_image} is healthy again." >&2
-    else
-      echo "  CRITICAL: rollback to ${old_image} did not become healthy (schema may already be migrated). Restore the CT from the PVE snapshot / PBS." >&2
-    fi
-  }
-  trap rollback ERR
-
-  echo "  Pulling target image ..."
-  podman pull "$new_image"
-
-  sed -i "s|^Image=.*|Image=${new_image}|" "$QUADLET_FILE"
-  sed -i \
-    -e "s|^APP_TAG=.*|APP_TAG=$new_tag|" \
-    -e "s|^APP_IMAGE=.*|APP_IMAGE=$new_image|" \
-    "$ENV_FILE"
-
-  echo "  Reloading Quadlet and restarting service ..."
-  systemctl daemon-reload
-  systemctl restart "$SERVICE"
-
-  echo "  Waiting for Docmost (migrations may take a moment) ..."
-  if ! wait_for_app; then
-    trap - ERR
-    rollback
-    die "Docmost did not become healthy after update."
-  fi
-
-  trap - ERR
-  cleanup
-  if [[ -n "$old_id" && "$old_id" != "$(image_id_of "$new_image")" ]]; then
-    podman rmi "$old_id" >/dev/null 2>&1 || true
-  fi
-  echo "  OK: Docmost updated to $new_tag"
+load_unit() {
+  OLD_TAG=$(unit_value '# LabTag=' "$UNIT") || die "Missing LabTag metadata; use the matching upgraded creator."
+  OLD_IMAGE=$(unit_value '# LabImage=' "$UNIT") || die "Missing LabImage metadata."
+  OLD_ID=$(unit_value 'Image=' "$UNIT") || die "Missing image ID."
+  [[ $OLD_IMAGE == *:* ]] || die "Invalid image reference."
+  REPO=${OLD_IMAGE%:*}
+  [[ $REPO =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*[A-Za-z0-9]$ ]] || die "Invalid repository."
+  valid_tag "$COMPONENT" "$OLD_TAG" || die "Configured tag violates this component's policy."
+  [[ $OLD_IMAGE == "$REPO:$OLD_TAG" && $OLD_ID =~ ^sha256:[a-f0-9]{64}$ ]] || die "Inconsistent unit metadata."
+  [[ $(unit_value 'Pull=' "$UNIT") == never ]] || die "Expected Pull=never."
 }
-
-# update-postgres <tag> [--yes] — move PostgreSQL to another minor of the SAME major
-update_postgres() {
-  local new_tag="" skip_confirm=0
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      -y|--yes) skip_confirm=1; shift ;;
-      *) new_tag="$1"; shift ;;
-    esac
-  done
-
-  local old_tag repo old_image new_image old_id tmp_env tmp_quadlet old_major new_major
-  [[ -n "$new_tag" ]] || die "Usage: docmost-maint.sh update-postgres <tag>"
-  [[ "$new_tag" =~ ^[0-9]+\.[0-9]+(-[A-Za-z0-9.]+)?$ ]] \
-    || die "Invalid tag: $new_tag — PostgreSQL needs MAJOR.MINOR like 18.7 ('latest' and major-only tags are not permitted)."
-
-  old_tag="$(postgres_tag)"
-  repo="$(postgres_repo)"
-  [[ -n "$repo" ]] || die "Could not read POSTGRES_IMAGE_REPO from .env"
-  old_image="$(postgres_image)"
-  new_image="${repo}:${new_tag}"
-  old_major="${old_tag%%.*}"
-  new_major="${new_tag%%.*}"
-  # Guard: the data directory format changes between majors; the new binaries
-  # would refuse to start on the old cluster and rollback would be the only outcome.
-  [[ "$old_major" == "$new_major" ]] \
-    || die "Major upgrade ${old_major} → ${new_major} is not automated. Dump/restore or pg_upgrade manually, then set the tag."
-  old_id="$(image_id_of "$old_image")"
-  tmp_env="$(mktemp)"
-  tmp_quadlet="$(mktemp)"
-
-  echo "  Current PostgreSQL tag: $old_tag"
-  echo "  Target  PostgreSQL tag: $new_tag"
-
-  if [[ "$skip_confirm" -eq 0 ]]; then
-    confirm_or_exit || { rm -f "$tmp_env" "$tmp_quadlet"; exit 0; }
+write_env() {
+  local tag=$1 reference=$2 id=$3 temp
+  temp=$(mktemp "${ENV_FILE}.XXXXXX") || return 1
+  if ! awk -v c="$COMPONENT" -v repo="$REPO" -v t="$tag" -v r="$reference" -v id="$id" '
+    $0 ~ ("^" c "_(IMAGE_REPO|TAG|IMAGE|IMAGE_ID)=") {next}
+    {print}
+    END {print c "_IMAGE_REPO=" repo; print c "_TAG=" t; print c "_IMAGE=" r; print c "_IMAGE_ID=" id}
+  ' "$ENV_FILE" > "$temp" || ! chmod 0600 "$temp" || ! mv -fT "$temp" "$ENV_FILE"; then
+    rm -f -- "$temp"; return 1
   fi
-
-  cp -a "$ENV_FILE"              "$tmp_env"
-  cp -a "$POSTGRES_QUADLET_FILE" "$tmp_quadlet"
-
-  cleanup() { rm -f "$tmp_env" "$tmp_quadlet"; }
-  rollback() {
-    echo "  !! PostgreSQL update failed — rolling back and restarting ..." >&2
-    cp -a "$tmp_env"     "$ENV_FILE"
-    cp -a "$tmp_quadlet" "$POSTGRES_QUADLET_FILE"
-    [[ -n "$old_id" ]] && podman tag "$old_id" "$old_image" >/dev/null 2>&1 || true
-    systemctl daemon-reload
-    systemctl restart "$POSTGRES_SERVICE" || true
-    systemctl restart "$SERVICE" || true
-    rm -f "$tmp_env" "$tmp_quadlet"
-    if wait_for_postgres && wait_for_app; then
-      echo "  Rollback complete — ${old_image} is healthy again." >&2
-    else
-      echo "  CRITICAL: rollback to ${old_image} did not become healthy. Restore the CT from the PVE snapshot / PBS." >&2
-    fi
-  }
-  trap rollback ERR
-
-  echo "  Pulling target image ..."
-  podman pull "$new_image"
-
-  sed -i "s|^Image=.*|Image=${new_image}|" "$POSTGRES_QUADLET_FILE"
-  sed -i \
-    -e "s|^POSTGRES_TAG=.*|POSTGRES_TAG=$new_tag|" \
-    -e "s|^POSTGRES_IMAGE=.*|POSTGRES_IMAGE=$new_image|" \
-    "$ENV_FILE"
-
-  # Requires= stops Docmost together with PostgreSQL; start it again explicitly.
-  echo "  Reloading Quadlet and restarting PostgreSQL + Docmost ..."
-  systemctl daemon-reload
-  systemctl restart "$POSTGRES_SERVICE"
-  systemctl restart "$SERVICE"
-
-  echo "  Waiting for PostgreSQL and Docmost ..."
-  if ! wait_for_postgres || ! wait_for_app; then
-    trap - ERR
-    rollback
-    die "Stack did not become healthy after PostgreSQL update."
-  fi
-
-  trap - ERR
-  cleanup
-  if [[ -n "$old_id" && "$old_id" != "$(image_id_of "$new_image")" ]]; then
-    podman rmi "$old_id" >/dev/null 2>&1 || true
-  fi
-  echo "  OK: PostgreSQL updated to $new_tag"
 }
-
-# update-redis <tag> [--yes] — switch Redis to "latest" or a pinned version
-update_redis() {
-  local new_tag="" skip_confirm=0
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      -y|--yes) skip_confirm=1; shift ;;
-      *) new_tag="$1"; shift ;;
-    esac
-  done
-
-  local old_tag repo old_image new_image old_id tmp_env tmp_quadlet
-  [[ -n "$new_tag" ]] || die "Usage: docmost-maint.sh update-redis <tag>"
-  [[ "$new_tag" == "latest" || "$new_tag" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9._-]+)?$ ]] \
-    || die "Invalid tag: $new_tag — use 'latest' or a full version like 8.10.2."
-
-  old_tag="$(redis_tag)"
-  repo="$(redis_repo)"
-  [[ -n "$repo" ]] || die "Could not read REDIS_IMAGE_REPO from .env"
-  old_image="$(redis_image)"
-  new_image="${repo}:${new_tag}"
-  old_id="$(image_id_of "$old_image")"
-  tmp_env="$(mktemp)"
-  tmp_quadlet="$(mktemp)"
-
-  echo "  Current Redis tag: $old_tag"
-  echo "  Target  Redis tag: $new_tag"
-
-  if [[ "$skip_confirm" -eq 0 ]]; then
-    confirm_or_exit || { rm -f "$tmp_env" "$tmp_quadlet"; exit 0; }
+write_unit() {
+  local tag=$1 reference=$2 id=$3 temp
+  temp=$(mktemp "${UNIT}.XXXXXX") || return 1
+  if ! sed -e "s|^# LabTag=.*|# LabTag=$tag|" \
+      -e "s|^# LabImage=.*|# LabImage=$reference|" \
+      -e "s|^Image=.*|Image=$id|" "$UNIT" > "$temp" \
+      || ! chmod 0644 "$temp" || ! mv -fT "$temp" "$UNIT"; then
+    rm -f -- "$temp"; return 1
   fi
-
-  cp -a "$ENV_FILE"           "$tmp_env"
-  cp -a "$REDIS_QUADLET_FILE" "$tmp_quadlet"
-
-  cleanup() { rm -f "$tmp_env" "$tmp_quadlet"; }
-  rollback() {
-    echo "  !! Redis update failed — rolling back and restarting ..." >&2
-    cp -a "$tmp_env"     "$ENV_FILE"
-    cp -a "$tmp_quadlet" "$REDIS_QUADLET_FILE"
-    [[ -n "$old_id" ]] && podman tag "$old_id" "$old_image" >/dev/null 2>&1 || true
-    systemctl daemon-reload
-    systemctl restart "$REDIS_SERVICE" || true
-    systemctl restart "$SERVICE" || true
-    rm -f "$tmp_env" "$tmp_quadlet"
-    if wait_for_redis && wait_for_app; then
-      echo "  Rollback complete — ${old_image} is healthy again." >&2
-    else
-      echo "  CRITICAL: rollback to ${old_image} did not become healthy. Restore the CT from the PVE snapshot / PBS." >&2
-    fi
-  }
-  trap rollback ERR
-
-  echo "  Pulling target image ..."
-  podman pull "$new_image"
-
-  sed -i "s|^Image=.*|Image=${new_image}|" "$REDIS_QUADLET_FILE"
-  sed -i \
-    -e "s|^REDIS_TAG=.*|REDIS_TAG=$new_tag|" \
-    -e "s|^REDIS_IMAGE=.*|REDIS_IMAGE=$new_image|" \
-    "$ENV_FILE"
-
-  echo "  Reloading Quadlet and restarting Redis + Docmost ..."
-  systemctl daemon-reload
-  systemctl restart "$REDIS_SERVICE"
-  systemctl restart "$SERVICE"
-
-  echo "  Waiting for Redis and Docmost ..."
-  if ! wait_for_redis || ! wait_for_app; then
-    trap - ERR
-    rollback
-    die "Stack did not become healthy after Redis update."
-  fi
-
-  trap - ERR
-  cleanup
-  if [[ -n "$old_id" && "$old_id" != "$(image_id_of "$new_image")" ]]; then
-    podman rmi "$old_id" >/dev/null 2>&1 || true
-  fi
-  echo "  OK: Redis updated to $new_tag"
 }
+copy_control_file() {
+  local source=$1 destination=$2 temp
+  temp=$(mktemp "${destination}.XXXXXX") || return 1
+  if ! cp --preserve=mode,ownership "$source" "$temp" || ! mv -fT "$temp" "$destination"; then
+    rm -f -- "$temp"; return 1
+  fi
+}
+wait_service() {
+  local container=$1 kind=$2 budget=$3 started=$SECONDS state restarts first code value
+  local healthy_since=-1
+  first=$(systemctl show "$container.service" -p NRestarts --value) || return 1
+  while (( SECONDS - started < budget )); do
+    state=$(systemctl show "$container.service" -p ActiveState --value) || return 1
+    restarts=$(systemctl show "$container.service" -p NRestarts --value) || return 1
+    [[ $state != failed && $state != inactive && $restarts == "$first" ]] || return 1
+    value=0
+    if [[ $state == active ]]; then
+      case $kind in
+        app)
+          code=$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 2 --max-time 3 \
+            "http://127.0.0.1:${STATE[APP_PORT]}/api/health") || code=000
+          [[ $code =~ ^200$ ]] && value=1
+          ;;
+        postgres)
+          timeout 5 podman exec "$container" pg_isready -q -h 127.0.0.1 -U docmost -d docmost && value=1
+          ;;
+        valkey|redis)
+          code=$(timeout 5 podman exec "$container" "$kind-cli" -h 127.0.0.1 ping 2>/dev/null) || code=""
+          [[ $code == PONG ]] && value=1
+          ;;
+      esac
+    fi
+    if (( value )); then
+      (( healthy_since >= 0 )) || healthy_since=$SECONDS
+      (( SECONDS - healthy_since >= 6 )) && return 0
+    else
+      healthy_since=-1
+    fi
+    sleep 2
+  done
+  return 1
+}
+validate_candidate() {
+  local id=$1 old_user new_user actual major uid gid path version
+  # Only the image shell runs, without network or data mounts. The candidate
+  # application never gets production data during validation.
+  podman run --rm --pull=never --network none --entrypoint /bin/sh "$id" -c true
+  old_user=$(podman image inspect --format '{{.Config.User}}' "$OLD_ID")
+  new_user=$(podman image inspect --format '{{.Config.User}}' "$id")
+  [[ $old_user == "$new_user" ]] || die "Image USER changed; review ownership before updating."
+if [[ $COMPONENT == POSTGRES ]]; then
+    path="$APP_DIR/postgresdata/18/docker"
+    [[ $(cat "$path/PG_VERSION") == 18 ]] || die "On-disk PostgreSQL major does not match."
+    uid=$(podman run --rm --pull=never --network none --entrypoint sh "$id" -c 'id -u postgres')
+    gid=$(podman run --rm --pull=never --network none --entrypoint sh "$id" -c 'id -g postgres')
+    [[ $uid =~ ^[0-9]+$ && $gid =~ ^[0-9]+$ && $(stat -c '%u:%g' "$path") == "$uid:$gid" ]] \
+      || die "PostgreSQL UID/GID differs from existing data; no recursive chown is attempted."
+    version=$(podman run --rm --pull=never --network none --entrypoint postgres "$id" --version)
+    [[ $version == "postgres (PostgreSQL) 18."* ]] || die "Candidate PostgreSQL binary has the wrong major."
+  fi
 
-# auto-update — re-pull all three current tags; restart only what changed
-auto_update_app() {
-  if [[ "$(env_flag AUTO_UPDATE)" != "1" ]]; then
-    echo "  Auto-update disabled in ${ENV_FILE}; nothing to do."
+  case $COMPONENT in
+    APP) path="$APP_DIR/storage"; actual=node ;;
+    REDIS) path="$APP_DIR/redis"; actual=redis ;;
+    *) return 0 ;;
+  esac
+  uid=$(podman run --rm --pull=never --network none --entrypoint sh "$id" -c "id -u $actual")
+  gid=$(podman run --rm --pull=never --network none --entrypoint sh "$id" -c "id -g $actual")
+  [[ $uid =~ ^[0-9]+$ && $gid =~ ^[0-9]+$ && $(stat -c '%u:%g' "$path") == "$uid:$gid" ]] \
+    || die "Candidate service UID/GID differs from persistent-directory ownership."
+}
+pre_update_checks() {
+
+  :
+}
+post_update_checks() {
+
+  :
+}
+finish() {
+  local rc=$? restored=1
+  trap - EXIT ERR INT TERM HUP
+  set +e
+  if (( rc != 0 && SWITCHED )); then
+    if (( START_ATTEMPTED == 0 || IMAGE_RECOVERY == 1 )); then
+      copy_control_file "$WORK/old.container" "$UNIT" || restored=0
+      copy_control_file "$WORK/old.env" "$ENV_FILE" || restored=0
+      systemctl daemon-reload || restored=0
+      if (( restored && START_ATTEMPTED )); then
+        systemctl restart "$SERVICE" && wait_service "$CONTAINER" "$KIND" "${STATE[UPDATE_WAIT_SECONDS]}" || restored=0
+      fi
+      if (( restored && APP_STOPPED )); then
+        systemctl start "$MAIN_SERVICE" && wait_service docmost app "${STATE[UPDATE_WAIT_SECONDS]}" || restored=0
+      fi
+      if (( restored )); then
+        printf '  Previous control files/image restored; this does not undo application data changes.\n' >&2
+      else
+        printf '  CRITICAL: Recovery was not confirmed. Inspect %s and %s.\n' "$UNIT" "$WORK" >&2
+      fi
+    else
+      printf '  Target %s image retained: persistent state may already have changed.\n' "$COMPONENT" >&2
+      printf '  No automatic image/database downgrade. Inspect journalctl -u %s -u %s.\n' "$SERVICE" "$MAIN_SERVICE" >&2
+      printf '  Recover matching PBS/PVE state if needed. A readiness timeout does not stop a migration.\n' >&2
+      (( APP_STOPPED == 0 )) || printf '  After the backend is healthy: systemctl start %s\n' "$MAIN_SERVICE" >&2
+    fi
+  elif (( rc != 0 && APP_STOPPED )); then
+    systemctl start "$MAIN_SERVICE" || restored=0
+  fi
+  if [[ -n $WORK ]]; then
+    if (( restored )); then rm -rf -- "$WORK"; else printf '  Retained control-file copies: %s\n' "$WORK" >&2; fi
+  fi
+  exit "$rc"
+}
+trap finish EXIT
+trap 'printf "  Maintenance failed near line %s.\n" "$LINENO" >&2' ERR
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
+
+update_component() {
+  local requested=${2:-} actual new_id target old_variant new_variant
+  select_component "$1"
+  load_unit
+  SWITCHED=0; START_ATTEMPTED=0; APP_STOPPED=0
+  target=${requested:-$OLD_TAG}
+  valid_tag "$COMPONENT" "$target" || die "Invalid target tag for $COMPONENT."
+# Semantic version downgrades of persistent components require a separate review.
+  if (( IMAGE_RECOVERY == 0 )) && [[ $target != latest && $OLD_TAG != latest ]]; then
+    [[ $(printf '%s\n%s\n' "$OLD_TAG" "$target" | sort -V | head -n 1) == "$OLD_TAG" ]] \
+      || die "Persistent-component downgrade requires matching data recovery."
+  fi
+
+  if [[ $COMPONENT == POSTGRES ]]; then
+    [[ ${OLD_TAG%%[.-]*} == ${target%%[.-]*} ]] || die "PostgreSQL major changes require a separate migration."
+
+    old_variant=""; new_variant=""
+    [[ $OLD_TAG != *-* ]] || old_variant=${OLD_TAG#*-}
+    [[ $target != *-* ]] || new_variant=${target#*-}
+    [[ $old_variant == "$new_variant" ]] || die "PostgreSQL image variant change requires migration review."
+  fi
+
+  if [[ $COMPONENT == APP ]]; then
+    [[ ${OLD_TAG%%.*} == ${target%%.*} ]] || die "Application major changes require a separate migration review."
+  fi
+  /usr/local/sbin/docmost-ufw-check || die "Restore active UFW filtering before maintenance."
+  actual=$(podman inspect --format '{{.Image}}' "$CONTAINER") || die "Cannot inspect running image."
+  [[ $(image_id "$actual") == "$OLD_ID" ]] || die "Running/configured image mismatch; inspect the service."
+  wait_service "$CONTAINER" "$KIND" 30 || die "$SERVICE is unhealthy before update."
+  if [[ $COMPONENT != APP ]]; then
+    wait_service docmost app 30 || die "Application is unhealthy before backend update."
+  fi
+  if [[ ${STATE[${COMPONENT}_TAG]:-} != "$OLD_TAG" ||
+        ${STATE[${COMPONENT}_IMAGE]:-} != "$OLD_IMAGE" ||
+        ${STATE[${COMPONENT}_IMAGE_ID]:-} != "$OLD_ID" ||
+        ${STATE[${COMPONENT}_IMAGE_REPO]:-} != "$REPO" ]]; then
+    write_env "$OLD_TAG" "$OLD_IMAGE" "$OLD_ID"
+    read_state
+    printf '  Reconciled metadata from the authoritative Quadlet.\n'
+  fi
+  pre_update_checks
+  if (( YES == 0 )); then
+    [[ -t 8 ]] || die "Interactive terminal or --yes is required."
+    printf '  Verify a matching PBS/PVE recovery checkpoint on the host before updating.\n'
+    (( STATE[PODMAN_FUSE_OVERLAY] == 0 )) || printf '  FUSE is enabled: use stop-mode PBS; do not freeze this running CT.\n'
+    :
+    (( IMAGE_RECOVERY )) || printf '  Once the target starts, automatic image downgrade is disabled.\n'
+    read -r -p "  Update $COMPONENT $OLD_TAG -> $target? [y/N]: " answer <&8 || return 0
+    [[ $answer =~ ^([Yy]|[Yy][Ee][Ss])$ ]] || return 0
+  else
+    printf '  --yes skips confirmation; no backup is created or verified.\n'
+  fi
+  podman pull "$REPO:$target"
+  new_id=$(image_id "$REPO:$target") || die "Cannot resolve target image."
+  if [[ $new_id == "$OLD_ID" && $target == "$OLD_TAG" ]]; then
+    printf '  %s unchanged; no restart.\n' "$COMPONENT"
     return 0
   fi
-
-  local pg_image pg_old_id pg_new_id rd_image rd_old_id rd_new_id app_image app_old_id app_new_id
-  pg_image="$(postgres_image)"
-  rd_image="$(redis_image)"
-  app_image="$(current_image)"
-  [[ -n "$pg_image" ]]  || die "Could not read POSTGRES_IMAGE from .env"
-  [[ -n "$rd_image" ]]  || die "Could not read REDIS_IMAGE from .env"
-  [[ -n "$app_image" ]] || die "Could not read APP_IMAGE from .env"
-  pg_old_id="$(running_image_id "$POSTGRES_CONTAINER")"
-  rd_old_id="$(running_image_id "$REDIS_CONTAINER")"
-  app_old_id="$(running_image_id "$CONTAINER")"
-
-  echo "  Auto-update: re-pulling ${pg_image} ..."
-  podman pull "$pg_image"
-  pg_new_id="$(image_id_of "$pg_image")"
-  [[ -n "$pg_new_id" ]] || die "Could not inspect pulled image ${pg_image}"
-
-  echo "  Auto-update: re-pulling ${rd_image} ..."
-  podman pull "$rd_image"
-  rd_new_id="$(image_id_of "$rd_image")"
-  [[ -n "$rd_new_id" ]] || die "Could not inspect pulled image ${rd_image}"
-
-  echo "  Auto-update: re-pulling ${app_image} ..."
-  podman pull "$app_image"
-  app_new_id="$(image_id_of "$app_image")"
-  [[ -n "$app_new_id" ]] || die "Could not inspect pulled image ${app_image}"
-
-  local pg_changed=0 rd_changed=0 app_changed=0
-  [[ -z "$pg_old_id"  || "$pg_new_id"  != "$pg_old_id"  ]] && pg_changed=1
-  [[ -z "$rd_old_id"  || "$rd_new_id"  != "$rd_old_id"  ]] && rd_changed=1
-  [[ -z "$app_old_id" || "$app_new_id" != "$app_old_id" ]] && app_changed=1
-
-  if [[ "$pg_changed" -eq 0 && "$rd_changed" -eq 0 && "$app_changed" -eq 0 ]]; then
-    echo "  OK: all images are already current — no restart needed."
-    return 0
-  fi
-
-  rollback() {
-    echo "  !! Auto-update failed — restoring previous images and restarting ..." >&2
-    [[ "$pg_changed"  -eq 1 && -n "$pg_old_id"  ]] && podman tag "$pg_old_id"  "$pg_image"  >/dev/null 2>&1 || true
-    [[ "$rd_changed"  -eq 1 && -n "$rd_old_id"  ]] && podman tag "$rd_old_id"  "$rd_image"  >/dev/null 2>&1 || true
-    [[ "$app_changed" -eq 1 && -n "$app_old_id" ]] && podman tag "$app_old_id" "$app_image" >/dev/null 2>&1 || true
-    [[ "$pg_changed" -eq 1 ]] && { systemctl restart "$POSTGRES_SERVICE" || true; }
-    [[ "$rd_changed" -eq 1 ]] && { systemctl restart "$REDIS_SERVICE" || true; }
-    systemctl restart "$SERVICE" || true
-    if wait_for_postgres && wait_for_redis && wait_for_app; then
-      echo "  Rollback complete — previous images are healthy again." >&2
-    else
-      echo "  CRITICAL: rollback did not become healthy (Docmost schema may already be migrated). Restore the CT from the PVE snapshot / PBS." >&2
+  validate_candidate "$new_id"
+  WORK=$(mktemp -d /run/docmost-update.XXXXXX)
+  cp --preserve=mode,ownership "$UNIT" "$WORK/old.container"
+  cp --preserve=mode,ownership "$ENV_FILE" "$WORK/old.env"
+  SWITCHED=1
+  write_unit "$target" "$REPO:$target" "$new_id"
+  write_env "$target" "$REPO:$target" "$new_id"
+  "$GENERATOR" --dryrun > "$WORK/generator.txt"
+  grep -Fq "$CONTAINER.service" "$WORK/generator.txt" || die "Generator omitted $SERVICE."
+  systemctl daemon-reload
+  [[ $(systemctl show "$SERVICE" -p LoadState --value) == loaded ]] || die "Unit did not load."
+  if [[ $new_id != "$OLD_ID" ]]; then
+    if [[ $COMPONENT != APP ]]; then
+      APP_STOPPED=1
+      systemctl stop "$MAIN_SERVICE"
     fi
-  }
-  trap rollback ERR
-
-  if [[ "$pg_changed" -eq 1 ]]; then
-    echo "  PostgreSQL image changed — restarting ${POSTGRES_SERVICE} ..."
-    systemctl restart "$POSTGRES_SERVICE"
+    START_ATTEMPTED=1
+    systemctl restart "$SERVICE"
+    wait_service "$CONTAINER" "$KIND" "${STATE[UPDATE_WAIT_SECONDS]}" || die "$SERVICE failed readiness or restarted."
+    if [[ $COMPONENT != APP ]]; then
+      systemctl start "$MAIN_SERVICE"
+      wait_service docmost app "${STATE[UPDATE_WAIT_SECONDS]}" || die "Application did not recover after backend update."
+    fi
   fi
-  if [[ "$rd_changed" -eq 1 ]]; then
-    echo "  Redis image changed — restarting ${REDIS_SERVICE} ..."
-    systemctl restart "$REDIS_SERVICE"
-  fi
-  # Docmost restarts when its own image changed, or after a backend restart
-  # (Requires= already stopped it, and it must reconnect to the new backend).
-  echo "  Restarting ${SERVICE} ..."
-  systemctl restart "$SERVICE"
-
-  echo "  Waiting for PostgreSQL, Redis and Docmost ..."
-  if ! wait_for_postgres || ! wait_for_redis || ! wait_for_app; then
-    trap - ERR
-    rollback
-    die "Stack did not become healthy after auto-update."
-  fi
-
-  trap - ERR
-  [[ "$pg_changed"  -eq 1 && -n "$pg_old_id"  ]] && podman rmi "$pg_old_id"  >/dev/null 2>&1 || true
-  [[ "$rd_changed"  -eq 1 && -n "$rd_old_id"  ]] && podman rmi "$rd_old_id"  >/dev/null 2>&1 || true
-  [[ "$app_changed" -eq 1 && -n "$app_old_id" ]] && podman rmi "$app_old_id" >/dev/null 2>&1 || true
-  echo "  OK: Docmost stack refreshed (Docmost changed: ${app_changed}, PostgreSQL changed: ${pg_changed}, Redis changed: ${rd_changed})"
+  actual=$(podman inspect --format '{{.Image}}' "$CONTAINER")
+  [[ $(image_id "$actual") == "$new_id" ]] || die "Running image differs from target."
+  post_update_checks
+  SWITCHED=0; START_ATTEMPTED=0; APP_STOPPED=0
+  rm -rf -- "$WORK"; WORK=""
+  # Retain the prior image for inspection/recovery. No broad image prune.
+  read_state
+  printf '  Updated %s: %s (%s).\n' "$COMPONENT" "$target" "$new_id"
 }
 
-need_root
-cmd="${1:-}"
-case "$cmd" in
-  update)          shift; update_app "$@" ;;
-  update-postgres) shift; update_postgres "$@" ;;
-  update-redis)    shift; update_redis "$@" ;;
-  auto-update)     auto_update_app ;;
-  version)
-    echo "Configured Docmost image:    $(current_image)"
-    echo "Running Docmost image ID:    $(running_image_id "$CONTAINER")"
-    echo "Docmost digest:              $(podman image inspect --format '{{index .RepoDigests 0}}' "$(current_image)" 2>/dev/null || echo n/a)"
-    echo "Configured PostgreSQL image: $(postgres_image)"
-    echo "Running PostgreSQL image ID: $(running_image_id "$POSTGRES_CONTAINER")"
-    echo "PostgreSQL server version:   $(podman exec "$POSTGRES_CONTAINER" psql -U docmost -d docmost -tAc 'show server_version' 2>/dev/null || echo n/a)"
-    echo "Configured Redis image:      $(redis_image)"
-    echo "Running Redis image ID:      $(running_image_id "$REDIS_CONTAINER")"
-    echo "AUTO_UPDATE=$(env_flag AUTO_UPDATE)"
+[[ $EUID == 0 ]] || die "Run as root inside the docmost CT."
+for command in podman systemctl curl awk sed sort head cat stat grep mktemp cp chmod mv rm flock timeout python3; do
+  command -v "$command" >/dev/null || die "Missing command: $command"
+done
+[[ -f $ENV_FILE ]] || die "Missing $ENV_FILE."
+exec 9>"$LOCK"
+flock -n 9 || die "Another maintenance operation is running."
+YES=0
+ARGS=()
+for arg in "$@"; do
+  case $arg in --yes|-y) YES=1 ;; *) ARGS+=("$arg") ;; esac
+done
+set -- "${ARGS[@]}"
+cmd=${1:---help}
+read_state
+case $cmd in
+  update|update-postgres|update-redis)
+    (( $# <= 2 )) || die "Usage: $0 $cmd [tag] [--yes]"
+    if (( YES == 0 )); then
+      exec 8</dev/tty || die "Interactive terminal or --yes is required."
+    fi
+    case $cmd in
+      update-postgres) update_component POSTGRES "${2:-}" ;;
+      update-redis) update_component REDIS "${2:-}" ;;
+      update) update_component APP "${2:-}" ;;
+    esac
     ;;
-  ""|-h|--help) usage ;;
-  *) usage; die "Unknown command: $cmd" ;;
+  auto-update)
+    (( $# == 1 )) || die "auto-update takes no tag."
+    [[ ${STATE[AUTO_UPDATE]} == 1 ]] || { printf '  Auto-update is disabled.\n'; exit 0; }
+    YES=1
+    for component in POSTGRES REDIS APP; do
+      update_component "$component"
+    done
+    ;;
+  check)
+    (( $# <= 2 )) && [[ ${2:-} == "" || ${2:-} == --initial ]] || die "Usage: $0 check [--initial]"
+    /usr/local/sbin/docmost-ufw-check
+    budget=${STATE[UPDATE_WAIT_SECONDS]}
+    [[ ${2:-} != --initial ]] || budget=${STATE[INITIAL_WAIT_SECONDS]}
+    for component in POSTGRES REDIS APP; do
+      select_component "$component"
+      load_unit
+      if [[ ${2:-} == --initial ]]; then
+        [[ $(systemctl show "$SERVICE" -p NRestarts --value) == 0 ]] || die "$SERVICE restarted during initial startup."
+      fi
+      wait_service "$CONTAINER" "$KIND" "$budget" || die "$SERVICE failed readiness or restarted."
+      actual=$(podman inspect --format '{{.Image}}' "$CONTAINER")
+      [[ $(image_id "$actual") == "$OLD_ID" ]] || die "Running/configured image mismatch: $SERVICE"
+    done
+    printf '  Service readiness, stable restart counts, image IDs and UFW checks passed.\n'
+    ;;
+  version)
+    (( $# == 1 )) || die "version takes no argument."
+    for component in POSTGRES REDIS APP; do
+      select_component "$component"; load_unit
+      printf '  %s\n    tag: %s\n    configured ID: %s\n    running ID: ' "$CONTAINER" "$OLD_TAG" "$OLD_ID"
+      podman inspect --format '{{.Image}}' "$CONTAINER" || true
+    done
+    ;;
+  --help|-h|'')
+    printf 'Usage: %s update [tag] [--yes] | update-postgres [tag] [--yes] | update-redis [tag] [--yes] | auto-update | check [--initial] | version\n' "$0"
+    printf '  Exact image IDs; one component per operation; PBS/PVE handles data recovery.\n'
+    printf '  Fresh-creator helper: do not replace an older deployed helper without migrating its control files.\n'
+    ;;
+  *) die "Unknown command: $cmd" ;;
 esac
 MAINT
-echo "  Maintenance script deployed: /usr/local/bin/docmost-maint.sh"
+pct push "$CT_ID" "$tmp" /usr/local/bin/docmost-maint.sh --perms 0755
+rm -f -- "$tmp"
 
 # ── Start via Quadlet ─────────────────────────────────────────────────────────
-# daemon-reload triggers the Quadlet generator which produces docmost.service,
-# docmost-postgres.service and docmost-redis.service as transient systemd units.
-# WantedBy=multi-user.target handles boot restarts. Transient units cannot be
-# systemctl-enabled; daemon-reload is sufficient. Starting docmost.service pulls
-# in both backends via Requires= and waits for their health checks (Notify=healthy).
-pct exec "$CT_ID" -- bash -lc "
-  set -euo pipefail
-  systemctl daemon-reload
-  systemctl start '${QUADLET_SERVICE}'
-"
-
-# ── Disarm destructive cleanup ────────────────────────────────────────────────
+pct exec "$CT_ID" -- bash -s -- docmost-postgres docmost-redis docmost <<'QUADLET_VALIDATE'
+set -euo pipefail
+output=$(mktemp)
+trap 'rm -f -- "$output"' EXIT
+/usr/lib/systemd/system-generators/podman-system-generator --dryrun > "$output"
+for service in "$@"; do
+  grep -Fq "$service.service" "$output" || { echo "ERROR: Quadlet generator omitted $service." >&2; exit 1; }
+done
+systemctl daemon-reload
+for service in "$@"; do
+  [[ $(systemctl show "$service.service" -p LoadState --value) == loaded ]] || exit 1
+done
+QUADLET_VALIDATE
+pct exec "$CT_ID" -- /usr/local/sbin/docmost-ufw-check
+# Preserve the CT even if the first persistent start fails partway through.
 CLEANUP_ON_FAIL=0
+pct exec "$CT_ID" -- systemctl start docmost.service
+
+# Destructive cleanup was disarmed before the first persistent service start.
 
 # ── Verification ──────────────────────────────────────────────────────────────
-sleep 3
+sleep 30
+if ! pct exec "$CT_ID" -- /usr/local/bin/docmost-maint.sh check --initial; then
+  echo "ERROR: Initial readiness/image/firewall verification failed; CT $CT_ID is preserved." >&2
+  exit 1
+fi
 VERIFY_FAIL=0
 
 for svc in "$POSTGRES_QUADLET_SERVICE" "$REDIS_QUADLET_SERVICE" "$QUADLET_SERVICE"; do
@@ -1296,7 +1388,7 @@ fi
 # Docmost migrates the schema on first start; an empty public schema means the
 # app came up without a working DATABASE_URL (or migrations failed silently).
 TABLE_COUNT="$(pct exec "$CT_ID" -- sh -lc "podman exec docmost-postgres psql -U docmost -d docmost -tAc \"select count(*) from pg_tables where schemaname='public'\" 2>/dev/null" 2>/dev/null | tr -d '[:space:]' || true)"
-if [[ "$TABLE_COUNT" =~ ^[0-9]+$ ]] && (( TABLE_COUNT > 0 )); then
+if [[ "$TABLE_COUNT" =~ ^(0|[1-9][0-9]*)$ ]] && (( TABLE_COUNT > 0 )); then
   echo "  Database migrated (${TABLE_COUNT} tables in schema public)"
 else
   echo "  ERROR: No tables found in the docmost database — migrations did not run" >&2
@@ -1304,47 +1396,113 @@ else
   VERIFY_FAIL=1
 fi
 
+
+# Verify credentials and the effective database, not only pg_isready.
+if ! pct exec "$CT_ID" -- python3 - <<'DATABASE_VERIFY'
+import pathlib, subprocess, urllib.parse
+app = "docmost"
+root = pathlib.Path("/opt") / app
+container = app + "-postgres"
+def envfile(path):
+    result = {}
+    for line in path.read_text().splitlines():
+        if not line or line.startswith("#"):
+            continue
+        key, value = line.split("=", 1)
+        if key in result:
+            raise SystemExit("Duplicate credential key")
+        result[key] = value
+    return result
+appenv = envfile(root / (app + ".env"))
+pgenv = envfile(root / "postgres.env")
+for ctr, values in ((app, appenv), (container, pgenv)):
+    for key, expected in values.items():
+        got = subprocess.check_output(["podman", "exec", ctr, "printenv", key], text=True, timeout=15).removesuffix("\n")
+        if got != expected:
+            raise SystemExit(f"Credential/config round trip failed: {ctr} {key}")
+encoded_password = urllib.parse.urlsplit(appenv["DATABASE_URL"]).password
+if not encoded_password:
+    raise SystemExit("Database verification failed: DATABASE_URL has no password")
+password = urllib.parse.unquote(encoded_password)
+def sql(statement, secret):
+    command = ["podman", "exec", "-i", container, "bash", "-c",
+               'IFS= read -r PGPASSWORD; export PGPASSWORD; exec psql -X -w -v ON_ERROR_STOP=1 -h 127.0.0.1 -p 5432 -U "$1" -d "$1" -tAc "$2"',
+               "check", app, statement]
+    return subprocess.run(command, input=secret+"\n", text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15)
+def verify_result(label, result, expected):
+    if result.returncode or result.stdout.strip() != expected:
+        detail = result.stderr.strip() if result.returncode else f"expected {expected!r}, got {result.stdout.strip()!r}"
+        # Show the failing check and PostgreSQL error, but never credentials.
+        for value in sorted({*appenv.values(), *pgenv.values(), password, encoded_password}, key=len, reverse=True):
+            if value:
+                detail = detail.replace(value, "[redacted]")
+        raise SystemExit(f"Database verification failed [{label}]: {detail or 'query failed without diagnostic output'}")
+    print(f"  Database check passed: {label}", flush=True)
+verify_result("TCP password authentication", sql("SELECT 1", password), "1")
+if sql("SELECT 1", "deliberately-wrong").returncode == 0:
+    raise SystemExit("PostgreSQL accepted an incorrect TCP password")
+print("  Database check passed: incorrect TCP password rejected", flush=True)
+checks = [
+    ("restricted application role", "SELECT rolcanlogin AND NOT rolsuper AND NOT rolcreatedb AND NOT rolcreaterole AND NOT rolreplication AND NOT rolbypassrls FROM pg_roles WHERE rolname='docmost'", "t"),
+    ("database ownership", "SELECT pg_get_userbyid(datdba)='docmost' FROM pg_database WHERE datname='docmost'", "t"),
+    ("schema migrations", "SELECT count(*)>0 FROM pg_tables WHERE schemaname='public'", "t"),
+]
+for label, query, expected in checks:
+    verify_result(label, sql(query, password), expected)
+# SHOW data_directory and pg_hba_file_rules require elevated read privileges.
+# Use the existing bootstrap administrator over its local Unix socket; the
+# application keeps NOSUPERUSER and receives no extra roles or permissions.
+admin_checks = [
+    ("persistent data directory", "SHOW data_directory", "/var/lib/postgresql/18/docker"),
+    ("SCRAM host authentication rules", "SELECT count(*)=0 FROM pg_hba_file_rules WHERE error IS NOT NULL OR (type LIKE 'host%' AND auth_method <> 'scram-sha-256')", "t"),
+]
+for label, query, expected in admin_checks:
+    result = subprocess.run(["podman", "exec", container, "psql", "-X", "-w", "-v", "ON_ERROR_STOP=1",
+                             "-h", "/var/run/postgresql", "-p", "5432", "-U", "postgres", "-d", app, "-tAc", query],
+                            text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15)
+    verify_result(label, result, expected)
+print("  Database credentials, authentication, role, persistent path and schema verified.")
+DATABASE_VERIFY
+then
+  VERIFY_FAIL=1
+fi
+
 if (( VERIFY_FAIL == 1 )); then
   echo "" >&2
   echo "  FATAL: Core verification failed — CT $CT_ID is preserved but the install is incomplete." >&2
-  echo "  Inspect the container and fix manually, or destroy and re-run." >&2
+  echo "  Inspect the named check above; preserve the CT and its data while resolving the failure." >&2
   exit 1
 fi
 
 # ── Auto-update timer (policy-driven) ─────────────────────────────────────────
-pct exec "$CT_ID" -- bash -lc "
-  set -euo pipefail
-  cat > /etc/systemd/system/docmost-update.service <<EOF2
+pct exec "$CT_ID" -- bash -s -- "$UPDATE_TIME" <<'TIMER_INSTALL'
+set -euo pipefail
+cat > /etc/systemd/system/docmost-update.service <<EOF2
 [Unit]
-Description=Docmost auto-update maintenance run
+Description=docmost image maintenance
 After=network-online.target
 Wants=network-online.target
-
 [Service]
 Type=oneshot
 ExecStart=/usr/local/bin/docmost-maint.sh auto-update
+TimeoutStartSec=infinity
+TimeoutStopSec=180
 EOF2
-
-  cat > /etc/systemd/system/docmost-update.timer <<EOF2
+cat > /etc/systemd/system/docmost-update.timer <<EOF2
 [Unit]
-Description=Docmost auto-update timer
-
+Description=docmost daily image maintenance
 [Timer]
-OnCalendar=*-*-* ${UPDATE_TIME}:00
+OnCalendar=*-*-* $1:00
 Persistent=true
-
 [Install]
 WantedBy=timers.target
 EOF2
-
-  systemctl daemon-reload
-"
-if [[ "$AUTO_UPDATE" -eq 1 ]]; then
-  pct exec "$CT_ID" -- bash -lc 'systemctl enable --now docmost-update.timer'
-  echo "  Auto-update timer enabled"
+systemctl daemon-reload
+TIMER_INSTALL
+if [[ $AUTO_UPDATE == 1 ]]; then
+  pct exec "$CT_ID" -- systemctl enable --now docmost-update.timer
 else
-  pct exec "$CT_ID" -- bash -lc 'systemctl disable --now docmost-update.timer >/dev/null 2>&1 || true'
-  echo "  Auto-update timer installed but disabled"
+  pct exec "$CT_ID" -- systemctl disable --now docmost-update.timer
 fi
 
 # ── Unattended upgrades ───────────────────────────────────────────────────────
@@ -1499,6 +1657,43 @@ pct set "$CT_ID" --description "$DM_DESC"
 # ── Protect container ─────────────────────────────────────────────────────────
 pct set "$CT_ID" --protection 1
 
+
+cat <<OPERATIONS
+
+  DOCMOST — OPERATIONS
+
+  CONTAINER     $HN | CT $CT_ID | $CT_IP
+  WEB/ADMIN     http://$CT_IP:$APP_PORT/
+  ALLOWED FROM  $FIREWALL_ACCESS_LABEL
+  FIREWALL      UFW inside the CT, IPv4 and IPv6; no PVE firewall dependency
+  AUTO-UPDATE   $AUTO_UPDATE | daily $UPDATE_TIME ($APP_TZ)
+  IMAGES        exact local IDs, Pull=never; old images retained for review
+
+  RUN ON THE PROXMOX HOST
+    pct enter $CT_ID
+    pct exec $CT_ID -- /usr/local/bin/docmost-maint.sh version
+
+  RUN INSIDE THE CT
+    /usr/local/bin/docmost-maint.sh check
+    /usr/local/bin/docmost-maint.sh update $APP_TAG
+    ufw status verbose
+    journalctl -u docmost.service --no-pager -n 80
+
+  ACCESS CHECK
+    Test the web endpoint from your intended client/proxy.
+    If you restricted sources, also test from outside the allowed list.
+    Installer rule checks do not prove the full network path.
+    Add/delete UFW rules directly; do not restart ufw.service while apps run.
+
+  RECOVERY
+    Verify a matching PBS/PVE checkpoint before updates; --yes only skips prompts.
+    If FUSE is enabled, use stop-mode PBS. Back up external bind mounts separately.
+    For persistent components, failed updates retain the target after it may start.
+    The helper changes one component at a time; earlier successes remain applied.
+    Creators build new CTs. Existing CTs require a reviewed control-file migration.
+
+OPERATIONS
+
 # ── Summary ───────────────────────────────────────────────────────────────────
 echo ""
 echo "    CT: $CT_ID | IP: ${CT_IP} | Web UI: http://${CT_IP}:${APP_PORT}/"
@@ -1518,9 +1713,9 @@ echo "    Policy:  $([ "$AUTO_UPDATE" -eq 1 ] && echo "auto-update daily at ${UP
 echo ""
 echo "    pct exec $CT_ID -- systemctl status docmost.service"
 echo "    pct exec $CT_ID -- journalctl -u docmost.service --no-pager -n 50"
-echo "    pct exec $CT_ID -- /usr/local/bin/docmost-maint.sh update <tag>           # latest, or pin e.g. 0.96.0"
+echo "    pct exec $CT_ID -- /usr/local/bin/docmost-maint.sh update <tag>           # pin e.g. 0.96.0"
 echo "    pct exec $CT_ID -- /usr/local/bin/docmost-maint.sh update-postgres <tag>  # same major only, e.g. 18.7"
-echo "    pct exec $CT_ID -- /usr/local/bin/docmost-maint.sh update-redis <tag>     # latest, or pin e.g. 8.10.2"
+echo "    pct exec $CT_ID -- /usr/local/bin/docmost-maint.sh update-redis <tag>     # pin e.g. 8.10.2"
 echo "    pct exec $CT_ID -- /usr/local/bin/docmost-maint.sh auto-update            # re-pull current tags now (if AUTO_UPDATE=1)"
 echo "    pct exec $CT_ID -- /usr/local/bin/docmost-maint.sh version"
 echo "    Backup/restore: use PBS or PVE snapshots (take one before every Docmost update — migrations are forward-only)"
@@ -1530,7 +1725,7 @@ if [[ -z "$APP_FQDN" ]]; then
   echo "    When you put it behind a domain, set Environment=APP_URL=https://<fqdn> in ${QUADLET_FILE},"
   echo "    update APP_URL/APP_FQDN in ${APP_DIR}/.env, then: systemctl daemon-reload && systemctl restart docmost.service"
 fi
-echo "    Port ${APP_PORT} listens on all CT interfaces (Network=host) — restrict with the PVE firewall if needed."
+echo "    Port ${APP_PORT} listens on all CT interfaces (Network=host) — access follows the UFW source choice shown above."
 echo "    Health probe: curl -s http://${CT_IP}:${APP_PORT}/api/health"
 echo "    Mail is not configured (MAIL_DRIVER defaults to log): invites/password resets are printed to the journal."
 echo "    Add MAIL_* variables to ${APP_ENV_FILE} and restart docmost.service to enable SMTP/Postmark."
