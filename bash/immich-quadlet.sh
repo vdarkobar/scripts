@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
 set -Eeo pipefail
+umask 022
+export LC_ALL=C
+# Safety revision: 2026-09-11. Fresh Proxmox CT creator; maintenance runs inside the CT.
 
 # ── Config ────────────────────────────────────────────────────────────────────
 CT_ID=""                             # empty = auto-assign via pvesh; set e.g. CT_ID=120 to pin
@@ -27,7 +30,7 @@ TAGS="immich;podman;quadlet;lxc"
 # here) plus the floating tags latest / noml / cuda / openvino. GHCR is the source
 # of truth: https://github.com/imagegenius/docker-immich/pkgs/container/immich
 APP_IMAGE_REPO="ghcr.io/imagegenius/immich"
-APP_TAG="3.1.0"                      # full version (optionally -noml), or "latest"; floating 3 / 3.1 / noml are rejected
+APP_TAG="3.1.0"                      # full version (optionally -noml), only; floating 3 / 3.1 / noml are rejected
 # PostgreSQL with VectorChord — Immich requires this image family. Take the tag
 # from the Immich release notes; a different major (14- → 15-) needs a dump/restore
 # and is refused by the maint script.
@@ -36,15 +39,15 @@ POSTGRES_TAG="14-vectorchord0.4.3-pgvectors0.2.0"
 POSTGRES_STORAGE_TYPE="SSD"          # SSD | HDD — HDD sets DB_STORAGE_TYPE=HDD (random_page_cost tuning in the image)
 # Valkey (job queue): Immich upstream ships valkey:8-bookworm; pinned to a full 8.x here.
 VALKEY_IMAGE_REPO="docker.io/valkey/valkey"
-VALKEY_TAG="8.1.3"                   # full version like 8.1.3, or "latest"; floating majors (8, 8.1) are rejected
+VALKEY_TAG="8.1.3"                   # full version like 8.1.3, only; floating majors (8, 8.1) are rejected
 DEBIAN_VERSION=13
 
 # Auto-update policy
 # AUTO_UPDATE=0 (default): timer installed but disabled; manual updates via
 #   immich-maint.sh update <tag> / update-postgres <tag> / update-valkey <tag>
-# AUTO_UPDATE=1: immich-update.timer re-pulls the CURRENT tags (pinned or latest)
+# AUTO_UPDATE=1: immich-update.timer re-pulls the CURRENT pinned tags
 #   daily at UPDATE_TIME and restarts only what changed; a failed health check
-#   rolls back to the previous image. Immich runs DB migrations on upgrade —
+#   reports failure and retains the target. Immich runs DB migrations on upgrade —
 #   an image rollback after a migrated schema is NOT safe; PBS covers that case.
 AUTO_UPDATE=0
 UPDATE_TIME="03:00"                  # local CT time (APP_TZ), HH:MM; timer runs daily
@@ -66,6 +69,17 @@ EXTRA_PACKAGES=(
 # Behavior
 CLEANUP_ON_FAIL=1
 
+
+# Service verification and in-CT firewall
+INITIAL_WAIT_SECONDS=600
+UPDATE_WAIT_SECONDS=1800             # permit migrations; a timeout does not stop the app
+# Bare IPs (192.168.1.20) or network CIDRs (192.168.1.0/24).
+# Empty array prompts before CT creation; pressing Enter allows any source
+# on APP_PORT (IPv4/IPv6). UFW stays enabled. Set client/NPM sources to restrict.
+UFW_ALLOWED_SOURCES=()
+SCRIPT_URL="https://raw.githubusercontent.com/vdarkobar/scripts/main/bash/immich-quadlet.sh"
+SCRIPT_LOCAL="/root/immich-quadlet.sh"
+
 # Derived
 APP_DIR="/opt/immich"
 LIBRARY_DIR="${APP_DIR}/library"
@@ -83,6 +97,9 @@ APP_ENV_FILE="${APP_DIR}/immich.env"          # DB_PASSWORD for the app containe
 POSTGRES_ENV_FILE="${APP_DIR}/postgres.env"   # POSTGRES_PASSWORD for the DB container (EnvironmentFile=, 0600)
 
 # ── Custom configs created by this script ─────────────────────────────────────
+#   /usr/local/sbin/immich-ufw-check                  (service-start firewall guard)
+#   /etc/default/ufw, /etc/ufw/ufw.conf               (in-CT IPv4/IPv6 policy)
+#   /etc/ufw/user.rules, /etc/ufw/user6.rules         (configured source allows)
 #   /etc/containers/systemd/immich.container           (Quadlet unit — source of truth)
 #   /etc/containers/systemd/immich-postgres.container  (Quadlet unit — PostgreSQL/VectorChord)
 #   /etc/containers/systemd/immich-valkey.container    (Quadlet unit — job queue)
@@ -109,12 +126,12 @@ POSTGRES_ENV_FILE="${APP_DIR}/postgres.env"   # POSTGRES_PASSWORD for the DB con
 
 # ── Config validation ─────────────────────────────────────────────────────────
 [[ "$HN" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$ ]] || { echo "  ERROR: HN is not a valid hostname: $HN" >&2; exit 1; }
-[[ "$CPU" =~ ^[0-9]+$ ]] && (( CPU >= 1 )) || { echo "  ERROR: CPU must be a positive integer." >&2; exit 1; }
-[[ "$RAM" =~ ^[0-9]+$ ]] && (( RAM >= 256 )) || { echo "  ERROR: RAM must be >= 256 MB." >&2; exit 1; }
-[[ "$DISK" =~ ^[0-9]+$ ]] && (( DISK >= 1 )) || { echo "  ERROR: DISK must be >= 1 GB." >&2; exit 1; }
-[[ "$DEBIAN_VERSION" =~ ^[0-9]+$ ]] || { echo "  ERROR: DEBIAN_VERSION must be numeric." >&2; exit 1; }
-[[ "$APP_PORT" =~ ^[0-9]+$ ]] || { echo "  ERROR: APP_PORT must be numeric." >&2; exit 1; }
-(( APP_PORT >= 1 && APP_PORT <= 65535 )) || { echo "  ERROR: APP_PORT must be between 1 and 65535." >&2; exit 1; }
+[[ "$CPU" =~ ^(0|[1-9][0-9]*)$ ]] && (( CPU >= 1 )) || { echo "  ERROR: CPU must be a positive integer." >&2; exit 1; }
+[[ "$RAM" =~ ^(0|[1-9][0-9]*)$ ]] && (( RAM >= 256 )) || { echo "  ERROR: RAM must be >= 256 MB." >&2; exit 1; }
+[[ "$DISK" =~ ^(0|[1-9][0-9]*)$ ]] && (( DISK >= 1 )) || { echo "  ERROR: DISK must be >= 1 GB." >&2; exit 1; }
+[[ "$DEBIAN_VERSION" == 13 ]] || { echo "  ERROR: This creator requires Debian 13." >&2; exit 1; }
+[[ "$APP_PORT" =~ ^(0|[1-9][0-9]*)$ ]] || { echo "  ERROR: APP_PORT must be numeric." >&2; exit 1; }
+(( APP_PORT >= 1024 && APP_PORT <= 65535 )) || { echo "  ERROR: APP_PORT must be between 1024 and 65535." >&2; exit 1; }
 # All three containers share the CT network stack (Network=host).
 (( APP_PORT != 5432 && APP_PORT != 6379 && APP_PORT != 3003 )) \
   || { echo "  ERROR: APP_PORT $APP_PORT collides with PostgreSQL (5432), Valkey (6379) or machine learning (3003) on the shared host network." >&2; exit 1; }
@@ -130,21 +147,21 @@ for _repo_var in APP_IMAGE_REPO POSTGRES_IMAGE_REPO VALKEY_IMAGE_REPO; do
   }
 done
 unset _repo_var
-# Immich: "latest" or full semver with optional -noml (3.1.0, 3.1.0-noml). Floating
+# Immich: pinned full semver with optional -noml (3.1.0, 3.1.0-noml). Floating
 # majors (3, 3.1) and bare variant tags (noml, cuda, openvino) are rejected — they
 # hide which line is running without the simplicity of "latest".
-[[ "$APP_TAG" == "latest" || "$APP_TAG" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-noml)?$ ]] || {
-  echo "  ERROR: APP_TAG must be 'latest' or a full version like 3.1.0 / 3.1.0-noml (floating tags like 3, 3.1 or noml are not accepted)." >&2
+[[ "$APP_TAG" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-noml)?$ ]] || {
+  echo "  ERROR: APP_TAG must be a pinned full version like 3.1.0 / 3.1.0-noml (floating tags like 3, 3.1 or noml are not accepted)." >&2
   exit 1
 }
 # PostgreSQL: <major>-vectorchord<ver>[-pgvectors<ver>] exactly as published by immich-app.
-[[ "$POSTGRES_TAG" =~ ^[0-9]{2}-vectorchord[0-9]+\.[0-9]+\.[0-9]+(-pgvectors[0-9]+\.[0-9]+\.[0-9]+)?$ ]] || {
+[[ "$POSTGRES_TAG" =~ ^14-vectorchord[0-9]+\.[0-9]+\.[0-9]+(-pgvectors[0-9]+\.[0-9]+\.[0-9]+)?$ ]] || {
   echo "  ERROR: POSTGRES_TAG must look like 14-vectorchord0.4.3-pgvectors0.2.0 (see Immich release notes)." >&2
   exit 1
 }
-# Valkey: "latest" or full semver (8.1.3, 8.1.3-bookworm). Floating majors (8, 8.1) are rejected.
-[[ "$VALKEY_TAG" == "latest" || "$VALKEY_TAG" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9._-]+)?$ ]] || {
-  echo "  ERROR: VALKEY_TAG must be 'latest' or a full version like 8.1.3 (floating tags like 8 are not accepted)." >&2
+# Valkey: pinned full semver (8.1.3, 8.1.3-bookworm). Floating majors (8, 8.1) are rejected.
+[[ "$VALKEY_TAG" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9._-]+)?$ ]] || {
+  echo "  ERROR: VALKEY_TAG must be a pinned full version like 8.1.3 (floating tags like 8 are not accepted)." >&2
   exit 1
 }
 [[ "$UPDATE_TIME" =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]] || { echo "  ERROR: UPDATE_TIME must be HH:MM (24h), e.g. 03:00." >&2; exit 1; }
@@ -167,20 +184,29 @@ for pkg in "${EXTRA_PACKAGES[@]}"; do
   [[ "$pkg" =~ ^[a-z0-9][a-z0-9+.-]*$ ]] || { echo "  ERROR: Invalid package name in EXTRA_PACKAGES: $pkg" >&2; exit 1; }
 done
 
+
+for wait_var in INITIAL_WAIT_SECONDS UPDATE_WAIT_SECONDS; do
+  [[ ${!wait_var} =~ ^[1-9][0-9]{1,4}$ ]] && (( ${!wait_var} >= 30 && ${!wait_var} <= 86400 )) \
+    || { echo "ERROR: $wait_var must be 30..86400 seconds." >&2; exit 1; }
+done
+[[ $UPDATE_TIME =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]] || { echo "ERROR: Invalid UPDATE_TIME." >&2; exit 1; }
+
 # ── Trap cleanup ──────────────────────────────────────────────────────────────
 trap 'rc=$?;
   trap - ERR
-  echo "  ERROR: failed (rc=$rc) near line ${BASH_LINENO[0]:-?}" >&2
+  echo "  ERROR: failed (rc=$rc) near line ${LINENO:-?}" >&2
   echo "  Command: $BASH_COMMAND" >&2
   if [[ "${CLEANUP_ON_FAIL:-0}" -eq 1 && "${CREATED:-0}" -eq 1 ]]; then
     echo "  Cleanup: stopping/destroying CT ${CT_ID} ..." >&2
     pct stop "${CT_ID}" >/dev/null 2>&1 || true
     pct destroy "${CT_ID}" >/dev/null 2>&1 || true
   fi
+  [[ -z ${PHOTO_MOUNT_SRC:-} ]] || echo "  External photo path retained: ${PHOTO_MOUNT_SRC}" >&2
   exit "$rc"
 ' ERR
 
-trap 'rc=$?;
+trap 'rc=130;
+  trap - ERR INT TERM HUP
   echo "  Interrupted (rc=$rc)" >&2
   echo "  Command: $BASH_COMMAND" >&2
   if [[ "${CLEANUP_ON_FAIL:-0}" -eq 1 && "${CREATED:-0}" -eq 1 ]]; then
@@ -188,13 +214,14 @@ trap 'rc=$?;
     pct stop "${CT_ID}" >/dev/null 2>&1 || true
     pct destroy "${CT_ID}" >/dev/null 2>&1 || true
   fi
+  [[ -z ${PHOTO_MOUNT_SRC:-} ]] || echo "  External photo path retained: ${PHOTO_MOUNT_SRC}" >&2
   exit "$rc"
-' INT TERM
+' INT TERM HUP
 
 # ── Preflight — root & commands ───────────────────────────────────────────────
 [[ "$(id -u)" -eq 0 ]] || { echo "  ERROR: Run as root on the Proxmox host." >&2; exit 1; }
 
-for cmd in pvesh pveam pct pvesm qm curl python3 ip awk grep sed sort paste seq readlink cp chmod chown stat dpkg head tr ls mkdir; do
+for cmd in pvesh pveam pct pvesm qm curl python3 ip awk grep sed sort paste seq readlink cp chmod chown stat dpkg head tr ls mkdir flock mktemp mv rm tail bash timeout; do
   command -v "$cmd" >/dev/null 2>&1 || { echo "  ERROR: Missing required command: $cmd" >&2; exit 1; }
 done
 if [[ "$PHOTO_STORAGE" != "rootfs" && "$PHOTO_STORAGE" != /* ]]; then
@@ -206,6 +233,10 @@ fi
 # pveam lists templates for more than one CPU architecture. Selecting only by
 # Debian version can pick an ARM64 rootfs on an AMD64 host (or vice versa),
 # which creates successfully but fails when LXC executes /sbin/init.
+# Serialize this creator before assigning an ID or checking its hostname.
+exec 7>/run/lock/immich-creator.lock
+flock -n 7 || { echo "ERROR: Another immich creator is running." >&2; exit 1; }
+
 HOST_ARCH="$(dpkg --print-architecture)"
 case "$HOST_ARCH" in
   amd64|arm64) ;;
@@ -219,8 +250,10 @@ if ! exec 8</dev/tty; then
   exit 1
 fi
 
+[[ -t 8 ]] || { echo "ERROR: Prompt input must be a terminal." >&2; exit 1; }
+
 if [[ -n "$CT_ID" ]]; then
-  [[ "$CT_ID" =~ ^[0-9]+$ ]] && (( CT_ID >= 100 && CT_ID <= 999999999 )) \
+  [[ "$CT_ID" =~ ^(0|[1-9][0-9]*)$ ]] && (( CT_ID >= 100 && CT_ID <= 999999999 )) \
     || { echo "  ERROR: CT_ID must be an integer >= 100." >&2; exit 1; }
   if pct status "$CT_ID" >/dev/null 2>&1 || qm status "$CT_ID" >/dev/null 2>&1; then
     echo "  ERROR: CT_ID $CT_ID is already in use on this node." >&2
@@ -237,7 +270,7 @@ fi
 EXISTING_CT="$(pct list 2>/dev/null | awk -v h="$HN" 'NR>1 && $NF==h {print $1}' | head -n1)"
 if [[ -n "$EXISTING_CT" ]]; then
   echo "  ERROR: A CT with hostname '${HN}' already exists on this node (CT ${EXISTING_CT})." >&2
-  echo "  Destroy it (pct set ${EXISTING_CT} --protection 0; pct destroy ${EXISTING_CT}) or change HN, then re-run." >&2
+  echo "  Fresh creator: use the existing CT maintenance helper, or review the retained CT before removing it." >&2
   exit 1
 fi
 
@@ -306,12 +339,12 @@ cat <<EOF2
   FQDN:              $([ -n "$APP_FQDN" ] && echo "$APP_FQDN" || echo "(no public FQDN — local IP mode)")
   Photo storage:     $PHOTO_STORAGE (ZFS pools: $AVAIL_ZFS_POOLS)
   Photo library:     $PHOTO_MAPPING
-  Listens on:        0.0.0.0:${APP_PORT} inside the CT (Network=host) — reachable from the whole LAN
+  Listens on:        0.0.0.0:${APP_PORT} inside the CT (Network=host) — access follows the UFW source choice below
                      PostgreSQL 127.0.0.1:5432, Valkey 127.0.0.1:6379, ML 127.0.0.1:3003 (loopback only)
   Podman storage:    $([ "$PODMAN_FUSE_OVERLAY" -eq 1 ] && echo "fuse-overlayfs (fuse=1)" || echo "native overlay (no FUSE)")
   Tags:              $TAGS
   Auto-update:       $([ "$AUTO_UPDATE" -eq 1 ] && echo "enabled — daily at ${UPDATE_TIME} (re-pull $APP_TAG / $POSTGRES_TAG / $VALKEY_TAG)" || echo "disabled ($APP_TAG / $POSTGRES_TAG / $VALKEY_TAG, manual)")
-  Cleanup on fail:   $CLEANUP_ON_FAIL (until first service start; CT preserved after that — host photo path/dataset is never removed)
+  Cleanup on fail:   $CLEANUP_ON_FAIL (disarmed before first persistent start) (until first service start; CT preserved after that — host photo path/dataset is never removed)
   ────────────────────────────────────────
   To change defaults, press Enter and
   edit the Config section at the top of
@@ -319,38 +352,91 @@ cat <<EOF2
 
 EOF2
 
-SCRIPT_URL="https://raw.githubusercontent.com/vdarkobar/scripts/main/bash/immich-quadlet.sh"
-SCRIPT_LOCAL="/root/immich-quadlet.sh"
 SCRIPT_SELF="$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")"
 
-read -r -p "  Continue with these settings? [y/N]: " response <&8
+response=""
+read -r -p "  Continue with these settings? [y/N]: " response <&8 || response=""
 case "$response" in
   [yY][eE][sS]|[yY]) ;;
   *)
     echo ""
-    echo "  Saving current script to ${SCRIPT_LOCAL} for editing..."
-    # Shebang check: when run as 'curl | bash', $0 is the bash binary, not this script.
-    if [[ -f "$SCRIPT_SELF" ]] && head -n1 "$SCRIPT_SELF" 2>/dev/null | grep -q '^#!/usr/bin/env bash$' \
-      && cp -f -- "$SCRIPT_SELF" "$SCRIPT_LOCAL"; then
-      chmod +x "$SCRIPT_LOCAL"
-      echo "  Edit:  nano ${SCRIPT_LOCAL}"
-      echo "  Run:   bash ${SCRIPT_LOCAL}"
-      echo ""
-    elif curl -fsSL "$SCRIPT_URL" -o "$SCRIPT_LOCAL"; then
-      chmod +x "$SCRIPT_LOCAL"
-      echo "  WARNING: Could not copy the running script; downloaded fallback from GitHub instead."
-      echo "  Edit:  nano ${SCRIPT_LOCAL}"
-      echo "  Run:   bash ${SCRIPT_LOCAL}"
-      echo ""
+    echo "  Keeping an editable script copy..."
+    if [[ -f "$SCRIPT_SELF" ]] && head -n 1 "$SCRIPT_SELF" | grep -q '^#!/usr/bin/env bash$'; then
+      # The running local file is already the correct editable copy. In particular,
+      # never cp a file onto itself and then fetch a replacement over user edits.
+      echo "  Edit: nano $SCRIPT_SELF"
+      echo "  Run:  bash $SCRIPT_SELF"
     else
-      echo "  ERROR: Failed to save a local editable copy of the script." >&2
-      exit 1
+      [[ ! -e $SCRIPT_LOCAL ]] || SCRIPT_LOCAL="/root/immich-quadlet-downloaded.$$.sh"
+      DOWNLOAD_TEMP=$(mktemp /root/immich-download.XXXXXX)
+      if curl -fLsS --retry 3 --connect-timeout 10 --max-time 120 "$SCRIPT_URL" -o "$DOWNLOAD_TEMP" \
+        && head -n 1 "$DOWNLOAD_TEMP" | grep -q '^#!/usr/bin/env bash$' \
+        && bash -n "$DOWNLOAD_TEMP"; then
+        chmod 0700 "$DOWNLOAD_TEMP"
+        mv -T "$DOWNLOAD_TEMP" "$SCRIPT_LOCAL"
+        echo "  Downloaded a separate upstream copy; it may differ from the piped script."
+        echo "  Edit: nano $SCRIPT_LOCAL"
+      else
+        rm -f -- "$DOWNLOAD_TEMP"
+        echo "  ERROR: Could not save a validated upstream copy. Existing files were preserved." >&2
+        exit 1
+      fi
     fi
     exit 0
     ;;
 esac
 
 echo ""
+
+
+# ── Firewall access sources ───────────────────────────────────────────────────
+# Enter NPM host addresses for proxy-only access, or client subnets for direct
+# LAN access. Enter without sources opens only APP_PORT, not the whole firewall.
+FIREWALL_ACCESS_LABEL=""
+if (( ${#UFW_ALLOWED_SOURCES[@]} == 0 )); then
+  cat <<FIREWALL_HELP
+  Firewall access for TCP $APP_PORT:
+
+    One device:       192.168.1.20
+    Whole subnet:     192.168.1.0/24
+    Multiple sources: 192.168.1.20 192.168.2.0/24
+    IPv6 examples:    fd00::20 or fd00::/64
+
+  CIDR format: network-address/prefix-length
+  Example: 192.168.1.0/24 covers the 192.168.1.x subnet.
+  Use the network address (no host bits); replace examples with your addresses.
+
+  Press Enter to allow any source on TCP $APP_PORT (IPv4 and IPv6).
+  UFW stays enabled. Any source includes the internet if this CT is reachable.
+
+FIREWALL_HELP
+  if ! read -r -p "  Allowed sources (space-separated) [Enter = any]: " firewall_input <&8; then
+    echo "ERROR: Firewall input interrupted; no access policy selected." >&2
+    exit 1
+  fi
+  read -r -a UFW_ALLOWED_SOURCES <<< "$firewall_input"
+  if (( ${#UFW_ALLOWED_SOURCES[@]} == 0 )); then
+    UFW_ALLOWED_SOURCES=("0.0.0.0/0" "::/0")
+    FIREWALL_ACCESS_LABEL="Any source (IPv4 and IPv6)"
+  fi
+fi
+if ! python3 - "${UFW_ALLOWED_SOURCES[@]}"  <<'FIREWALL_VALIDATE'
+import ipaddress, sys
+for value in sys.argv[1:]:
+    try:
+        network = ipaddress.ip_network(value, strict=True)
+    except ValueError:
+        print(f"ERROR: Invalid firewall source {value!r}. Use a host IP (192.168.1.20) or network CIDR (192.168.1.0/24, no host bits).", file=sys.stderr)
+        sys.exit(1)
+    if network.network_address.is_multicast or network.network_address.is_loopback:
+        print(f"ERROR: Expected a client/proxy source, got {value!r}.", file=sys.stderr)
+        sys.exit(1)
+FIREWALL_VALIDATE
+then
+  exit 1
+fi
+FIREWALL_ACCESS_LABEL="${FIREWALL_ACCESS_LABEL:-${UFW_ALLOWED_SOURCES[*]}}"
+echo "  UFW TCP $APP_PORT allowed sources: $FIREWALL_ACCESS_LABEL"
 
 # ── Preflight — environment ───────────────────────────────────────────────────
 pvesm status | awk -v s="$TEMPLATE_STORAGE" '$1==s{f=1} END{exit(!f)}' \
@@ -538,14 +624,14 @@ fi
 # ── Start & wait for IPv4 ─────────────────────────────────────────────────────
 pct start "$CT_ID"
 CT_IP=""
-for i in $(seq 1 30); do
+for i in $(seq 1 60); do
   CT_IP="$(pct exec "$CT_ID" -- sh -lc '
     ip -4 -o addr show scope global 2>/dev/null | awk "{print \$4}" | cut -d/ -f1 | head -n1
   ' 2>/dev/null || true)"
   [[ -n "$CT_IP" ]] && break
   sleep 1
 done
-[[ -n "$CT_IP" ]] || { echo "  ERROR: No IPv4 address acquired via DHCP within timeout." >&2; exit 1; }
+[[ -n "$CT_IP" ]] || { echo "  ERROR: No IPv4 address acquired via DHCP within timeout." >&2; false; }
 echo "  CT $CT_ID is up — IP: $CT_IP"
 
 printf 'root:%s\n' "$PASSWORD" | pct exec "$CT_ID" -- chpasswd
@@ -572,7 +658,7 @@ pct exec "$CT_ID" -- bash -lc "
   set -euo pipefail
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -qq
-  apt-get install -y locales curl ca-certificates iproute2 podman tar gzip ${PODMAN_FUSE_PKG}
+  apt-get install -y locales curl ca-certificates iproute2 python3 ufw iptables util-linux podman tar gzip ${PODMAN_FUSE_PKG}
   sed -i 's/^# *en_US.UTF-8/en_US.UTF-8/' /etc/locale.gen
   locale-gen
   update-locale LANG=en_US.UTF-8
@@ -589,6 +675,62 @@ pct exec "$CT_ID" -- bash -lc '
   apt-get purge -y openssh-server postfix 2>/dev/null || true
   apt-get -y autoremove
 '
+
+# ── UFW inside the CT ─────────────────────────────────────────────────────────
+# Fresh CT only. Network=host uses this CT's INPUT chain.
+pct exec "$CT_ID" -- bash -s -- "$APP_PORT" "${UFW_ALLOWED_SOURCES[@]}" <<'UFWSETUP'
+set -euo pipefail
+export LC_ALL=C
+port=$1; shift
+(( $# > 0 )) || { echo "ERROR: No allowed source addresses."; false; }
+iptables -w 5 -S INPUT >/dev/null
+ip6tables -w 5 -S INPUT >/dev/null
+ufw --force reset
+sed -i 's/^IPV6=.*/IPV6=yes/' /etc/default/ufw
+grep -qx 'IPV6=yes' /etc/default/ufw
+# The creator owns sysctl hardening; avoid a second writer in ufw-init.
+grep -q '^IPT_SYSCTL=' /etc/default/ufw
+sed -i 's|^IPT_SYSCTL=.*|IPT_SYSCTL=|' /etc/default/ufw
+ufw default deny incoming
+ufw default allow outgoing
+ufw default deny routed
+ufw logging off
+for source in "$@"; do
+  ufw allow in proto tcp from "$source" to any port "$port"
+done
+ufw --force enable
+systemctl enable ufw.service
+systemctl restart ufw.service
+for source in "$@"; do
+  tool=iptables; prefix=ufw
+  if [[ $source == *:* ]]; then tool=ip6tables; prefix=ufw6; fi
+  "$tool" -w 5 -C "$prefix-user-input" -s "$source" -p tcp -m tcp --dport "$port" -j ACCEPT
+done
+UFWSETUP
+
+tmp=$(mktemp)
+cat > "$tmp" <<'UFWCHECK'
+#!/usr/bin/env bash
+set -euo pipefail
+export LC_ALL=C
+# Startup guard: active filtering and default-deny in both address families.
+# Installation verifies specific allow rules; test access from client hosts too.
+grep -qx 'ENABLED=yes' /etc/ufw/ufw.conf
+grep -qx 'IPV6=yes' /etc/default/ufw
+status=$(/usr/sbin/ufw status)
+grep -qx 'Status: active' <<< "$status"
+for tool in /usr/sbin/iptables /usr/sbin/ip6tables; do
+  prefix=ufw
+  [[ ${tool##*/} != ip6tables ]] || prefix=ufw6
+  rules=$("$tool" -w 5 -S INPUT)
+  grep -qx -- '-P INPUT DROP' <<< "$rules"
+  "$tool" -w 5 -C INPUT -j "$prefix-before-input"
+  "$tool" -w 5 -S "$prefix-user-input" >/dev/null
+done
+UFWCHECK
+pct push "$CT_ID" "$tmp" /usr/local/sbin/immich-ufw-check --perms 0755
+rm -f -- "$tmp"
+pct exec "$CT_ID" -- /usr/local/sbin/immich-ufw-check
 
 # ── Podman configuration ──────────────────────────────────────────────────────
 OVERLAY_OPTIONS=""
@@ -622,9 +764,9 @@ pct exec "$CT_ID" -- podman --version
 # Quadlet requires cgroup v2 and the overlay driver must actually be active
 # (a silent fallback to vfs would work but eat disk and be very slow).
 CGROUPS_VERSION="$(pct exec "$CT_ID" -- podman info --format '{{.Host.CgroupsVersion}}' 2>/dev/null || echo "?")"
-[[ "$CGROUPS_VERSION" == "v2" ]] || { echo "  ERROR: Quadlet requires cgroup v2 inside the CT; podman reports '${CGROUPS_VERSION}'." >&2; exit 1; }
+[[ "$CGROUPS_VERSION" == "v2" ]] || { echo "  ERROR: Quadlet requires cgroup v2 inside the CT; podman reports '${CGROUPS_VERSION}'." >&2; false; }
 GRAPH_DRIVER="$(pct exec "$CT_ID" -- podman info --format '{{.Store.GraphDriverName}}' 2>/dev/null || echo "?")"
-[[ "$GRAPH_DRIVER" == "overlay" ]] || { echo "  ERROR: Podman storage driver is '${GRAPH_DRIVER}', expected overlay." >&2; exit 1; }
+[[ "$GRAPH_DRIVER" == "overlay" ]] || { echo "  ERROR: Podman storage driver is '${GRAPH_DRIVER}', expected overlay." >&2; false; }
 echo "  Podman: cgroup ${CGROUPS_VERSION}, storage driver ${GRAPH_DRIVER}$([ "$PODMAN_FUSE_OVERLAY" -eq 1 ] && echo " (fuse-overlayfs)" || echo " (native)")"
 
 # ── Pull images ───────────────────────────────────────────────────────────────
@@ -646,6 +788,22 @@ pct exec "$CT_ID" -- bash -lc "
   podman pull '${VALKEY_IMAGE}'
 "
 
+
+# ── Resolve immutable runtime images ──────────────────────────────────────────
+for component in POSTGRES VALKEY APP; do
+  reference_var=${component}_IMAGE
+  resolved=$(pct exec "$CT_ID" -- podman image inspect --format '{{.Id}}' "${!reference_var}")
+  resolved=${resolved#sha256:}
+  [[ $resolved =~ ^[a-f0-9]{64}$ ]] || { echo "ERROR: Invalid image ID for $component." >&2; false; }
+  printf -v "${component}_IMAGE_ID" 'sha256:%s' "$resolved"
+done
+
+
+# The database image decides its postgres UID/GID; do not assume Debian's 999.
+POSTGRES_UID=$(pct exec "$CT_ID" -- podman run --rm --pull=never --network none --entrypoint sh "$POSTGRES_IMAGE_ID" -c 'id -u postgres')
+POSTGRES_GID=$(pct exec "$CT_ID" -- podman run --rm --pull=never --network none --entrypoint sh "$POSTGRES_IMAGE_ID" -c 'id -g postgres')
+[[ $POSTGRES_UID =~ ^[0-9]+$ && $POSTGRES_GID =~ ^[0-9]+$ ]] || { echo "ERROR: Cannot determine PostgreSQL ownership." >&2; false; }
+
 # ── Prepare persistent paths ──────────────────────────────────────────────────
 # Immich persistent state (all of it):
 #   /opt/immich/postgres/   PostgreSQL cluster (→ /var/lib/postgresql/data). The
@@ -666,14 +824,14 @@ pct exec "$CT_ID" -- bash -lc "
   set -euo pipefail
   install -d -m 0755 '${APP_DIR}'
   install -d -m 0755 '${APP_DIR}/postgres-init'
-  install -d -m 0700 -o 999 -g 999 '${APP_DIR}/postgres'
+  install -d -m 0700 -o ${POSTGRES_UID} -g ${POSTGRES_GID} '${APP_DIR}/postgres'
   install -d -m 0755 -o 1000 -g 1000 '${APP_DIR}/config'
   if [ -z '${PHOTO_MOUNT_SRC}' ]; then
     install -d -m 0755 -o 1000 -g 1000 '${LIBRARY_DIR}'
   else
-    mountpoint -q '${LIBRARY_DIR}' || { echo '  ERROR: ${LIBRARY_DIR} is not a mount point inside the CT (mp0 missing?)' >&2; exit 1; }
+    mountpoint -q '${LIBRARY_DIR}' || { echo '  ERROR: ${LIBRARY_DIR} is not a mount point inside the CT (mp0 missing?)' >&2; false; }
     owner=\$(stat -c '%u:%g' '${LIBRARY_DIR}')
-    [ \"\$owner\" = '1000:1000' ] || { echo \"  ERROR: ${LIBRARY_DIR} is seen as \$owner inside the CT, expected 1000:1000 (host must be 101000:101000)\" >&2; exit 1; }
+    [ \"\$owner\" = '1000:1000' ] || { echo \"  ERROR: ${LIBRARY_DIR} is seen as \$owner inside the CT, expected 1000:1000 (host must be 101000:101000)\" >&2; false; }
   fi
   ls -ld '${APP_DIR}/postgres' '${APP_DIR}/config' '${LIBRARY_DIR}'
 "
@@ -737,28 +895,32 @@ After=network-online.target
 Wants=network-online.target
 
 [Container]
-Image=${POSTGRES_IMAGE}
+# LabTag=${POSTGRES_TAG}
+# LabImage=${POSTGRES_IMAGE}
+Image=${POSTGRES_IMAGE_ID}
+Pull=never
 ContainerName=immich-postgres
 Network=host
 Environment=TZ=${APP_TZ}
 Environment=POSTGRES_USER=immich
 Environment=POSTGRES_DB=immich
-Environment=POSTGRES_INITDB_ARGS=--data-checksums
 ${DB_STORAGE_LINE}
 EnvironmentFile=${POSTGRES_ENV_FILE}
 Volume=${APP_DIR}/postgres:/var/lib/postgresql/data
 Volume=${APP_DIR}/postgres-init:/docker-entrypoint-initdb.d:ro
 ShmSize=128m
-HealthCmd=pg_isready -U immich -d immich
+HealthCmd=pg_isready -h 127.0.0.1 -U immich -d immich
 HealthInterval=10s
 HealthTimeout=5s
 HealthRetries=5
 HealthStartPeriod=60s
 Notify=healthy
+StopTimeout=110
 LogDriver=journald
 
 [Service]
 Restart=always
+RestartSec=5
 TimeoutStartSec=300
 TimeoutStopSec=120
 
@@ -773,7 +935,10 @@ After=network-online.target
 Wants=network-online.target
 
 [Container]
-Image=${VALKEY_IMAGE}
+# LabTag=${VALKEY_TAG}
+# LabImage=${VALKEY_IMAGE}
+Image=${VALKEY_IMAGE_ID}
+Pull=never
 ContainerName=immich-valkey
 Network=host
 Environment=TZ=${APP_TZ}
@@ -785,10 +950,12 @@ HealthTimeout=5s
 HealthRetries=3
 HealthStartPeriod=10s
 Notify=healthy
+StopTimeout=20
 LogDriver=journald
 
 [Service]
 Restart=always
+RestartSec=5
 TimeoutStartSec=120
 TimeoutStopSec=30
 
@@ -799,12 +966,16 @@ EOF2
   cat > '${QUADLET_FILE}' <<EOF2
 [Unit]
 Description=Immich (imagegenius monolith)
-After=network-online.target ${POSTGRES_QUADLET_SERVICE} ${VALKEY_QUADLET_SERVICE}
+After=network-online.target ufw.service ${POSTGRES_QUADLET_SERVICE} ${VALKEY_QUADLET_SERVICE}
 Wants=network-online.target
+Requires=ufw.service
 Requires=${POSTGRES_QUADLET_SERVICE} ${VALKEY_QUADLET_SERVICE}
 
 [Container]
-Image=${APP_IMAGE}
+# LabTag=${APP_TAG}
+# LabImage=${APP_IMAGE}
+Image=${APP_IMAGE_ID}
+Pull=never
 ContainerName=immich
 Network=host
 Environment=TZ=${APP_TZ}
@@ -823,10 +994,13 @@ Environment=MACHINE_LEARNING_PORT=3003
 EnvironmentFile=${APP_ENV_FILE}
 Volume=${LIBRARY_DIR}:/photos
 Volume=${APP_DIR}/config:/config
+StopTimeout=110
 LogDriver=journald
 
 [Service]
+ExecStartPre=/usr/local/sbin/immich-ufw-check
 Restart=always
+RestartSec=5
 TimeoutStartSec=300
 TimeoutStopSec=120
 
@@ -841,7 +1015,7 @@ EOF2
 # Read by Quadlet via EnvironmentFile= (podman --env-file). Written UNQUOTED —
 # podman keeps quotes as part of the value. Streamed over stdin so the password
 # never appears in host or CT argv, and no temp file is created.
-printf 'POSTGRES_PASSWORD=%s\n' "$DB_PASSWORD" | pct exec "$CT_ID" -- bash -lc "
+{ printf 'POSTGRES_PASSWORD=%s\n' "$DB_PASSWORD"; printf 'POSTGRES_INITDB_ARGS=--data-checksums --auth-host=scram-sha-256\nPOSTGRES_HOST_AUTH_METHOD=scram-sha-256\n'; } | pct exec "$CT_ID" -- bash -lc "
   set -euo pipefail
   umask 077
   cat > '${POSTGRES_ENV_FILE}'
@@ -865,427 +1039,450 @@ pct exec "$CT_ID" -- bash -lc "
 APP_IMAGE_REPO=${APP_IMAGE_REPO}
 APP_TAG=${APP_TAG}
 APP_IMAGE=${APP_IMAGE}
+APP_IMAGE_ID=${APP_IMAGE_ID}
 POSTGRES_IMAGE_REPO=${POSTGRES_IMAGE_REPO}
 POSTGRES_TAG=${POSTGRES_TAG}
 POSTGRES_IMAGE=${POSTGRES_IMAGE}
+POSTGRES_IMAGE_ID=${POSTGRES_IMAGE_ID}
 VALKEY_IMAGE_REPO=${VALKEY_IMAGE_REPO}
 VALKEY_TAG=${VALKEY_TAG}
 VALKEY_IMAGE=${VALKEY_IMAGE}
+VALKEY_IMAGE_ID=${VALKEY_IMAGE_ID}
 APP_PORT=${APP_PORT}
 APP_TZ=${APP_TZ}
 APP_FQDN=${APP_FQDN}
 PHOTO_STORAGE=${PHOTO_STORAGE}
 PHOTO_MOUNT_SRC=${PHOTO_MOUNT_SRC}
 AUTO_UPDATE=${AUTO_UPDATE}
+PODMAN_FUSE_OVERLAY=${PODMAN_FUSE_OVERLAY}
+INITIAL_WAIT_SECONDS=${INITIAL_WAIT_SECONDS}
+UPDATE_WAIT_SECONDS=${UPDATE_WAIT_SECONDS}
+UPDATE_TIME=${UPDATE_TIME}
 EOF2
   chmod 0600 '${APP_DIR}/.env'
 "
 
 # ── Maintenance script ────────────────────────────────────────────────────────
-# update <tag>:          Immich — pull → sed Image= in Quadlet file → sed .env →
-#   daemon-reload → restart immich.service → /api/server/ping check; rollback
-#   restores both files, daemon-reload, restart. Immich migrates the DB schema on
-#   upgrade; a rolled-back image may refuse a migrated DB — that is what the
-#   PVE snapshot / PBS backup is for.
-# update-postgres <tag>: same flow for the DB unit; refuses a different PG major
-#   (14- → 15- needs dump/restore). Immich is stopped around the DB restart.
-# update-valkey <tag>:   same flow for the queue unit; Immich restarted after.
-# auto-update:  re-pull ALL current tags (latest or pinned); restart only what
-#   changed (backend change ⇒ Immich is stopped/started around it); rollback
-#   re-tags the previous image IDs and restarts.
-pct exec "$CT_ID" -- bash -lc 'cat > /usr/local/bin/immich-maint.sh && chmod 0755 /usr/local/bin/immich-maint.sh' <<'MAINT'
+# One component per update; immutable IDs, atomic control files and explicit
+# recovery policy. The helper never archives or restores application data.
+tmp="$(mktemp)"
+cat > "$tmp" <<'MAINT'
 #!/usr/bin/env bash
 set -Eeo pipefail
+umask 077
+export LC_ALL=C
 
-APP_DIR="${APP_DIR:-/opt/immich}"
-QUADLET_DIR="/etc/containers/systemd"
-QUADLET_FILE="${QUADLET_DIR}/immich.container"
-POSTGRES_QUADLET_FILE="${QUADLET_DIR}/immich-postgres.container"
-VALKEY_QUADLET_FILE="${QUADLET_DIR}/immich-valkey.container"
-SERVICE="immich.service"
-POSTGRES_SERVICE="immich-postgres.service"
-VALKEY_SERVICE="immich-valkey.service"
-CONTAINER="immich"
-POSTGRES_CONTAINER="immich-postgres"
-VALKEY_CONTAINER="immich-valkey"
-ENV_FILE="${APP_DIR}/.env"
+# Generated with this application's creator; no shared runtime library.
+APP_DIR=/opt/immich
+ENV_FILE=$APP_DIR/.env
+UNIT_DIR=/etc/containers/systemd
+MAIN_SERVICE=immich.service
+LOCK=/run/lock/immich-maint.lock
+GENERATOR=/usr/lib/systemd/system-generators/podman-system-generator
+# Only temporary control-file copies are made. PBS/PVE owns data recovery.
+# Atomic rename protects each file; this is not a multi-file disk transaction.
+# The Quadlet contains the authoritative tag/reference/ID. Metadata is reconciled
+# under the maintenance lock after an interruption.
+WORK=""
+SWITCHED=0
+START_ATTEMPTED=0
+APP_STOPPED=0
+COMPONENT=""
+DB_TYPE_BEFORE=""
+declare -A STATE=()
 
-need_root() { [[ $EUID -eq 0 ]] || { echo "  ERROR: Run as root." >&2; exit 1; }; }
-die() { echo "  ERROR: $*" >&2; exit 1; }
-
-usage() {
-  cat <<EOF2
-  Immich Maintenance (Quadlet)
-  ────────────────────────────
-  Usage:
-    $0 update <tag> [--yes]            # Immich:     latest, or pin e.g. 3.1.0 / 3.1.0-noml
-    $0 update-postgres <tag> [--yes]   # PostgreSQL: e.g. 14-vectorchord0.4.3-pgvectors0.2.0 (same major only)
-    $0 update-valkey <tag> [--yes]     # Valkey:     latest, or pin e.g. 8.1.3
-    $0 auto-update                     # re-pull current tags (only if AUTO_UPDATE=1)
-    $0 version
-
-  Notes:
-    - update pulls the tag, updates the Quadlet unit and .env, restarts what is needed
-    - auto-update is called by immich-update.timer; it never changes the tags
-    - to switch between tracking and pinning: update latest / update <full version>
-    - Immich migrates the database on upgrade — read the release notes first;
-      a rollback after a migrated schema needs the PVE snapshot / PBS backup
-    - PostgreSQL major changes (14- → 15-) are refused; they need a dump/restore
-    - backup and restore are handled by PBS and PVE snapshots; the photo library
-      (bind mount) is outside vzdump — back it up on the host (ZFS snapshot / external)
-    - take a PVE snapshot before manual updates: pct snapshot <CT_ID> pre-update-\$(date +%Y%m%d)
-EOF2
-}
-
-[[ -d "$APP_DIR" ]]               || die "APP_DIR not found: $APP_DIR"
-[[ -f "$ENV_FILE" ]]              || die "Missing env file: $ENV_FILE"
-[[ -f "$QUADLET_FILE" ]]          || die "Missing Quadlet unit: $QUADLET_FILE"
-[[ -f "$POSTGRES_QUADLET_FILE" ]] || die "Missing Quadlet unit: $POSTGRES_QUADLET_FILE"
-[[ -f "$VALKEY_QUADLET_FILE" ]]   || die "Missing Quadlet unit: $VALKEY_QUADLET_FILE"
-
-# One maintenance operation at a time — a manual update must not overlap the timer.
-LOCK_FILE="/run/lock/immich-maint.lock"
-mkdir -p /run/lock
-exec 9>"$LOCK_FILE"
-flock -n 9 || die "Another immich-maint.sh operation is already running."
-
-env_val() {
-  awk -F= -v key="$1" '$1==key{print substr($0, length(key)+2)}' "$ENV_FILE" | tail -n1
-}
-
-env_flag() {
-  local raw
-  raw="$(env_val "$1" | tr -d '[:space:]')"
-  [[ "$raw" =~ ^[01]$ ]] && printf '%s' "$raw" || printf '0'
-}
-
-app_port() {
-  local port
-  port="$(env_val APP_PORT | tr -d '[:space:]')"
-  [[ "$port" =~ ^[0-9]+$ ]] && printf '%s' "$port" || printf '2283'
-}
-
-running_image_id() {
-  podman inspect --format '{{.Image}}' "$1" 2>/dev/null || true
-}
-
-image_id_of() {
-  podman image inspect --format '{{.Id}}' "$1" 2>/dev/null || true
-}
-
-image_digest_of() {
-  podman image inspect --format '{{index .RepoDigests 0}}' "$1" 2>/dev/null || echo n/a
-}
-
-# /api/server/ping is answered by the Node server (200 + {"res":"pong"}) only
-# once it is up and connected; the web UI is served by the same process.
-# Generous window: first start after an upgrade runs DB migrations and reloads
-# ML models.
-wait_for_app() {
-  local port code
-  port="$(app_port)"
-  for i in $(seq 1 120); do
-    code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 "http://127.0.0.1:${port}/api/server/ping" 2>/dev/null || echo 000)"
-    [[ "$code" == "200" ]] && return 0
-    sleep 3
+die() { printf '  ERROR: %s\n' "$*" >&2; exit 1; }
+read_state() {
+  local line key value
+  STATE=()
+  while IFS= read -r line || [[ -n $line ]]; do
+    [[ $line =~ ^[[:space:]]*(#.*)?$ ]] && continue
+    [[ $line =~ ^([A-Z][A-Z0-9_]*)=(.*)$ ]] || die "Malformed state line."
+    key=${BASH_REMATCH[1]}; value=${BASH_REMATCH[2]}
+    [[ ! ${STATE[$key]+yes} ]] || die "Duplicate state key: $key"
+    STATE[$key]=$value
+  done < "$ENV_FILE"
+  # State is parsed as data. Never source an editable .env as root.
+  for key in APP_PORT INITIAL_WAIT_SECONDS UPDATE_WAIT_SECONDS PODMAN_FUSE_OVERLAY AUTO_UPDATE; do
+    [[ ${STATE[$key]:-} =~ ^(0|[1-9][0-9]{0,5})$ ]] || die "Invalid $key."
   done
-  return 1
+  (( STATE[APP_PORT] >= 1024 && STATE[APP_PORT] <= 65535 )) || die "Invalid APP_PORT."
+  (( STATE[INITIAL_WAIT_SECONDS] >= 30 && STATE[INITIAL_WAIT_SECONDS] <= 86400 )) || die "Invalid initial wait."
+  (( STATE[UPDATE_WAIT_SECONDS] >= 30 && STATE[UPDATE_WAIT_SECONDS] <= 86400 )) || die "Invalid update wait."
+  [[ ${STATE[AUTO_UPDATE]} =~ ^[01]$ && ${STATE[PODMAN_FUSE_OVERLAY]} =~ ^[01]$ ]] || die "Invalid policy flag."
+  (( STATE[APP_PORT] != 5432 && STATE[APP_PORT] != 6379 )) || die "Backend port collision."
+  (( STATE[APP_PORT] != 3003 )) || die "Machine-learning port collision."
 }
-
-wait_for_postgres() {
-  for i in $(seq 1 60); do
-    podman exec "$POSTGRES_CONTAINER" pg_isready -q -U immich -d immich >/dev/null 2>&1 && return 0
+unit_value() {
+  local prefix=$1 file=$2
+  awk -v p="$prefix" 'index($0,p)==1 {value=substr($0,length(p)+1); n++} END {if(n!=1) exit 1; print value}' "$file"
+}
+image_id() {
+  local value
+  value=$(podman image inspect --format '{{.Id}}' "$1") || return 1
+  value=${value#sha256:}
+  [[ $value =~ ^[a-f0-9]{64}$ ]] || return 1
+  printf 'sha256:%s\n' "$value"
+}
+select_component() {
+  COMPONENT=$1
+  case $COMPONENT in
+    POSTGRES) CONTAINER=immich-postgres; KIND=postgres; IMAGE_RECOVERY=0 ;;
+    VALKEY) CONTAINER=immich-valkey; KIND=valkey; IMAGE_RECOVERY=1 ;;
+    APP) CONTAINER=immich; KIND=app; IMAGE_RECOVERY=0 ;;
+    *) die "Unknown component: $COMPONENT" ;;
+  esac
+  SERVICE=$CONTAINER.service
+  UNIT=$UNIT_DIR/$CONTAINER.container
+}
+valid_tag() {
+  case $1 in
+    POSTGRES) [[ $2 =~ ^14-vectorchord[0-9]+\.[0-9]+\.[0-9]+(-pgvectors[0-9]+\.[0-9]+\.[0-9]+)?$ ]] ;;
+    VALKEY) [[ $2 =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9._-]+)?$ ]] ;;
+    APP) [[ $2 =~ ^[0-9]+\.[0-9]+\.[0-9]+(-noml)?$ ]] ;;
+    *) return 1 ;;
+  esac
+}
+load_unit() {
+  OLD_TAG=$(unit_value '# LabTag=' "$UNIT") || die "Missing LabTag metadata; use the matching upgraded creator."
+  OLD_IMAGE=$(unit_value '# LabImage=' "$UNIT") || die "Missing LabImage metadata."
+  OLD_ID=$(unit_value 'Image=' "$UNIT") || die "Missing image ID."
+  [[ $OLD_IMAGE == *:* ]] || die "Invalid image reference."
+  REPO=${OLD_IMAGE%:*}
+  [[ $REPO =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*[A-Za-z0-9]$ ]] || die "Invalid repository."
+  valid_tag "$COMPONENT" "$OLD_TAG" || die "Configured tag violates this component's policy."
+  [[ $OLD_IMAGE == "$REPO:$OLD_TAG" && $OLD_ID =~ ^sha256:[a-f0-9]{64}$ ]] || die "Inconsistent unit metadata."
+  [[ $(unit_value 'Pull=' "$UNIT") == never ]] || die "Expected Pull=never."
+}
+write_env() {
+  local tag=$1 reference=$2 id=$3 temp
+  temp=$(mktemp "${ENV_FILE}.XXXXXX") || return 1
+  if ! awk -v c="$COMPONENT" -v repo="$REPO" -v t="$tag" -v r="$reference" -v id="$id" '
+    $0 ~ ("^" c "_(IMAGE_REPO|TAG|IMAGE|IMAGE_ID)=") {next}
+    {print}
+    END {print c "_IMAGE_REPO=" repo; print c "_TAG=" t; print c "_IMAGE=" r; print c "_IMAGE_ID=" id}
+  ' "$ENV_FILE" > "$temp" || ! chmod 0600 "$temp" || ! mv -fT "$temp" "$ENV_FILE"; then
+    rm -f -- "$temp"; return 1
+  fi
+}
+write_unit() {
+  local tag=$1 reference=$2 id=$3 temp
+  temp=$(mktemp "${UNIT}.XXXXXX") || return 1
+  if ! sed -e "s|^# LabTag=.*|# LabTag=$tag|" \
+      -e "s|^# LabImage=.*|# LabImage=$reference|" \
+      -e "s|^Image=.*|Image=$id|" "$UNIT" > "$temp" \
+      || ! chmod 0644 "$temp" || ! mv -fT "$temp" "$UNIT"; then
+    rm -f -- "$temp"; return 1
+  fi
+}
+copy_control_file() {
+  local source=$1 destination=$2 temp
+  temp=$(mktemp "${destination}.XXXXXX") || return 1
+  if ! cp --preserve=mode,ownership "$source" "$temp" || ! mv -fT "$temp" "$destination"; then
+    rm -f -- "$temp"; return 1
+  fi
+}
+wait_service() {
+  local container=$1 kind=$2 budget=$3 started=$SECONDS state restarts first code value
+  local healthy_since=-1
+  first=$(systemctl show "$container.service" -p NRestarts --value) || return 1
+  while (( SECONDS - started < budget )); do
+    state=$(systemctl show "$container.service" -p ActiveState --value) || return 1
+    restarts=$(systemctl show "$container.service" -p NRestarts --value) || return 1
+    [[ $state != failed && $state != inactive && $restarts == "$first" ]] || return 1
+    value=0
+    if [[ $state == active ]]; then
+      case $kind in
+        app)
+          code=$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 2 --max-time 3 \
+            "http://127.0.0.1:${STATE[APP_PORT]}/api/server/ping") || code=000
+          [[ $code =~ ^200$ ]] && value=1
+          ;;
+        postgres)
+          timeout 5 podman exec "$container" pg_isready -q -h 127.0.0.1 -U immich -d immich && value=1
+          ;;
+        valkey|redis)
+          code=$(timeout 5 podman exec "$container" "$kind-cli" -h 127.0.0.1 ping 2>/dev/null) || code=""
+          [[ $code == PONG ]] && value=1
+          ;;
+      esac
+    fi
+    if (( value )); then
+      (( healthy_since >= 0 )) || healthy_since=$SECONDS
+      (( SECONDS - healthy_since >= 6 )) && return 0
+    else
+      healthy_since=-1
+    fi
     sleep 2
   done
   return 1
 }
-
-wait_for_valkey() {
-  local pong
-  for i in $(seq 1 20); do
-    pong="$(podman exec "$VALKEY_CONTAINER" valkey-cli -h 127.0.0.1 ping 2>/dev/null || true)"
-    [[ "$pong" == "PONG" ]] && return 0
-    sleep 2
+validate_candidate() {
+  local id=$1 old_user new_user actual major uid gid path version
+  # Only the image shell runs, without network or data mounts. The candidate
+  # application never gets production data during validation.
+  podman run --rm --pull=never --network none --entrypoint /bin/sh "$id" -c true
+  old_user=$(podman image inspect --format '{{.Config.User}}' "$OLD_ID")
+  new_user=$(podman image inspect --format '{{.Config.User}}' "$id")
+  [[ $old_user == "$new_user" ]] || die "Image USER changed; review ownership before updating."
+if [[ $COMPONENT == POSTGRES ]]; then
+    path="$APP_DIR/postgres"
+    [[ $(cat "$path/PG_VERSION") == 14 ]] || die "On-disk PostgreSQL major does not match."
+    uid=$(podman run --rm --pull=never --network none --entrypoint sh "$id" -c 'id -u postgres')
+    gid=$(podman run --rm --pull=never --network none --entrypoint sh "$id" -c 'id -g postgres')
+    [[ $uid =~ ^[0-9]+$ && $gid =~ ^[0-9]+$ && $(stat -c '%u:%g' "$path") == "$uid:$gid" ]] \
+      || die "PostgreSQL UID/GID differs from existing data; no recursive chown is attempted."
+    version=$(podman run --rm --pull=never --network none --entrypoint postgres "$id" --version)
+    [[ $version == "postgres (PostgreSQL) 14."* ]] || die "Candidate PostgreSQL binary has the wrong major."
+  fi
+}
+pre_update_checks() {
+if [[ -n ${STATE[PHOTO_MOUNT_SRC]:-} ]]; then
+    mountpoint -q "$APP_DIR/library" || die "External photo-library mount is missing."
+  fi
+  for path in "$APP_DIR/config" "$APP_DIR/library"; do
+    [[ $(stat -c '%u:%g' "$path") == 1000:1000 ]] || die "Immich path has unexpected ownership: $path"
   done
-  return 1
+  :
 }
+post_update_checks() {
 
-wait_for_stack() {
-  wait_for_postgres && wait_for_valkey && wait_for_app
+  :
 }
-
-confirm_or_exit() {
-  echo ""
-  echo "  IMPORTANT: Take a PVE snapshot before proceeding."
-  echo "  Use: pct snapshot <CT_ID> pre-update-$(date +%Y%m%d)"
-  echo "  (With an mp0 bind mount PVE may refuse the snapshot — snapshot the ZFS dataset / rely on PBS instead.)"
-  echo ""
-  read -r -p "  Continue? [y/N]: " confirm
-  case "$confirm" in
-    [yY][eE][sS]|[yY]) return 0 ;;
-    *) echo "  Aborted."; return 1 ;;
-  esac
+finish() {
+  local rc=$? restored=1
+  trap - EXIT ERR INT TERM HUP
+  set +e
+  if (( rc != 0 && SWITCHED )); then
+    if (( START_ATTEMPTED == 0 || IMAGE_RECOVERY == 1 )); then
+      copy_control_file "$WORK/old.container" "$UNIT" || restored=0
+      copy_control_file "$WORK/old.env" "$ENV_FILE" || restored=0
+      systemctl daemon-reload || restored=0
+      if (( restored && START_ATTEMPTED )); then
+        systemctl restart "$SERVICE" && wait_service "$CONTAINER" "$KIND" "${STATE[UPDATE_WAIT_SECONDS]}" || restored=0
+      fi
+      if (( restored && APP_STOPPED )); then
+        systemctl start "$MAIN_SERVICE" && wait_service immich app "${STATE[UPDATE_WAIT_SECONDS]}" || restored=0
+      fi
+      if (( restored )); then
+        printf '  Previous control files/image restored; this does not undo application data changes.\n' >&2
+      else
+        printf '  CRITICAL: Recovery was not confirmed. Inspect %s and %s.\n' "$UNIT" "$WORK" >&2
+      fi
+    else
+      printf '  Target %s image retained: persistent state may already have changed.\n' "$COMPONENT" >&2
+      printf '  No automatic image/database downgrade. Inspect journalctl -u %s -u %s.\n' "$SERVICE" "$MAIN_SERVICE" >&2
+      printf '  Recover matching PBS/PVE state if needed. A readiness timeout does not stop a migration.\n' >&2
+      (( APP_STOPPED == 0 )) || printf '  After the backend is healthy: systemctl start %s\n' "$MAIN_SERVICE" >&2
+    fi
+  elif (( rc != 0 && APP_STOPPED )); then
+    systemctl start "$MAIN_SERVICE" || restored=0
+  fi
+  if [[ -n $WORK ]]; then
+    if (( restored )); then rm -rf -- "$WORK"; else printf '  Retained control-file copies: %s\n' "$WORK" >&2; fi
+  fi
+  exit "$rc"
 }
+trap finish EXIT
+trap 'printf "  Maintenance failed near line %s.\n" "$LINENO" >&2' ERR
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
 
-# Restart the right units after an image change. A backend restart drops
-# Immich's connections, so Immich is stopped first and started afterwards.
-#   $1 = app | postgres | valkey | backends   (backends = both DB and queue)
-restart_for() {
-  case "$1" in
-    app)      systemctl restart "$SERVICE" ;;
-    postgres) systemctl stop "$SERVICE"; systemctl restart "$POSTGRES_SERVICE"; systemctl start "$SERVICE" ;;
-    valkey)   systemctl stop "$SERVICE"; systemctl restart "$VALKEY_SERVICE";   systemctl start "$SERVICE" ;;
-    backends) systemctl stop "$SERVICE"; systemctl restart "$POSTGRES_SERVICE"; systemctl restart "$VALKEY_SERVICE"; systemctl start "$SERVICE" ;;
-    *) die "restart_for: unknown target $1" ;;
-  esac
-}
-
-# Shared pinned-tag switch for one unit. Tag validation and app-specific guards
-# are done by the callers; this function does the file/pull/restart/rollback flow.
-#   $1 = app | postgres | valkey   $2 = new tag   $3 = 1 to skip the confirmation
-switch_image() {
-  local which="$1" new_tag="$2" skip_confirm="$3"
-  local label key file old_tag repo old_image new_image old_id tmp_env tmp_quadlet
-  case "$which" in
-    app)      label="Immich";     key="APP";      file="$QUADLET_FILE" ;;
-    postgres) label="PostgreSQL"; key="POSTGRES"; file="$POSTGRES_QUADLET_FILE" ;;
-    valkey)   label="Valkey";     key="VALKEY";   file="$VALKEY_QUADLET_FILE" ;;
-    *) die "switch_image: unknown target $which" ;;
-  esac
-
-  repo="$(env_val "${key}_IMAGE_REPO")"
-  [[ -n "$repo" ]] || die "Could not read ${key}_IMAGE_REPO from .env"
-  old_image="$(env_val "${key}_IMAGE")"
-  [[ -n "$old_image" ]] || die "Could not read ${key}_IMAGE from .env"
-  old_tag="${old_image##*:}"
-  new_image="${repo}:${new_tag}"
-  # Capture the current image ID before pulling: if new_tag == old_tag, the pull
-  # moves the tag and the old ref would otherwise resolve to the NEW image on rollback.
-  old_id="$(image_id_of "$old_image")"
-  tmp_env="$(mktemp)"
-  tmp_quadlet="$(mktemp)"
-
-  echo "  Current ${label} tag: $old_tag"
-  echo "  Target  ${label} tag: $new_tag"
-
-  if [[ "$skip_confirm" -eq 0 ]]; then
-    confirm_or_exit || { rm -f "$tmp_env" "$tmp_quadlet"; exit 0; }
+update_component() {
+  local requested=${2:-} actual new_id target old_variant new_variant
+  select_component "$1"
+  load_unit
+  SWITCHED=0; START_ATTEMPTED=0; APP_STOPPED=0
+  target=${requested:-$OLD_TAG}
+  valid_tag "$COMPONENT" "$target" || die "Invalid target tag for $COMPONENT."
+# Semantic version downgrades of persistent components require a separate review.
+  if (( IMAGE_RECOVERY == 0 )) && [[ $target != latest && $OLD_TAG != latest ]]; then
+    [[ $(printf '%s\n%s\n' "$OLD_TAG" "$target" | sort -V | head -n 1) == "$OLD_TAG" ]] \
+      || die "Persistent-component downgrade requires matching data recovery."
   fi
 
-  cp -a "$ENV_FILE" "$tmp_env"
-  cp -a "$file"     "$tmp_quadlet"
+  if [[ $COMPONENT == POSTGRES ]]; then
+    [[ ${OLD_TAG%%[.-]*} == ${target%%[.-]*} ]] || die "PostgreSQL major changes require a separate migration."
 
-  cleanup() { rm -f "$tmp_env" "$tmp_quadlet"; }
-  rollback() {
-    echo "  !! ${label} update failed — rolling back and restarting ..." >&2
-    cp -a "$tmp_env"     "$ENV_FILE"
-    cp -a "$tmp_quadlet" "$file"
-    [[ -n "$old_id" ]] && podman tag "$old_id" "$old_image" >/dev/null 2>&1 || true
-    systemctl daemon-reload
-    restart_for "$which" || true
-    rm -f "$tmp_env" "$tmp_quadlet"
-    if wait_for_stack; then
-      echo "  Rollback complete — ${old_image} is healthy again." >&2
-    else
-      echo "  CRITICAL: rollback to ${old_image} did not become healthy. Restore the CT from the PVE snapshot / PBS." >&2
-      [[ "$which" == "app" ]] && echo "  (If the new Immich already migrated the database, the old image cannot run against it.)" >&2
+    printf '  VectorChord/pgvectors changes must match the running Immich release.\n'
     fi
-  }
-  trap rollback ERR
 
-  echo "  Pulling target image ..."
-  podman pull "$new_image"
+  if [[ $COMPONENT == APP ]]; then
+    [[ ${OLD_TAG%%.*} == ${target%%.*} ]] || die "Application major changes require a separate migration review."
+  fi
 
-  sed -i "s|^Image=.*|Image=${new_image}|" "$file"
-  sed -i \
-    -e "s|^${key}_TAG=.*|${key}_TAG=$new_tag|" \
-    -e "s|^${key}_IMAGE=.*|${key}_IMAGE=$new_image|" \
-    "$ENV_FILE"
-
-  echo "  Reloading Quadlet and restarting ..."
+  if [[ $COMPONENT == APP ]]; then
+    old_variant=""; new_variant=""
+    [[ $OLD_TAG != *-* ]] || old_variant=${OLD_TAG#*-}
+    [[ $target != *-* ]] || new_variant=${target#*-}
+    [[ $old_variant == "$new_variant" ]] || die "Immich ML image variant changes require a separate review."
+  fi
+  /usr/local/sbin/immich-ufw-check || die "Restore active UFW filtering before maintenance."
+  actual=$(podman inspect --format '{{.Image}}' "$CONTAINER") || die "Cannot inspect running image."
+  [[ $(image_id "$actual") == "$OLD_ID" ]] || die "Running/configured image mismatch; inspect the service."
+  wait_service "$CONTAINER" "$KIND" 30 || die "$SERVICE is unhealthy before update."
+  if [[ $COMPONENT != APP ]]; then
+    wait_service immich app 30 || die "Application is unhealthy before backend update."
+  fi
+  if [[ ${STATE[${COMPONENT}_TAG]:-} != "$OLD_TAG" ||
+        ${STATE[${COMPONENT}_IMAGE]:-} != "$OLD_IMAGE" ||
+        ${STATE[${COMPONENT}_IMAGE_ID]:-} != "$OLD_ID" ||
+        ${STATE[${COMPONENT}_IMAGE_REPO]:-} != "$REPO" ]]; then
+    write_env "$OLD_TAG" "$OLD_IMAGE" "$OLD_ID"
+    read_state
+    printf '  Reconciled metadata from the authoritative Quadlet.\n'
+  fi
+  pre_update_checks
+  if (( YES == 0 )); then
+    [[ -t 8 ]] || die "Interactive terminal or --yes is required."
+    printf '  Verify a matching PBS/PVE recovery checkpoint on the host before updating.\n'
+    (( STATE[PODMAN_FUSE_OVERLAY] == 0 )) || printf '  FUSE is enabled: use stop-mode PBS; do not freeze this running CT.\n'
+    printf '  External Immich photo storage needs its own coordinated checkpoint; CT backup excludes bind mounts.\n'
+    (( IMAGE_RECOVERY )) || printf '  Once the target starts, automatic image downgrade is disabled.\n'
+    read -r -p "  Update $COMPONENT $OLD_TAG -> $target? [y/N]: " answer <&8 || return 0
+    [[ $answer =~ ^([Yy]|[Yy][Ee][Ss])$ ]] || return 0
+  else
+    printf '  --yes skips confirmation; no backup is created or verified.\n'
+  fi
+  podman pull "$REPO:$target"
+  new_id=$(image_id "$REPO:$target") || die "Cannot resolve target image."
+  if [[ $new_id == "$OLD_ID" && $target == "$OLD_TAG" ]]; then
+    printf '  %s unchanged; no restart.\n' "$COMPONENT"
+    return 0
+  fi
+  validate_candidate "$new_id"
+  WORK=$(mktemp -d /run/immich-update.XXXXXX)
+  cp --preserve=mode,ownership "$UNIT" "$WORK/old.container"
+  cp --preserve=mode,ownership "$ENV_FILE" "$WORK/old.env"
+  SWITCHED=1
+  write_unit "$target" "$REPO:$target" "$new_id"
+  write_env "$target" "$REPO:$target" "$new_id"
+  "$GENERATOR" --dryrun > "$WORK/generator.txt"
+  grep -Fq "$CONTAINER.service" "$WORK/generator.txt" || die "Generator omitted $SERVICE."
   systemctl daemon-reload
-  restart_for "$which"
-
-  echo "  Waiting for the stack ..."
-  if ! wait_for_stack; then
-    trap - ERR
-    rollback
-    die "Stack did not become healthy after ${label} update."
-  fi
-
-  trap - ERR
-  cleanup
-  if [[ -n "$old_id" && "$old_id" != "$(image_id_of "$new_image")" ]]; then
-    podman rmi "$old_id" >/dev/null 2>&1 || true
-  fi
-  echo "  OK: ${label} updated to $new_tag"
-}
-
-parse_update_args() {
-  # sets NEW_TAG and SKIP_CONFIRM from "$@"
-  NEW_TAG=""; SKIP_CONFIRM=0
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      -y|--yes) SKIP_CONFIRM=1; shift ;;
-      *) NEW_TAG="$1"; shift ;;
-    esac
-  done
-}
-
-# update <tag> [--yes] — switch Immich to "latest" or a pinned version
-update_app() {
-  parse_update_args "$@"
-  [[ -n "$NEW_TAG" ]] || die "Usage: immich-maint.sh update <tag>"
-  [[ "$NEW_TAG" == "latest" || "$NEW_TAG" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-noml)?$ ]] \
-    || die "Invalid tag: $NEW_TAG — use 'latest' or a full version like 3.1.0 / 3.1.0-noml (floating 3, 3.1, noml are not accepted)."
-  echo "  NOTE: Immich applies database migrations on upgrade. Read the release notes"
-  echo "        (breaking changes, required PostgreSQL image) before continuing."
-  switch_image app "$NEW_TAG" "$SKIP_CONFIRM"
-}
-
-# update-postgres <tag> [--yes] — switch the DB image within the same PostgreSQL major
-update_postgres() {
-  parse_update_args "$@"
-  [[ -n "$NEW_TAG" ]] || die "Usage: immich-maint.sh update-postgres <tag>"
-  [[ "$NEW_TAG" =~ ^[0-9]{2}-vectorchord[0-9]+\.[0-9]+\.[0-9]+(-pgvectors[0-9]+\.[0-9]+\.[0-9]+)?$ ]] \
-    || die "Invalid tag: $NEW_TAG — expected e.g. 14-vectorchord0.4.3-pgvectors0.2.0 (from Immich release notes)."
-  local cur_tag cur_major new_major
-  cur_tag="$(env_val POSTGRES_TAG)"
-  cur_major="${cur_tag%%-*}"
-  new_major="${NEW_TAG%%-*}"
-  [[ "$cur_major" == "$new_major" ]] \
-    || die "PostgreSQL major change ${cur_major} → ${new_major} is not handled here: it needs a pg_dumpall/restore into a fresh data directory. Aborting."
-  echo "  NOTE: VectorChord/pgvectors bumps must match what the running Immich version"
-  echo "        expects — check the Immich release notes before continuing."
-  switch_image postgres "$NEW_TAG" "$SKIP_CONFIRM"
-}
-
-# update-valkey <tag> [--yes] — switch the queue backend to "latest" or a pinned version
-update_valkey() {
-  parse_update_args "$@"
-  [[ -n "$NEW_TAG" ]] || die "Usage: immich-maint.sh update-valkey <tag>"
-  [[ "$NEW_TAG" == "latest" || "$NEW_TAG" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9._-]+)?$ ]] \
-    || die "Invalid tag: $NEW_TAG — use 'latest' or a full version like 8.1.3."
-  switch_image valkey "$NEW_TAG" "$SKIP_CONFIRM"
-}
-
-# auto-update — re-pull the current tags (latest or pinned); restart only what changed
-auto_update_app() {
-  if [[ "$(env_flag AUTO_UPDATE)" != "1" ]]; then
-    echo "  Auto-update disabled in ${ENV_FILE}; nothing to do."
-    return 0
-  fi
-
-  local app_image pg_image vk_image app_old_id pg_old_id vk_old_id app_new_id pg_new_id vk_new_id
-  app_image="$(env_val APP_IMAGE)";      [[ -n "$app_image" ]] || die "Could not read APP_IMAGE from .env"
-  pg_image="$(env_val POSTGRES_IMAGE)";  [[ -n "$pg_image" ]]  || die "Could not read POSTGRES_IMAGE from .env"
-  vk_image="$(env_val VALKEY_IMAGE)";    [[ -n "$vk_image" ]]  || die "Could not read VALKEY_IMAGE from .env"
-  app_old_id="$(running_image_id "$CONTAINER")"
-  pg_old_id="$(running_image_id "$POSTGRES_CONTAINER")"
-  vk_old_id="$(running_image_id "$VALKEY_CONTAINER")"
-
-  echo "  Auto-update: re-pulling ${pg_image} ..."
-  podman pull "$pg_image"
-  pg_new_id="$(image_id_of "$pg_image")";   [[ -n "$pg_new_id" ]]  || die "Could not inspect pulled image ${pg_image}"
-  echo "  Auto-update: re-pulling ${vk_image} ..."
-  podman pull "$vk_image"
-  vk_new_id="$(image_id_of "$vk_image")";   [[ -n "$vk_new_id" ]]  || die "Could not inspect pulled image ${vk_image}"
-  echo "  Auto-update: re-pulling ${app_image} ..."
-  podman pull "$app_image"
-  app_new_id="$(image_id_of "$app_image")"; [[ -n "$app_new_id" ]] || die "Could not inspect pulled image ${app_image}"
-
-  local app_changed=0 pg_changed=0 vk_changed=0
-  [[ -z "$app_old_id" || "$app_new_id" != "$app_old_id" ]] && app_changed=1
-  [[ -z "$pg_old_id"  || "$pg_new_id"  != "$pg_old_id"  ]] && pg_changed=1
-  [[ -z "$vk_old_id"  || "$vk_new_id"  != "$vk_old_id"  ]] && vk_changed=1
-
-  if [[ "$app_changed" -eq 0 && "$pg_changed" -eq 0 && "$vk_changed" -eq 0 ]]; then
-    echo "  OK: all images are already current — no restart needed."
-    return 0
-  fi
-
-  local target="app"
-  if   [[ "$pg_changed" -eq 1 && "$vk_changed" -eq 1 ]]; then target="backends"
-  elif [[ "$pg_changed" -eq 1 ]]; then target="postgres"
-  elif [[ "$vk_changed" -eq 1 ]]; then target="valkey"
-  fi
-
-  rollback() {
-    echo "  !! Auto-update failed — restoring previous images and restarting ..." >&2
-    [[ "$app_changed" -eq 1 && -n "$app_old_id" ]] && podman tag "$app_old_id" "$app_image" >/dev/null 2>&1 || true
-    [[ "$pg_changed"  -eq 1 && -n "$pg_old_id"  ]] && podman tag "$pg_old_id"  "$pg_image"  >/dev/null 2>&1 || true
-    [[ "$vk_changed"  -eq 1 && -n "$vk_old_id"  ]] && podman tag "$vk_old_id"  "$vk_image"  >/dev/null 2>&1 || true
-    restart_for "$target" || true
-    if wait_for_stack; then
-      echo "  Rollback complete — previous images are healthy again." >&2
-    else
-      echo "  CRITICAL: rollback did not become healthy. Restore the CT from the PVE snapshot / PBS." >&2
-      [[ "$app_changed" -eq 1 ]] && echo "  (If the new Immich already migrated the database, the old image cannot run against it.)" >&2
+  [[ $(systemctl show "$SERVICE" -p LoadState --value) == loaded ]] || die "Unit did not load."
+  if [[ $new_id != "$OLD_ID" ]]; then
+    if [[ $COMPONENT != APP ]]; then
+      APP_STOPPED=1
+      systemctl stop "$MAIN_SERVICE"
     fi
-  }
-  trap rollback ERR
-
-  echo "  Changed — Immich: ${app_changed}, PostgreSQL: ${pg_changed}, Valkey: ${vk_changed}; restarting (${target}) ..."
-  restart_for "$target"
-
-  echo "  Waiting for the stack ..."
-  if ! wait_for_stack; then
-    trap - ERR
-    rollback
-    die "Stack did not become healthy after auto-update."
+    START_ATTEMPTED=1
+    systemctl restart "$SERVICE"
+    wait_service "$CONTAINER" "$KIND" "${STATE[UPDATE_WAIT_SECONDS]}" || die "$SERVICE failed readiness or restarted."
+    if [[ $COMPONENT != APP ]]; then
+      systemctl start "$MAIN_SERVICE"
+      wait_service immich app "${STATE[UPDATE_WAIT_SECONDS]}" || die "Application did not recover after backend update."
+    fi
   fi
-
-  trap - ERR
-  [[ "$app_changed" -eq 1 && -n "$app_old_id" ]] && podman rmi "$app_old_id" >/dev/null 2>&1 || true
-  [[ "$pg_changed"  -eq 1 && -n "$pg_old_id"  ]] && podman rmi "$pg_old_id"  >/dev/null 2>&1 || true
-  [[ "$vk_changed"  -eq 1 && -n "$vk_old_id"  ]] && podman rmi "$vk_old_id"  >/dev/null 2>&1 || true
-  echo "  OK: Immich stack refreshed (Immich changed: ${app_changed}, PostgreSQL changed: ${pg_changed}, Valkey changed: ${vk_changed})"
+  actual=$(podman inspect --format '{{.Image}}' "$CONTAINER")
+  [[ $(image_id "$actual") == "$new_id" ]] || die "Running image differs from target."
+  post_update_checks
+  SWITCHED=0; START_ATTEMPTED=0; APP_STOPPED=0
+  rm -rf -- "$WORK"; WORK=""
+  # Retain the prior image for inspection/recovery. No broad image prune.
+  read_state
+  printf '  Updated %s: %s (%s).\n' "$COMPONENT" "$target" "$new_id"
 }
 
-need_root
-cmd="${1:-}"
-case "$cmd" in
-  update)          shift; update_app "$@" ;;
-  update-postgres) shift; update_postgres "$@" ;;
-  update-valkey)   shift; update_valkey "$@" ;;
-  auto-update)     auto_update_app ;;
-  version)
-    # With "latest" the tag carries no version info; the digest identifies the build.
-    echo "Configured Immich image:     $(env_val APP_IMAGE)"
-    echo "Running Immich image ID:     $(running_image_id "$CONTAINER")"
-    echo "Immich digest:               $(image_digest_of "$(env_val APP_IMAGE)")"
-    echo "Immich server version:       $(curl -s --max-time 3 "http://127.0.0.1:$(app_port)/api/server/version" 2>/dev/null || echo n/a)"
-    echo "Configured PostgreSQL image: $(env_val POSTGRES_IMAGE)"
-    echo "Running PostgreSQL image ID: $(running_image_id "$POSTGRES_CONTAINER")"
-    echo "Configured Valkey image:     $(env_val VALKEY_IMAGE)"
-    echo "Running Valkey image ID:     $(running_image_id "$VALKEY_CONTAINER")"
-    echo "AUTO_UPDATE=$(env_flag AUTO_UPDATE)"
+[[ $EUID == 0 ]] || die "Run as root inside the immich CT."
+for command in podman systemctl curl awk sed sort head cat stat grep mktemp cp chmod mv rm flock timeout python3; do
+  command -v "$command" >/dev/null || die "Missing command: $command"
+done
+[[ -f $ENV_FILE ]] || die "Missing $ENV_FILE."
+exec 9>"$LOCK"
+flock -n 9 || die "Another maintenance operation is running."
+YES=0
+ARGS=()
+for arg in "$@"; do
+  case $arg in --yes|-y) YES=1 ;; *) ARGS+=("$arg") ;; esac
+done
+set -- "${ARGS[@]}"
+cmd=${1:---help}
+read_state
+case $cmd in
+  update|update-postgres|update-valkey)
+    (( $# <= 2 )) || die "Usage: $0 $cmd [tag] [--yes]"
+    if (( YES == 0 )); then
+      exec 8</dev/tty || die "Interactive terminal or --yes is required."
+    fi
+    case $cmd in
+      update-postgres) update_component POSTGRES "${2:-}" ;;
+      update-valkey) update_component VALKEY "${2:-}" ;;
+      update) update_component APP "${2:-}" ;;
+    esac
     ;;
-  ""|-h|--help) usage ;;
-  *) usage; die "Unknown command: $cmd" ;;
+  auto-update)
+    (( $# == 1 )) || die "auto-update takes no tag."
+    [[ ${STATE[AUTO_UPDATE]} == 1 ]] || { printf '  Auto-update is disabled.\n'; exit 0; }
+    YES=1
+    for component in POSTGRES VALKEY APP; do
+      update_component "$component"
+    done
+    ;;
+  check)
+    (( $# <= 2 )) && [[ ${2:-} == "" || ${2:-} == --initial ]] || die "Usage: $0 check [--initial]"
+    /usr/local/sbin/immich-ufw-check
+    budget=${STATE[UPDATE_WAIT_SECONDS]}
+    [[ ${2:-} != --initial ]] || budget=${STATE[INITIAL_WAIT_SECONDS]}
+    for component in POSTGRES VALKEY APP; do
+      select_component "$component"
+      load_unit
+      if [[ ${2:-} == --initial ]]; then
+        [[ $(systemctl show "$SERVICE" -p NRestarts --value) == 0 ]] || die "$SERVICE restarted during initial startup."
+      fi
+      wait_service "$CONTAINER" "$KIND" "$budget" || die "$SERVICE failed readiness or restarted."
+      actual=$(podman inspect --format '{{.Image}}' "$CONTAINER")
+      [[ $(image_id "$actual") == "$OLD_ID" ]] || die "Running/configured image mismatch: $SERVICE"
+    done
+    printf '  Service readiness, stable restart counts, image IDs and UFW checks passed.\n'
+    ;;
+  version)
+    (( $# == 1 )) || die "version takes no argument."
+    for component in POSTGRES VALKEY APP; do
+      select_component "$component"; load_unit
+      printf '  %s\n    tag: %s\n    configured ID: %s\n    running ID: ' "$CONTAINER" "$OLD_TAG" "$OLD_ID"
+      podman inspect --format '{{.Image}}' "$CONTAINER" || true
+    done
+    ;;
+  --help|-h|'')
+    printf 'Usage: %s update [tag] [--yes] | update-postgres [tag] [--yes] | update-valkey [tag] [--yes] | auto-update | check [--initial] | version\n' "$0"
+    printf '  Exact image IDs; one component per operation; PBS/PVE handles data recovery.\n'
+    printf '  Fresh-creator helper: do not replace an older deployed helper without migrating its control files.\n'
+    ;;
+  *) die "Unknown command: $cmd" ;;
 esac
 MAINT
-echo "  Maintenance script deployed: /usr/local/bin/immich-maint.sh"
+pct push "$CT_ID" "$tmp" /usr/local/bin/immich-maint.sh --perms 0755
+rm -f -- "$tmp"
 
 # ── Start via Quadlet ─────────────────────────────────────────────────────────
-# daemon-reload triggers the Quadlet generator which produces immich.service,
-# immich-postgres.service and immich-valkey.service as transient systemd units.
-# WantedBy=multi-user.target handles boot restarts. Transient units cannot be
-# systemctl-enabled; daemon-reload is sufficient. Starting immich.service pulls
-# in both backends via Requires= and waits for their health checks (Notify=healthy)
-# before the app container is created. First DB init + Immich migrations +
-# ML model download can take a few minutes.
-pct exec "$CT_ID" -- bash -lc "
-  set -euo pipefail
-  systemctl daemon-reload
-  systemctl start '${QUADLET_SERVICE}'
-"
-
-# ── Disarm destructive cleanup ────────────────────────────────────────────────
+pct exec "$CT_ID" -- bash -s -- immich-postgres immich-valkey immich <<'QUADLET_VALIDATE'
+set -euo pipefail
+output=$(mktemp)
+trap 'rm -f -- "$output"' EXIT
+/usr/lib/systemd/system-generators/podman-system-generator --dryrun > "$output"
+for service in "$@"; do
+  grep -Fq "$service.service" "$output" || { echo "ERROR: Quadlet generator omitted $service." >&2; exit 1; }
+done
+systemctl daemon-reload
+for service in "$@"; do
+  [[ $(systemctl show "$service.service" -p LoadState --value) == loaded ]] || exit 1
+done
+QUADLET_VALIDATE
+pct exec "$CT_ID" -- /usr/local/sbin/immich-ufw-check
+# Preserve the CT even if the first persistent start fails partway through.
 CLEANUP_ON_FAIL=0
+pct exec "$CT_ID" -- systemctl start immich.service
+
+# Destructive cleanup was disarmed before the first persistent service start.
 
 # ── Verification ──────────────────────────────────────────────────────────────
-sleep 3
+sleep 30
+if ! pct exec "$CT_ID" -- /usr/local/bin/immich-maint.sh check --initial; then
+  echo "ERROR: Initial readiness/image/firewall verification failed; CT $CT_ID is preserved." >&2
+  exit 1
+fi
 VERIFY_FAIL=0
 
 for svc in "$POSTGRES_QUADLET_SERVICE" "$VALKEY_QUADLET_SERVICE" "$QUADLET_SERVICE"; do
@@ -1375,50 +1572,103 @@ else
   VERIFY_FAIL=1
 fi
 
+
+# Verify credentials and the effective database, not only pg_isready.
+if ! pct exec "$CT_ID" -- python3 - <<'DATABASE_VERIFY'
+import pathlib, subprocess, urllib.parse
+app = "immich"
+root = pathlib.Path("/opt") / app
+container = app + "-postgres"
+def envfile(path):
+    result = {}
+    for line in path.read_text().splitlines():
+        if not line or line.startswith("#"):
+            continue
+        key, value = line.split("=", 1)
+        if key in result:
+            raise SystemExit("Duplicate credential key")
+        result[key] = value
+    return result
+appenv = envfile(root / (app + ".env"))
+pgenv = envfile(root / "postgres.env")
+for ctr, values in ((app, appenv), (container, pgenv)):
+    for key, expected in values.items():
+        got = subprocess.check_output(["podman", "exec", ctr, "printenv", key], text=True, timeout=15).removesuffix("\n")
+        if got != expected:
+            raise SystemExit(f"Credential/config round trip failed: {ctr} {key}")
+password = urllib.parse.urlsplit(appenv["DATABASE_URL"]).password if app == "docmost" else appenv["DB_PASSWORD"]
+def sql(statement, secret):
+    command = ["podman", "exec", "-i", container, "bash", "-c",
+               'IFS= read -r PGPASSWORD; export PGPASSWORD; exec psql -w -v ON_ERROR_STOP=1 -h 127.0.0.1 -U "$1" -d "$1" -tAc "$2"',
+               "check", app, statement]
+    return subprocess.run(command, input=secret+"\n", text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=15)
+if sql("SELECT 1", "deliberately-wrong").returncode == 0:
+    raise SystemExit("PostgreSQL accepted an incorrect TCP password")
+checks = [
+    ("SELECT 1", "1"),
+    ("SELECT rolcanlogin AND rolsuper FROM pg_roles WHERE rolname='immich'", "t"),
+    ("SELECT pg_get_userbyid(datdba)='immich' FROM pg_database WHERE datname='immich'", "t"),
+    ("SELECT count(*)>0 FROM pg_tables WHERE schemaname='public'", "t"),
+    ("SHOW data_directory", "/var/lib/postgresql/data"),
+]
+if app == "immich":
+    checks.append(("SELECT count(*)=1 FROM pg_extension WHERE extname='vchord'", "t"))
+for query, expected in checks:
+    result = sql(query, password)
+    if result.returncode or result.stdout.strip() != expected:
+        raise SystemExit("Database authentication, role, storage or migration verification failed")
+# pg_hba_file_rules is administrator-only; do not grant it to the app role.
+admin = "postgres" if app == "docmost" else "immich"
+query = "SELECT count(*)=0 FROM pg_hba_file_rules WHERE error IS NOT NULL OR (type LIKE 'host%' AND auth_method <> 'scram-sha-256')"
+hba = subprocess.run(["podman", "exec", container, "psql", "-w", "-U", admin, "-d", app, "-tAc", query],
+                     text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=15)
+if hba.returncode or hba.stdout.strip() != "t":
+    raise SystemExit("PostgreSQL host authentication is not consistently SCRAM")
+print("  Database credentials, authentication, role, persistent path and schema verified.")
+DATABASE_VERIFY
+then
+  VERIFY_FAIL=1
+fi
+
 if (( VERIFY_FAIL == 1 )); then
   echo "" >&2
   echo "  FATAL: Core verification failed — CT $CT_ID is preserved but the install is incomplete." >&2
   echo "  Inspect the container and fix manually, or destroy and re-run." >&2
   if [[ -n "$PHOTO_MOUNT_SRC" ]]; then
-    echo "  The host photo path ${PHOTO_MOUNT_SRC} was NOT touched by the failure and is safe to re-attach." >&2
+    echo "  Host photo path ${PHOTO_MOUNT_SRC} is retained. Inspect it and recover matching database/media state if necessary." >&2
   fi
   exit 1
 fi
 
 # ── Auto-update timer (policy-driven) ─────────────────────────────────────────
-pct exec "$CT_ID" -- bash -lc "
-  set -euo pipefail
-  cat > /etc/systemd/system/immich-update.service <<EOF2
+pct exec "$CT_ID" -- bash -s -- "$UPDATE_TIME" <<'TIMER_INSTALL'
+set -euo pipefail
+cat > /etc/systemd/system/immich-update.service <<EOF2
 [Unit]
-Description=Immich auto-update maintenance run
+Description=immich image maintenance
 After=network-online.target
 Wants=network-online.target
-
 [Service]
 Type=oneshot
 ExecStart=/usr/local/bin/immich-maint.sh auto-update
+TimeoutStartSec=infinity
+TimeoutStopSec=180
 EOF2
-
-  cat > /etc/systemd/system/immich-update.timer <<EOF2
+cat > /etc/systemd/system/immich-update.timer <<EOF2
 [Unit]
-Description=Immich auto-update timer
-
+Description=immich daily image maintenance
 [Timer]
-OnCalendar=*-*-* ${UPDATE_TIME}:00
+OnCalendar=*-*-* $1:00
 Persistent=true
-
 [Install]
 WantedBy=timers.target
 EOF2
-
-  systemctl daemon-reload
-"
-if [[ "$AUTO_UPDATE" -eq 1 ]]; then
-  pct exec "$CT_ID" -- bash -lc 'systemctl enable --now immich-update.timer'
-  echo "  Auto-update timer enabled"
+systemctl daemon-reload
+TIMER_INSTALL
+if [[ $AUTO_UPDATE == 1 ]]; then
+  pct exec "$CT_ID" -- systemctl enable --now immich-update.timer
 else
-  pct exec "$CT_ID" -- bash -lc 'systemctl disable --now immich-update.timer >/dev/null 2>&1 || true'
-  echo "  Auto-update timer installed but disabled"
+  pct exec "$CT_ID" -- systemctl disable --now immich-update.timer
 fi
 
 # ── Unattended upgrades ───────────────────────────────────────────────────────
@@ -1584,6 +1834,43 @@ pct set "$CT_ID" --description "$IM_DESC"
 # ── Protect container ─────────────────────────────────────────────────────────
 pct set "$CT_ID" --protection 1
 
+
+cat <<OPERATIONS
+
+  IMMICH — OPERATIONS
+
+  CONTAINER     $HN | CT $CT_ID | $CT_IP
+  WEB/ADMIN     http://$CT_IP:$APP_PORT/
+  ALLOWED FROM  $FIREWALL_ACCESS_LABEL
+  FIREWALL      UFW inside the CT, IPv4 and IPv6; no PVE firewall dependency
+  AUTO-UPDATE   $AUTO_UPDATE | daily $UPDATE_TIME ($APP_TZ)
+  IMAGES        exact local IDs, Pull=never; old images retained for review
+
+  RUN ON THE PROXMOX HOST
+    pct enter $CT_ID
+    pct exec $CT_ID -- /usr/local/bin/immich-maint.sh version
+
+  RUN INSIDE THE CT
+    /usr/local/bin/immich-maint.sh check
+    /usr/local/bin/immich-maint.sh update $APP_TAG
+    ufw status verbose
+    journalctl -u immich.service --no-pager -n 80
+
+  ACCESS CHECK
+    Test the web endpoint from your intended client/proxy.
+    If you restricted sources, also test from outside the allowed list.
+    Installer rule checks do not prove the full network path.
+    Add/delete UFW rules directly; do not restart ufw.service while apps run.
+
+  RECOVERY
+    Verify a matching PBS/PVE checkpoint before updates; --yes only skips prompts.
+    If FUSE is enabled, use stop-mode PBS. Back up external bind mounts separately.
+    For persistent components, failed updates retain the target after it may start.
+    The helper changes one component at a time; earlier successes remain applied.
+    Creators build new CTs. Existing CTs require a reviewed control-file migration.
+
+OPERATIONS
+
 # ── Summary ───────────────────────────────────────────────────────────────────
 echo ""
 echo "    CT: $CT_ID | IP: ${CT_IP} | Web UI: http://${CT_IP}:${APP_PORT}/"
@@ -1614,9 +1901,9 @@ if [[ "$PHOTO_EXISTING" -eq 1 ]]; then
 fi
 echo "    pct exec $CT_ID -- systemctl status immich.service"
 echo "    pct exec $CT_ID -- journalctl -u immich.service --no-pager -n 50"
-echo "    pct exec $CT_ID -- /usr/local/bin/immich-maint.sh update <tag>           # latest, or pin e.g. 3.1.0 / 3.1.0-noml"
+echo "    pct exec $CT_ID -- /usr/local/bin/immich-maint.sh update <tag>           # pin e.g. 3.1.0 / 3.1.0-noml"
 echo "    pct exec $CT_ID -- /usr/local/bin/immich-maint.sh update-postgres <tag>  # same PG major only, per Immich release notes"
-echo "    pct exec $CT_ID -- /usr/local/bin/immich-maint.sh update-valkey <tag>    # latest, or pin e.g. 8.1.3"
+echo "    pct exec $CT_ID -- /usr/local/bin/immich-maint.sh update-valkey <tag>    # pin e.g. 8.1.3"
 echo "    pct exec $CT_ID -- /usr/local/bin/immich-maint.sh auto-update            # re-pull current tags now (if AUTO_UPDATE=1)"
 echo "    pct exec $CT_ID -- /usr/local/bin/immich-maint.sh version"
 echo "    Backup/restore: PBS + PVE snapshots cover the CT (DB, config)."
@@ -1633,7 +1920,7 @@ echo "      client_max_body_size 0;"
 echo "      proxy_read_timeout 600s;"
 echo "      proxy_send_timeout 600s;"
 echo "      proxy_buffering off;"
-echo "    Port ${APP_PORT} listens on all CT interfaces (Network=host) — restrict with the PVE firewall if needed."
+echo "    Port ${APP_PORT} listens on all CT interfaces (Network=host) — access follows the UFW source choice shown above."
 echo "    PostgreSQL (5432), Valkey (6379) and the ML service (3003) are bound to 127.0.0.1 inside the CT."
 if [[ "$PODMAN_FUSE_OVERLAY" -eq 1 ]]; then
   echo "    Backups: fuse=1 + fuse-overlayfs can deadlock under snapshot-mode vzdump/PBS (freezer)."
