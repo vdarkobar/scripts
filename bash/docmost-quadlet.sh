@@ -4,6 +4,7 @@ umask 022
 export LC_ALL=C
 # Safety revision: 2026-09-11. Fresh Proxmox CT creator; maintenance runs inside the CT.
 # Verification fix: privileged PostgreSQL settings are checked as postgres.
+# Hardening integration: 2026-09-12; supplied lab-hardening-block.sh v1.1, unchanged.
 
 # ── Config ────────────────────────────────────────────────────────────────────
 CT_ID=""                             # empty = auto-assign via pvesh; set e.g. CT_ID=120 to pin
@@ -76,6 +77,24 @@ UFW_ALLOWED_SOURCES=()
 SCRIPT_URL="https://raw.githubusercontent.com/vdarkobar/scripts/main/bash/docmost-quadlet.sh"
 SCRIPT_LOCAL="/root/docmost-quadlet.sh"
 
+# Shared hardening v1.1 — Debian 13 service LXC, no forwarding
+# These are the tested LXC defaults. Docmost needs no policy exception.
+HARDENING_PROFILE="lxc"
+HARDENING_RP_FILTER=1
+HARDENING_KEEP_SSH=0                 # 0 = remove CT SSH server; 1 = preserve it
+HARDENING_REMOVE_POSTFIX=1           # Docmost mail uses its app configuration, not local Postfix
+HARDENING_JOURNAL_DAYS=14
+HARDENING_JOURNAL_MAX_MB=256
+HARDENING_JOURNAL_RUNTIME_MB=64
+HARDENING_UPDATE_MAX_AGE_HOURS=72
+# Creator-only "auto" resolves to the final APP_PORT after prompts.
+# Otherwise use a complete space-separated list; "" means inventory-only.
+# If preserving SSH, include its actual listening port in a complete TCP list.
+# These lists check unexpected external listeners; they do not add UFW rules
+# or establish application readiness. Loopback PostgreSQL/Redis are excluded.
+HARDENING_TCP_PORTS="auto"
+HARDENING_UDP_PORTS="68"             # net0 uses DHCPv4; add 546 only if DHCPv6 is actually used
+
 # Derived
 APP_DIR="/opt/docmost"
 APP_IMAGE="${APP_IMAGE_REPO}:${APP_TAG}"
@@ -113,8 +132,18 @@ APP_URL=""
 #   /etc/update-motd.d/10-sysinfo
 #   /etc/update-motd.d/30-app
 #   /etc/update-motd.d/99-footer
-#   /etc/apt/apt.conf.d/52unattended-<hostname>.conf
+#   /etc/update-motd.d/25-lab-hardening
 #   /etc/sysctl.d/99-hardening.conf
+#   /etc/apt/apt.conf.d/99-lab-hardening
+#   /etc/needrestart/conf.d/99-lab-hardening.conf
+#   /etc/systemd/journald.conf.d/99-lab-hardening.conf
+#   /etc/systemd/system/apt-daily{,-upgrade}.service.d/90-lab-readiness.conf
+#   /etc/systemd/system/lab-hardening-check.{service,timer}
+#   /usr/local/sbin/lab-apt-wait-online
+#   /usr/local/sbin/lab-hardening-check
+#   /etc/systemd/system/ssh.{service,socket}             (masks when SSH is removed)
+#   /var/lib/lab-hardening/{policy.json,status.json,last-index-refresh,check.lock}
+#   /var/backups/lab-hardening/<run>/                   (configuration copies and dry-run log)
 
 # ── Config validation ─────────────────────────────────────────────────────────
 [[ "$HN" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$ ]] || { echo "  ERROR: HN is not a valid hostname: $HN" >&2; exit 1; }
@@ -172,6 +201,17 @@ for wait_var in INITIAL_WAIT_SECONDS UPDATE_WAIT_SECONDS; do
 done
 [[ $UPDATE_TIME =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]] || { echo "ERROR: Invalid UPDATE_TIME." >&2; exit 1; }
 
+# Validate common tunables before creating a CT; the unchanged block validates
+# them again in the guest. Port lists are checked after "auto" is resolved.
+[[ $HARDENING_PROFILE == lxc || $HARDENING_PROFILE == auto ]] \
+  || { echo "ERROR: HARDENING_PROFILE must be lxc (or its auto alias)." >&2; exit 1; }
+[[ $HARDENING_RP_FILTER =~ ^(1|2|auto)$ && $HARDENING_KEEP_SSH =~ ^(0|1|auto)$ && $HARDENING_REMOVE_POSTFIX =~ ^[01]$ ]] \
+  || { echo "ERROR: Invalid hardening rp_filter or service-removal flag." >&2; exit 1; }
+for policy_var in HARDENING_JOURNAL_DAYS HARDENING_JOURNAL_MAX_MB HARDENING_JOURNAL_RUNTIME_MB HARDENING_UPDATE_MAX_AGE_HOURS; do
+  [[ ${!policy_var} =~ ^[1-9][0-9]{0,3}$ ]] \
+    || { echo "ERROR: $policy_var must be 1..9999." >&2; exit 1; }
+done
+
 # ── Trap cleanup ──────────────────────────────────────────────────────────────
 # rc is captured before the trap is reset; $LINENO is the failing line at top
 # level (BASH_LINENO[0] is 0 outside a function). After CREATED=1, failing
@@ -203,7 +243,7 @@ trap 'rc=130;
 # ── Preflight — root & commands ───────────────────────────────────────────────
 [[ "$(id -u)" -eq 0 ]] || { echo "  ERROR: Run as root on the Proxmox host." >&2; exit 1; }
 
-for cmd in pvesh pveam pct pvesm qm curl python3 ip awk grep sed sort paste seq readlink cp chmod dpkg head tr flock mktemp mv rm tail bash stat timeout; do
+for cmd in pveversion pvesh pveam pct pvesm qm curl python3 ip awk grep sed sort paste seq readlink cp chmod dpkg head tr flock mktemp mv rm tail bash stat timeout; do
   command -v "$cmd" >/dev/null 2>&1 || { echo "  ERROR: Missing required command: $cmd" >&2; exit 1; }
 done
 
@@ -409,6 +449,17 @@ done
 
 echo ""
 
+# ── Final hardening listener policy ───────────────────────────────────────────
+# All prompts are complete. Pass the chosen application port to the common
+# block; never include the loopback-only PostgreSQL/Redis backend ports.
+[[ $HARDENING_TCP_PORTS != auto ]] || HARDENING_TCP_PORTS="$APP_PORT"
+for port in $HARDENING_TCP_PORTS $HARDENING_UDP_PORTS; do
+  if [[ ! $port =~ ^[1-9][0-9]{0,4}$ ]] || (( port > 65535 )); then
+    echo "ERROR: Hardening ports must be space-separated numbers from 1 to 65535." >&2
+    exit 1
+  fi
+done
+
 # ── Generate secrets ──────────────────────────────────────────────────────────
 # DB_PASSWORD goes into DATABASE_URL unencoded, so it is alphanumeric only.
 # APP_SECRET signs sessions/JWTs (upstream: >= 32 chars, openssl rand -hex 32).
@@ -488,10 +539,9 @@ fi
 # ── OS update ─────────────────────────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc '
   set -euo pipefail
-  export DEBIAN_FRONTEND=noninteractive
+  export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l
   export LANG=C.UTF-8
   export LC_ALL=C.UTF-8
-  systemctl disable -q --now systemd-networkd-wait-online.service 2>/dev/null || true
   apt-get update -qq
   apt-get -o Dpkg::Options::="--force-confold" -y dist-upgrade
   apt-get -y autoremove
@@ -504,7 +554,7 @@ PODMAN_FUSE_PKG=""
 
 pct exec "$CT_ID" -- bash -lc "
   set -euo pipefail
-  export DEBIAN_FRONTEND=noninteractive
+  export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l
   apt-get update -qq
   apt-get install -y locales curl ca-certificates iproute2 python3 ufw iptables util-linux podman tar gzip ${PODMAN_FUSE_PKG}
   sed -i 's/^# *en_US.UTF-8/en_US.UTF-8/' /etc/locale.gen
@@ -513,16 +563,6 @@ pct exec "$CT_ID" -- bash -lc "
   ln -sf /usr/share/zoneinfo/${APP_TZ} /etc/localtime
   echo '${APP_TZ}' > /etc/timezone
 "
-
-# ── Remove unnecessary services ───────────────────────────────────────────────
-pct exec "$CT_ID" -- bash -lc '
-  set -euo pipefail
-  export DEBIAN_FRONTEND=noninteractive
-  systemctl disable --now ssh 2>/dev/null || true
-  systemctl disable --now postfix 2>/dev/null || true
-  apt-get purge -y openssh-server postfix 2>/dev/null || true
-  apt-get -y autoremove
-'
 
 # ── UFW inside the CT ─────────────────────────────────────────────────────────
 # Fresh CT only. Network=host uses this CT's INPUT chain.
@@ -533,12 +573,9 @@ port=$1; shift
 (( $# > 0 )) || { echo "ERROR: No allowed source addresses."; false; }
 iptables -w 5 -S INPUT >/dev/null
 ip6tables -w 5 -S INPUT >/dev/null
-ufw --force reset
 sed -i 's/^IPV6=.*/IPV6=yes/' /etc/default/ufw
 grep -qx 'IPV6=yes' /etc/default/ufw
-# The creator owns sysctl hardening; avoid a second writer in ufw-init.
-grep -q '^IPT_SYSCTL=' /etc/default/ufw
-sed -i 's|^IPT_SYSCTL=.*|IPT_SYSCTL=|' /etc/default/ufw
+# The late common block backs up UFW defaults and disables its sysctl loader.
 ufw default deny incoming
 ufw default allow outgoing
 ufw default deny routed
@@ -570,8 +607,10 @@ grep -qx 'Status: active' <<< "$status"
 for tool in /usr/sbin/iptables /usr/sbin/ip6tables; do
   prefix=ufw
   [[ ${tool##*/} != ip6tables ]] || prefix=ufw6
-  rules=$("$tool" -w 5 -S INPUT)
-  grep -qx -- '-P INPUT DROP' <<< "$rules"
+  for chain in INPUT FORWARD; do
+    rules=$("$tool" -w 5 -S "$chain")
+    grep -qx -- "-P $chain DROP" <<< "$rules"
+  done
   "$tool" -w 5 -C INPUT -j "$prefix-before-input"
   "$tool" -w 5 -S "$prefix-user-input" >/dev/null
 done
@@ -1300,12 +1339,818 @@ pct exec "$CT_ID" -- systemctl start docmost.service
 
 # Destructive cleanup was disarmed before the first persistent service start.
 
-# ── Verification ──────────────────────────────────────────────────────────────
+# ── Initial application readiness ────────────────────────────────────────────
 sleep 30
 if ! pct exec "$CT_ID" -- /usr/local/bin/docmost-maint.sh check --initial; then
   echo "ERROR: Initial readiness/image/firewall verification failed; CT $CT_ID is preserved." >&2
-  exit 1
+  false
 fi
+# ── Auto-update timer (policy-driven) ─────────────────────────────────────────
+pct exec "$CT_ID" -- bash -s -- "$UPDATE_TIME" <<'TIMER_INSTALL'
+set -euo pipefail
+cat > /etc/systemd/system/docmost-update.service <<EOF2
+[Unit]
+Description=docmost image maintenance
+After=network-online.target
+Wants=network-online.target
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/docmost-maint.sh auto-update
+TimeoutStartSec=infinity
+TimeoutStopSec=180
+EOF2
+cat > /etc/systemd/system/docmost-update.timer <<EOF2
+[Unit]
+Description=docmost daily image maintenance
+[Timer]
+OnCalendar=*-*-* $1:00
+Persistent=true
+[Install]
+WantedBy=timers.target
+EOF2
+systemctl daemon-reload
+TIMER_INSTALL
+if [[ $AUTO_UPDATE == 1 ]]; then
+  pct exec "$CT_ID" -- systemctl enable --now docmost-update.timer
+else
+  pct exec "$CT_ID" -- systemctl disable --now docmost-update.timer
+fi
+
+# ── Extra packages ────────────────────────────────────────────────────────────
+if [[ "${#EXTRA_PACKAGES[@]}" -gt 0 ]]; then
+  pct exec "$CT_ID" -- bash -lc "
+    set -euo pipefail
+    export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l
+    apt-get install -y ${EXTRA_PACKAGES[*]}
+  "
+fi
+
+# ── Cleanup packages ──────────────────────────────────────────────────────────
+pct exec "$CT_ID" -- bash -lc '
+  set -euo pipefail
+  export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l
+  apt-get purge -y man-db manpages 2>/dev/null || true
+  apt-get -y autoremove
+  apt-get -y clean
+'
+
+# ── MOTD (dynamic drop-ins) ───────────────────────────────────────────────────
+pct exec "$CT_ID" -- bash -lc "
+  set -euo pipefail
+  > /etc/motd
+  chmod -x /etc/update-motd.d/* 2>/dev/null || true
+  rm -f /etc/update-motd.d/*
+
+  cat > /etc/update-motd.d/00-header <<'MOTD'
+#!/bin/sh
+printf '\\n  Docmost (Podman/Quadlet)\\n'
+printf '  ────────────────────────────────────\\n'
+MOTD
+
+  cat > /etc/update-motd.d/10-sysinfo <<'MOTD'
+#!/bin/sh
+ip=\$(ip -4 -o addr show scope global 2>/dev/null | awk '{print \$4}' | cut -d/ -f1 | head -n1)
+printf '  Hostname:  %s\\n' \"\$(hostname)\"
+printf '  IP:        %s\\n' \"\${ip:-n/a}\"
+printf '  Uptime:    %s\\n' \"\$(uptime -p 2>/dev/null || uptime)\"
+printf '  Disk:      %s\\n' \"\$(df -h / | awk 'NR==2{printf \"%s/%s (%s used)\", \$3, \$2, \$5}')\"
+MOTD
+
+  cat > /etc/update-motd.d/30-app <<'MOTD'
+#!/bin/sh
+running=\$(podman ps --filter name=^docmost$ --filter name=^docmost-postgres$ --filter name=^docmost-redis$ --format '{{.Names}}' 2>/dev/null | wc -l)
+svc_status=\$(systemctl is-active docmost.service 2>/dev/null); svc_status=\${svc_status:-unknown}
+pg_status=\$(systemctl is-active docmost-postgres.service 2>/dev/null); pg_status=\${pg_status:-unknown}
+rd_status=\$(systemctl is-active docmost-redis.service 2>/dev/null); rd_status=\${rd_status:-unknown}
+ip=\$(ip -4 -o addr show scope global 2>/dev/null | awk '{print \$4}' | cut -d/ -f1 | head -n1)
+image=\$(awk -F= '/^APP_IMAGE=/{print \$2}' /opt/docmost/.env 2>/dev/null | tail -n1)
+pg_image=\$(awk -F= '/^POSTGRES_IMAGE=/{print \$2}' /opt/docmost/.env 2>/dev/null | tail -n1)
+rd_image=\$(awk -F= '/^REDIS_IMAGE=/{print \$2}' /opt/docmost/.env 2>/dev/null | tail -n1)
+auto=\$(awk -F= '/^AUTO_UPDATE=/{print \$2}' /opt/docmost/.env 2>/dev/null | tail -n1)
+fqdn=\$(awk -F= '/^APP_FQDN=/{print \$2}' /opt/docmost/.env 2>/dev/null | tail -n1)
+port=\$(awk -F= '/^APP_PORT=/{print \$2}' /opt/docmost/.env 2>/dev/null | tail -n1)
+port=\${port:-3000}
+printf '  Containers: docmost + docmost-postgres + docmost-redis (%s running)\\n' \"\$running\"
+printf '  Services:   docmost (%s) | postgres (%s) | redis (%s)\\n' \"\$svc_status\" \"\$pg_status\" \"\$rd_status\"
+printf '  Image:      %s\\n' \"\${image:-n/a}\"
+printf '  PostgreSQL: %s (127.0.0.1:5432)\\n' \"\${pg_image:-n/a}\"
+printf '  Redis:      %s (127.0.0.1:6379)\\n' \"\${rd_image:-n/a}\"
+printf '  Policy:     %s\\n' \"\$([ \"\$auto\" = '1' ] && echo 'auto-update daily (re-pull current tags)' || echo 'manual updates only')\"
+printf '  Data:       /opt/docmost/storage  postgresdata  redis\\n'
+printf '  Secrets:    /opt/docmost/docmost.env  postgres.env\\n'
+printf '  Logs:       journalctl -u docmost.service -f\\n'
+printf '  Maintain:   /usr/local/bin/docmost-maint.sh [update|update-postgres|update-redis|auto-update|version]\\n'
+printf '  Updates:    systemctl status docmost-update.timer\\n'
+if [ -n \"\$fqdn\" ]; then
+  printf '  Web UI:     https://%s/\\n' \"\$fqdn\"
+fi
+printf '  Web UI:     http://%s:%s/\\n' \"\${ip:-n/a}\" \"\$port\"
+MOTD
+
+  cat > /etc/update-motd.d/99-footer <<'MOTD'
+#!/bin/sh
+printf '  ────────────────────────────────────\\n\\n'
+MOTD
+
+  chmod +x /etc/update-motd.d/*
+"
+
+pct exec "$CT_ID" -- bash -lc '
+  set -euo pipefail
+  touch /root/.bashrc
+  grep -q "^export TERM=" /root/.bashrc 2>/dev/null || echo "export TERM=xterm-256color" >> /root/.bashrc
+'
+
+# ── Shared hardening integration ─────────────────────────────────────────────
+# No package cleanup or MOTD replacement may follow this stage. Preserve the
+# CT for any hardening/final-verification failure, including ERR/INT/TERM/HUP.
+CLEANUP_ON_FAIL=0
+# Capture persistent user rules before the block. The block checks baseline
+# UFW filtering; the creator additionally proves its selected rules survive.
+UFW_RULES_BEFORE="$(pct exec "$CT_ID" -- sha256sum /etc/ufw/user.rules /etc/ufw/user6.rules)"
+
+# BEGIN VERBATIM lab-hardening-block.sh v1.1
+#!/usr/bin/env bash
+# ── Shared Debian 13 LXC hardening block ───────────────────────────────────────
+# Version: 1.1 (2026-09-12; LXC-only scope)
+# Paste this whole file AFTER the creator's MOTD/cleanup steps and BEFORE its
+# final verification/summary. Later MOTD code must not delete 25-lab-hardening.
+# Replace its old unattended-upgrades and sysctl sections with this block.
+# The initial OS upgrade and application/UFW setup must already have run.
+# Keep application-specific ports, source rules, users, health checks and units.
+# Creators retain set -Eeo pipefail and their ERR trap; do not invoke this block
+# as the condition of an if/! command. Late failures must preserve the CT.
+#
+# On PVE: an existing running CT_ID is mandatory; all changes run via pct exec.
+# Direct: root inside an existing Debian 13 LXC. Other environments are refused.
+# Scope: Proxmox service LXCs without routing, including Podman Network=host.
+# Routers, VPN gateways and containers using bridge forwarding need another policy.
+#
+# Features: dual-stack sysctl policy and UFW checks; scoped service removal;
+# Debian updates without auto-reboot; conservative dependency cleanup;
+# persistent bounded journals; report-only needrestart; APT readiness repair;
+# hourly/boot checks, local status reporting, configuration backups.
+# No remote downloads of scripts; no changes to app images or Proxmox config.
+# Reports are local (journal, status.json, MOTD); no email/webhook is configured.
+# Re-running saves a new config backup; package removals have no automatic undo.
+# UFW logging and all allow/deny rules retain the installer's existing policy.
+#
+# Managed paths:
+#   /etc/sysctl.d/99-hardening.conf
+#   /etc/apt/apt.conf.d/99-lab-hardening
+#   /etc/needrestart/conf.d/99-lab-hardening.conf
+#   /etc/systemd/journald.conf.d/99-lab-hardening.conf
+#   /etc/systemd/system/apt-daily{,-upgrade}.service.d/90-lab-readiness.conf (LXC)
+#   /etc/systemd/system/lab-hardening-check.{service,timer}
+#   /usr/local/sbin/lab-{apt-wait-online,hardening-check}
+#   /etc/update-motd.d/25-lab-hardening
+#   /etc/default/ufw (IPT_SYSCTL only); SSH service/socket masks (when SSH removed)
+#   /var/lib/lab-hardening/{policy.json,status.json,last-index-refresh,check.lock}
+#   /var/backups/lab-hardening/<run>/ (configuration copies and dry-run log)
+# References: Debian trixie apt.conf(5), systemd-sysctl(8), ifquery(8),
+# journald.conf(5), needrestart(1); kernel.org networking/ip-sysctl.html.
+#
+# Settings may instead be assigned in the creator's top config section.
+HARDENING_PROFILE="${HARDENING_PROFILE:-lxc}"              # lxc; auto remains a compatible alias
+HARDENING_RP_FILTER="${HARDENING_RP_FILTER:-1}"            # 1=strict; 2=loose for asymmetric paths
+HARDENING_KEEP_SSH="${HARDENING_KEEP_SSH:-0}"              # 0=remove; 1=preserve
+HARDENING_REMOVE_POSTFIX="${HARDENING_REMOVE_POSTFIX:-1}"   # 0 for intentional mail service
+HARDENING_JOURNAL_DAYS="${HARDENING_JOURNAL_DAYS:-14}"
+HARDENING_JOURNAL_MAX_MB="${HARDENING_JOURNAL_MAX_MB:-256}"
+HARDENING_JOURNAL_RUNTIME_MB="${HARDENING_JOURNAL_RUNTIME_MB:-64}"
+HARDENING_UPDATE_MAX_AGE_HOURS="${HARDENING_UPDATE_MAX_AGE_HOURS:-72}"
+# Optional space-separated external listening ports; leave empty to inventory
+# only. Loopback listeners are excluded. For DHCP include UDP 68 (and 546 if used).
+# Examples: Matrix TCP="8008 8080" UDP="68"; NPM TCP="80 443 81" UDP="68".
+# If preserving SSH, include its actual listening port in the TCP list.
+HARDENING_TCP_PORTS="${HARDENING_TCP_PORTS:-}"
+HARDENING_UDP_PORTS="${HARDENING_UDP_PORTS:-}"
+
+# ── Dispatch into the guest ───────────────────────────────────────────────────
+# The subshell isolates the block's options/variables from its parent creator.
+# shellcheck disable=SC2034
+CLEANUP_ON_FAIL=0
+(
+set -Eeuo pipefail
+export LC_ALL=C
+[[ $EUID == 0 ]] || { echo 'ERROR: Run as root.' >&2; exit 1; }
+hardening_exec=()
+if command -v pveversion >/dev/null 2>&1; then
+  [[ ${CT_ID:-} =~ ^[1-9][0-9]+$ ]] || {
+    echo 'ERROR: On Proxmox, supply an existing CT_ID; the host is never hardened.' >&2; exit 1;
+  }
+  pct status "$CT_ID" | grep -qx 'status: running'
+  hardening_exec=(pct exec "$CT_ID" --)
+fi
+"${hardening_exec[@]}" bash -s -- \
+  "$HARDENING_PROFILE" "$HARDENING_RP_FILTER" "$HARDENING_KEEP_SSH" \
+  "$HARDENING_REMOVE_POSTFIX" "$HARDENING_JOURNAL_DAYS" \
+  "$HARDENING_JOURNAL_MAX_MB" "$HARDENING_JOURNAL_RUNTIME_MB" \
+  "$HARDENING_UPDATE_MAX_AGE_HOURS" "$HARDENING_TCP_PORTS" \
+  "$HARDENING_UDP_PORTS" <<'LAB_HARDENING_GUEST'
+set -Eeuo pipefail
+umask 022
+export LC_ALL=C DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+PROFILE=$1 RP_FILTER=$2 KEEP_SSH=$3 REMOVE_POSTFIX=$4
+JOURNAL_DAYS=$5 JOURNAL_MAX_MB=$6 JOURNAL_RUNTIME_MB=$7 UPDATE_MAX_AGE=$8
+TCP_PORTS=$9 UDP_PORTS=${10}
+[[ $EUID == 0 && -d /run/systemd/system ]] || {
+  echo 'ERROR: A running systemd guest and root access are required.' >&2; exit 1;
+}
+command -v pveversion >/dev/null 2>&1 && {
+  echo 'ERROR: Refusing to change a Proxmox host.' >&2; exit 1;
+}
+# shellcheck disable=SC1091
+. /etc/os-release
+[[ $ID == debian && $VERSION_ID == 13 ]] || {
+  echo 'ERROR: This policy requires Debian 13.' >&2; exit 1;
+}
+container=$(systemd-detect-virt --container || true)
+[[ $container == lxc ]] || {
+  echo 'ERROR: This block requires a Debian 13 LXC container.' >&2; exit 1;
+}
+[[ $PROFILE == lxc || $PROFILE == auto ]] || {
+  echo 'ERROR: Only the lxc hardening profile is supported.' >&2; exit 1;
+}
+PROFILE=lxc
+[[ $RP_FILTER == auto ]] && RP_FILTER=1
+[[ $KEEP_SSH == auto ]] && KEEP_SSH=0
+[[ $RP_FILTER =~ ^[12]$ && $KEEP_SSH =~ ^[01]$ && $REMOVE_POSTFIX =~ ^[01]$ ]] || {
+  echo 'ERROR: Invalid hardening setting.' >&2; exit 1;
+}
+[[ $KEEP_SSH == 1 || -z ${SSH_CONNECTION:-} ]] || {
+  echo 'ERROR: Run through pct exec/console before removing SSH, or set HARDENING_KEEP_SSH=1.' >&2; exit 1;
+}
+for value in "$JOURNAL_DAYS" "$JOURNAL_MAX_MB" "$JOURNAL_RUNTIME_MB" "$UPDATE_MAX_AGE"; do
+  [[ $value =~ ^[1-9][0-9]{0,3}$ ]] || { echo 'ERROR: Numeric policy values must be 1..9999.' >&2; exit 1; }
+done
+for port in $TCP_PORTS $UDP_PORTS; do
+  if [[ ! $port =~ ^[1-9][0-9]{0,4}$ ]] || (( port > 65535 )); then
+    echo 'ERROR: Port lists require space-separated numbers from 1 to 65535.' >&2; exit 1
+  fi
+done
+for command in ufw iptables ip6tables ip ss sysctl python3 systemctl apt-get flock; do
+  command -v "$command" >/dev/null || { echo "ERROR: Missing prerequisite: $command" >&2; exit 1; }
+done
+exec 9>/run/lock/lab-hardening-install.lock
+flock -n 9 || { echo 'ERROR: Hardening is already running.' >&2; exit 1; }
+
+# Check before any changes. Existing forwarding usually means bridge/VPN/router
+# functionality; do not silently break it with a service-host policy.
+for path in /proc/sys/net/ipv4/ip_forward /proc/sys/net/{ipv4,ipv6}/conf/*/forwarding; do
+  [[ -r $path && $(cat "$path") == 0 ]] || {
+    echo "ERROR: Forwarding enabled/unavailable at $path; review the guest network role." >&2; exit 1;
+  }
+done
+ufw status | grep -qx 'Status: active'
+grep -qx 'IPV6=yes' /etc/default/ufw
+for tool in iptables ip6tables; do
+  prefix=ufw; [[ $tool != ip6tables ]] || prefix=ufw6
+  "$tool" -w 5 -S INPUT | grep -qx -- '-P INPUT DROP'
+  "$tool" -w 5 -S FORWARD | grep -qx -- '-P FORWARD DROP'
+  "$tool" -w 5 -C INPUT -j "$prefix-before-input"
+  "$tool" -w 5 -S "$prefix-user-input" >/dev/null
+done
+
+# ── Staging and backups ───────────────────────────────────────────────────────
+stage=$(mktemp -d /var/tmp/lab-hardening.XXXXXX)
+chmod 0700 "$stage"
+backup="/var/backups/lab-hardening/$(date -u +%Y%m%dT%H%M%SZ)-$$"
+install -d -m 0700 "$backup"
+hardening_exit=0
+trap 'hardening_exit=$?; rm -rf -- "$stage"; exit "$hardening_exit"' EXIT
+trap 'echo "ERROR: Hardening failed near guest line $LINENO. Guest preserved; config backups: $backup" >&2' ERR
+install -d -m 0755 /var/lib/lab-hardening
+if [[ $(systemctl show lab-hardening-check.timer -p LoadState --value) == loaded ]]; then
+  systemctl stop lab-hardening-check.timer
+  systemctl stop lab-hardening-check.service
+fi
+
+# APT package operations use locks, strict download errors, and report-only
+# needrestart. No dist-upgrade is performed late in an already running app install.
+apt-get -o DPkg::Lock::Timeout=120 -o APT::Update::Error-Mode=any update
+date +%s > "$stage/index-refreshed"
+apt-get -o DPkg::Lock::Timeout=120 install -y --no-install-recommends \
+  unattended-upgrades needrestart python3-apt ca-certificates procps
+
+mkdir -p "$stage/etc/apt/apt.conf.d" "$stage/etc/needrestart/conf.d" \
+  "$stage/etc/systemd/journald.conf.d" "$stage/etc/sysctl.d" \
+  "$stage/etc/systemd/system" "$stage/usr/local/sbin" "$stage/etc/update-motd.d"
+cat > "$stage/etc/apt/apt.conf.d/99-lab-hardening" <<'APT_POLICY'
+// Managed by lab-hardening-block.sh. Debian release stays fixed at trixie.
+#clear Unattended-Upgrade::Allowed-Origins;
+#clear Unattended-Upgrade::Origins-Pattern;
+Unattended-Upgrade::Origins-Pattern {
+  "origin=Debian,codename=trixie,label=Debian";
+  "origin=Debian,codename=trixie-updates,label=Debian";
+  "origin=Debian,codename=trixie-security,label=Debian-Security";
+};
+// Preserve deliberate package blacklists/holds; report them in the check.
+APT::Periodic::Enable "1";
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Unattended-Upgrade "1";
+APT::Periodic::AutocleanInterval "7";
+APT::Update::Error-Mode "any";
+Unattended-Upgrade::AutoFixInterruptedDpkg "true";
+Unattended-Upgrade::MinimalSteps "true";
+Unattended-Upgrade::InstallOnShutdown "false";
+Unattended-Upgrade::Remove-New-Unused-Dependencies "true";
+Unattended-Upgrade::Remove-Unused-Dependencies "false";
+Unattended-Upgrade::Remove-Unused-Kernel-Packages "false";
+Unattended-Upgrade::Automatic-Reboot "false";
+APT_POLICY
+cat > "$stage/etc/needrestart/conf.d/99-lab-hardening.conf" <<'NEEDRESTART_POLICY'
+# Report only. Package maintainer scripts may still restart their own services.
+$nrconf{restart} = 'l';
+NEEDRESTART_POLICY
+cat > "$stage/etc/systemd/journald.conf.d/99-lab-hardening.conf" <<JOURNAL_POLICY
+[Journal]
+Storage=persistent
+Compress=yes
+SystemMaxUse=${JOURNAL_MAX_MB}M
+SystemKeepFree=128M
+RuntimeMaxUse=${JOURNAL_RUNTIME_MB}M
+MaxRetentionSec=${JOURNAL_DAYS}day
+RateLimitIntervalSec=30s
+RateLimitBurst=10000
+JOURNAL_POLICY
+
+# ── Network policy ───────────────────────────────────────────────────────────
+cat > "$stage/etc/sysctl.d/99-hardening.conf" <<SYSCTL_POLICY
+# Managed by lab-hardening-block.sh: non-routing Debian 13 LXC.
+# Forwarding comes first because changing it can reset IPv4 interface settings.
+net.ipv4.ip_forward = 0
+net.ipv4.conf.all.forwarding = 0
+net.ipv4.conf.default.forwarding = 0
+net.ipv4.conf.*.forwarding = 0
+net.ipv6.conf.all.forwarding = 0
+net.ipv6.conf.default.forwarding = 0
+net.ipv6.conf.*.forwarding = 0
+net.ipv4.conf.all.rp_filter = $RP_FILTER
+net.ipv4.conf.default.rp_filter = $RP_FILTER
+net.ipv4.conf.*.rp_filter = $RP_FILTER
+net.ipv4.conf.all.accept_redirects = 0
+net.ipv4.conf.default.accept_redirects = 0
+net.ipv4.conf.*.accept_redirects = 0
+net.ipv4.conf.all.send_redirects = 0
+net.ipv4.conf.default.send_redirects = 0
+net.ipv4.conf.*.send_redirects = 0
+net.ipv4.conf.all.accept_source_route = 0
+net.ipv4.conf.default.accept_source_route = 0
+net.ipv4.conf.*.accept_source_route = 0
+net.ipv6.conf.all.accept_redirects = 0
+net.ipv6.conf.default.accept_redirects = 0
+net.ipv6.conf.*.accept_redirects = 0
+# -1 rejects all IPv6 routing headers; 0 would still accept type 2.
+net.ipv6.conf.all.accept_source_route = -1
+net.ipv6.conf.default.accept_source_route = -1
+net.ipv6.conf.*.accept_source_route = -1
+net.ipv4.tcp_syncookies = 1
+net.ipv4.icmp_echo_ignore_broadcasts = 1
+net.ipv4.icmp_ignore_bogus_error_responses = 1
+# Preserve IPv6 addressing, router advertisements, autoconf and DHCP.
+SYSCTL_POLICY
+
+# ── APT readiness wrapper ─────────────────────────────────────────────────────
+# No network-manager disabling, DHCP changes or network restarts. Re-evaluate
+# ownership on every APT run; delegate to Debian's helper unless proven safe.
+cat > "$stage/usr/local/sbin/lab-apt-wait-online" <<'APT_WAIT_HELPER'
+#!/usr/bin/python3
+import json
+import os
+import subprocess
+os.environ['LC_ALL'] = 'C'
+os.environ['PATH'] = '/usr/sbin:/usr/bin:/sbin:/bin'
+
+def capture(args):
+    return subprocess.run(args, text=True, capture_output=True, timeout=15, check=True).stdout
+
+try:
+    if capture(['systemd-detect-virt', '--container']).strip() == 'lxc':
+        capture(['systemctl', 'is-active', 'networking.service'])
+        rows = [line.split() for line in capture(
+            ['networkctl', 'list', '--no-legend', '--no-pager']).splitlines() if line.strip()]
+        # An unfamiliar output shape cannot authorize bypassing the stock check.
+        if rows and all(len(row) == 5 and row[4] == 'unmanaged' for row in rows):
+            configured = set(capture(['ifquery', '--list']).split())
+            addresses = json.loads(capture(['ip', '-j', '-4', 'address', 'show']))
+            routes = json.loads(capture(['ip', '-j', '-4', 'route', 'show', 'default']))
+            for link in addresses:
+                name = link['ifname']
+                if (name in configured and 'UP' in link.get('flags', [])
+                        and any(a.get('scope') == 'global' for a in link.get('addr_info', []))
+                        and any(r.get('dev') == name for r in routes)):
+                    capture(['ifquery', '--state', name])
+                    raise SystemExit(0)
+except (OSError, subprocess.SubprocessError, ValueError, KeyError):
+    pass
+os.execv('/usr/lib/apt/apt-helper', ['apt-helper', 'wait-online'])
+APT_WAIT_HELPER
+# Only replace Debian's single stock pre-check, or our own earlier wrapper.
+# Preserve unknown/custom ExecStartPre sequences by refusing to replace them.
+for unit in apt-daily.service apt-daily-upgrade.service; do
+  systemctl show "$unit" -p ExecStartPre --value > "$stage/precheck"
+  python3 - "$stage/precheck" <<'APT_PRECHECK'
+import pathlib, re, sys
+text = pathlib.Path(sys.argv[1]).read_text()
+paths = re.findall(r'path=([^ ;]+)', text)
+if paths not in (['/usr/lib/apt/apt-helper'], ['/usr/local/sbin/lab-apt-wait-online']):
+    raise SystemExit('ERROR: Custom APT ExecStartPre detected; preserve it and review integration.')
+if paths == ['/usr/lib/apt/apt-helper'] and not re.search(r'argv\[\]=/usr/lib/apt/apt-helper wait-online\s*;', text):
+    raise SystemExit('ERROR: Unexpected apt-helper pre-check arguments.')
+APT_PRECHECK
+  mkdir -p "$stage/etc/systemd/system/$unit.d"
+  cat > "$stage/etc/systemd/system/$unit.d/90-lab-readiness.conf" <<'APT_DROPIN'
+[Service]
+ExecStartPre=
+ExecStartPre=-/usr/local/sbin/lab-apt-wait-online
+APT_DROPIN
+done
+
+# ── Reusable verification/report helper ────────────────────────────────────────
+# This helper reads policy/runtime state. Its only writes are its lock and report.
+# It never changes firewall rules, installs updates or restarts applications.
+cat > "$stage/usr/local/sbin/lab-hardening-check" <<'CHECK_HELPER'
+#!/usr/bin/python3
+import fcntl
+import glob
+import hashlib
+import ipaddress
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+import time
+
+os.environ['LC_ALL'] = 'C'
+os.environ['PATH'] = '/usr/sbin:/usr/bin:/sbin:/bin'
+
+STATE = Path('/var/lib/lab-hardening')
+errors, warnings, listeners = [], [], []
+
+def run(args, timeout=30):
+    try:
+        p = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+        return p.returncode, p.stdout.strip()
+    except (OSError, subprocess.SubprocessError) as exc:
+        errors.append(f'Cannot run {args[0]}: {exc}')
+        return 127, ''
+
+def require(condition, message):
+    if not condition:
+        errors.append(message)
+
+def read(path):
+    try:
+        return Path(path).read_text()
+    except OSError as exc:
+        errors.append(f'Cannot read {path}: {exc}')
+        return ''
+
+if os.geteuid() != 0:
+    raise SystemExit('Run lab-hardening-check as root.')
+lock = open(STATE / 'check.lock', 'a')
+try:
+    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except BlockingIOError:
+    raise SystemExit('A hardening check is already running.')
+try:
+    policy = json.loads(read(STATE / 'policy.json'))
+    for path, digest in policy['files'].items():
+        try:
+            require(hashlib.sha256(Path(path).read_bytes()).hexdigest() == digest,
+                    f'Managed file changed: {path}; review and rerun the hardening block.')
+        except OSError:
+            errors.append(f'Managed file missing: {path}')
+
+    # Runtime readback, including dotted interface names through procfs globbing.
+    for line in read('/etc/sysctl.d/99-hardening.conf').splitlines():
+        line = line.split('#', 1)[0].strip()
+        if not line:
+            continue
+        key, expected = (part.strip() for part in line.split('=', 1))
+        paths = glob.glob('/proc/sys/' + key.replace('.', '/'))
+        require(bool(paths), f'Required sysctl unavailable: {key}')
+        for path in paths:
+            require(read(path).strip() == expected, f'Sysctl mismatch: {path}, expected {expected}')
+
+    rc, status = run(['ufw', 'status'])
+    require(rc == 0 and 'Status: active' in status.splitlines(), 'UFW is inactive.')
+    ufw_defaults = read('/etc/default/ufw')
+    require(re.search(r'^IPV6=yes$', ufw_defaults, re.M), 'UFW IPv6 support disabled.')
+    require(re.search(r'^IPT_SYSCTL=$', ufw_defaults, re.M), 'UFW sysctl loading is enabled.')
+    for tool, prefix in [('iptables', 'ufw'), ('ip6tables', 'ufw6')]:
+        for chain in ['INPUT', 'FORWARD']:
+            rc, rules = run([tool, '-w', '5', '-S', chain])
+            require(rc == 0 and f'-P {chain} DROP' in rules.splitlines(), f'{tool} {chain} is not DROP.')
+        rc, _ = run([tool, '-w', '5', '-C', 'INPUT', '-j', prefix + '-before-input'])
+        require(rc == 0, f'{tool} UFW INPUT hook is missing.')
+        rc, _ = run([tool, '-w', '5', '-S', prefix + '-user-input'])
+        require(rc == 0, f'{tool} UFW user chain is missing.')
+
+    # APT lists are compared as sets: vendor/local duplication cannot widen policy.
+    import apt_pkg
+    apt_pkg.init()
+    cfg = apt_pkg.config
+    origins = {
+        'origin=Debian,codename=trixie,label=Debian',
+        'origin=Debian,codename=trixie-updates,label=Debian',
+        'origin=Debian,codename=trixie-security,label=Debian-Security',
+    }
+    require(set(cfg.value_list('Unattended-Upgrade::Origins-Pattern')) == origins,
+            'Effective unattended-upgrade origins differ from policy.')
+    require(not cfg.value_list('Unattended-Upgrade::Allowed-Origins'), 'Additional legacy Allowed-Origins exist.')
+    for key, expected in {
+        'APT::Periodic::Enable': '1', 'APT::Periodic::Update-Package-Lists': '1',
+        'APT::Periodic::Unattended-Upgrade': '1', 'APT::Periodic::AutocleanInterval': '7',
+        'APT::Update::Error-Mode': 'any',
+        'Unattended-Upgrade::Automatic-Reboot': 'false',
+        'Unattended-Upgrade::InstallOnShutdown': 'false',
+        'Unattended-Upgrade::Remove-New-Unused-Dependencies': 'true',
+        'Unattended-Upgrade::Remove-Unused-Dependencies': 'false',
+        'Unattended-Upgrade::Remove-Unused-Kernel-Packages': 'false',
+    }.items():
+        require(cfg.find(key) == expected, f'APT policy conflict: {key}')
+    if cfg.value_list('Unattended-Upgrade::Package-Blacklist'):
+        warnings.append('An unattended-upgrades blacklist is active; review excluded packages.')
+    if cfg.value_list('Unattended-Upgrade::Package-Whitelist'):
+        warnings.append('An unattended-upgrades whitelist is active; review update coverage.')
+    rc, holds = run(['apt-mark', 'showhold'])
+    require(rc == 0, 'Cannot inspect held packages.')
+    if holds:
+        warnings.append('Held packages: ' + ', '.join(holds.splitlines()))
+    for unit in ['ufw.service', 'unattended-upgrades.service', 'apt-daily.timer',
+                 'apt-daily-upgrade.timer', 'lab-hardening-check.timer']:
+        require(run(['systemctl', 'is-enabled', '--quiet', unit])[0] == 0, f'{unit} is not enabled.')
+        require(run(['systemctl', 'is-active', '--quiet', unit])[0] == 0, f'{unit} is not active.')
+    for unit in ['apt-daily.service', 'apt-daily-upgrade.service']:
+        rc, result = run(['systemctl', 'show', unit, '-p', 'Result', '--value'])
+        require(rc == 0 and result == 'success', f'{unit} last result: {result or "unknown"}')
+    now = time.time()
+    stamps = [Path('/var/lib/apt/periodic/update-stamp'), STATE / 'last-index-refresh']
+    last_refresh = max((p.stat().st_mtime for p in stamps if p.exists()), default=0)
+    require(now - last_refresh <= policy['update_max_age_hours'] * 3600,
+            'APT indexes have no recent recorded refresh; inspect apt-daily.service.')
+
+    # Verify the merged journald settings; commented defaults are not assignments.
+    rc, journal = run(['systemd-analyze', 'cat-config', 'systemd/journald.conf'])
+    require(rc == 0, 'Cannot inspect journald policy.')
+    effective = {}
+    section = ''
+    for line in journal.splitlines():
+        line = line.strip()
+        if line.startswith('['):
+            section = line
+        elif section == '[Journal]' and '=' in line and not line.startswith(('#', ';')):
+            k, v = line.split('=', 1)
+            effective[k.strip()] = v.strip()
+    for key, expected in policy['journal'].items():
+        require(effective.get(key) == expected, f'Journald policy conflict: {key}')
+    require(run(['systemctl', 'is-active', '--quiet', 'systemd-journald.service'])[0] == 0,
+            'Journald is not active.')
+    require(bool(glob.glob('/var/log/journal/*/*.journal')), 'Persistent journal files are missing.')
+
+    removed = []
+    if not policy['keep_ssh']:
+        removed.append('openssh-server')
+    if policy['remove_postfix']:
+        removed.append('postfix')
+    for package in removed:
+        _, status = run(['dpkg-query', '-W', '-f=${db:Status-Status}', package])
+        require(status != 'installed', f'Unwanted package installed: {package}')
+    if not policy['keep_ssh']:
+        for unit in ['ssh.service', 'ssh.socket']:
+            require(run(['systemctl', 'is-enabled', unit])[1] == 'masked', f'{unit} is not masked.')
+            require(run(['systemctl', 'is-active', '--quiet', unit])[0] != 0, f'{unit} is active.')
+
+    # Inventory excludes loopback; optional port lists verify external listeners.
+    rc, sockets = run(['ss', '-H', '-lntu'])
+    require(rc == 0, 'Cannot inspect listening sockets.')
+    for line in sockets.splitlines():
+        fields = line.split()
+        if len(fields) < 5:
+            errors.append('Unrecognized ss output.')
+            continue
+        proto, endpoint = fields[0], fields[4]
+        addr, port = endpoint.rsplit(':', 1)
+        addr = addr.strip('[]').split('%', 1)[0]
+        try:
+            if ipaddress.ip_address(addr).is_loopback:
+                continue
+        except ValueError:
+            if addr != '*':
+                errors.append(f'Unrecognized socket address: {addr}')
+        listeners.append(f'{proto} {endpoint}')
+        allowed = policy.get(proto + '_ports', [])
+        if allowed:
+            require(int(port) in allowed, f'Unexpected external listener: {proto} {endpoint}')
+    # needrestart's explicit batch/list mode cannot restart applications.
+    rc, restart = run(['needrestart', '-b', '-r', 'l', '-l'], timeout=90)
+    require(rc == 0, 'needrestart report failed.')
+    requests = [line for line in restart.splitlines()
+                if line.startswith(('NEEDRESTART-SVC:', 'NEEDRESTART-CONT:', 'NEEDRESTART-SESS:'))]
+    if requests:
+        warnings.append('Processes need a reviewed restart: ' + '; '.join(requests))
+except Exception as exc:
+    errors.append(f'Check could not complete: {type(exc).__name__}: {exc}')
+
+status = 'FAIL' if errors else ('WARN' if warnings else 'OK')
+report = {'status': status, 'checked_at': int(time.time()), 'errors': errors,
+          'warnings': warnings, 'external_listeners': listeners}
+temporary = STATE / ('status.' + str(os.getpid()) + '.tmp')
+temporary.write_text(json.dumps(report, indent=2) + '\n')
+temporary.chmod(0o644)
+os.replace(temporary, STATE / 'status.json')
+print('Lab hardening: ' + status)
+for entry in errors:
+    print('ERROR: ' + entry)
+for entry in warnings:
+    print('WARNING: ' + entry)
+print('External listeners: ' + (', '.join(listeners) or 'none'))
+raise SystemExit(1 if errors else 0)
+CHECK_HELPER
+
+cat > "$stage/etc/systemd/system/lab-hardening-check.service" <<'CHECK_SERVICE'
+[Unit]
+Description=Verify lab hardening and report update/restart status
+After=network.target systemd-journal-flush.service
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/lab-hardening-check
+Nice=10
+TimeoutStartSec=240
+StandardOutput=journal
+StandardError=journal
+CHECK_SERVICE
+cat > "$stage/etc/systemd/system/lab-hardening-check.timer" <<'CHECK_TIMER'
+[Unit]
+Description=Check lab hardening after boot and hourly
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=1h
+RandomizedDelaySec=60
+Unit=lab-hardening-check.service
+[Install]
+WantedBy=timers.target
+CHECK_TIMER
+cat > "$stage/etc/update-motd.d/25-lab-hardening" <<'MOTD_HELPER'
+#!/usr/bin/python3
+import json
+from pathlib import Path
+import time
+try:
+    p = json.loads(Path('/var/lib/lab-hardening/status.json').read_text())
+    stale = time.time() - p['checked_at'] > 3 * 3600
+    print('  Hardening: ' + ('STALE' if stale else p['status'])
+          + ' | root check: /usr/local/sbin/lab-hardening-check')
+except (OSError, ValueError, KeyError):
+    print('  Hardening: not yet verified | root check: /usr/local/sbin/lab-hardening-check')
+MOTD_HELPER
+
+# ── Install managed files atomically, preserving previous configuration ────────
+python3 - "$stage" "$backup" <<'INSTALL_FILES'
+import os, pathlib, shutil, sys, tempfile
+stage, backup = map(pathlib.Path, sys.argv[1:])
+for source in sorted(stage.rglob('*')):
+    if not source.is_file() or source.parent == stage:
+        continue
+    relative = source.relative_to(stage)
+    target = pathlib.Path('/') / relative
+    if target.is_symlink():
+        raise SystemExit(f'ERROR: Refusing to overwrite symlink: {target}')
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if target.exists():
+        saved = backup / relative
+        saved.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(target, saved)
+    fd, temporary = tempfile.mkstemp(prefix='.lab-hardening-', dir=target.parent)
+    try:
+        with os.fdopen(fd, 'wb') as out:
+            out.write(source.read_bytes())
+        mode = 0o755 if str(relative).startswith(('usr/local/sbin/', 'etc/update-motd.d/')) else 0o644
+        os.chmod(temporary, mode)
+        os.replace(temporary, target)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+# Preserve all UFW policy/rules; only stop its competing sysctl loader.
+target = pathlib.Path('/etc/default/ufw')
+saved = backup / 'etc/default/ufw'
+saved.parent.mkdir(parents=True, exist_ok=True)
+shutil.copy2(target, saved)
+import re
+text, count = re.subn(r'^IPT_SYSCTL=.*$', 'IPT_SYSCTL=', target.read_text(), flags=re.M)
+if count != 1:
+    raise SystemExit('ERROR: Expected one IPT_SYSCTL assignment in /etc/default/ufw.')
+fd, temporary = tempfile.mkstemp(prefix='.lab-ufw-', dir=target.parent)
+with os.fdopen(fd, 'w') as out:
+    out.write(text)
+os.chmod(temporary, target.stat().st_mode & 0o777)
+os.replace(temporary, target)
+INSTALL_FILES
+install -m 0644 "$stage/index-refreshed" /var/lib/lab-hardening/last-index-refresh
+
+# ── Remove and verify unwanted services ───────────────────────────────────────
+remove_packages=()
+if [[ $KEEP_SSH == 0 ]]; then
+  for unit in ssh.service ssh.socket; do
+    if [[ $(systemctl show "$unit" -p LoadState --value) != not-found ]]; then
+      systemctl stop "$unit"
+    fi
+  done
+  remove_packages+=(openssh-server)
+fi
+[[ $REMOVE_POSTFIX == 0 ]] || remove_packages+=(postfix)
+installed_remove=()
+for package in "${remove_packages[@]}"; do
+  if [[ $(dpkg-query -W -f='${db:Status-Status}' "$package" 2>/dev/null || true) == installed ]]; then
+    installed_remove+=("$package")
+  fi
+done
+if (( ${#installed_remove[@]} > 0 )); then
+  # No blanket autoremove: apps outside dpkg may use packages marked automatic.
+  apt-get -o DPkg::Lock::Timeout=120 purge -y "${installed_remove[@]}"
+fi
+if [[ $KEEP_SSH == 0 ]]; then
+  systemctl mask ssh.service ssh.socket
+fi
+
+# ── Activate common policy ────────────────────────────────────────────────────
+systemctl daemon-reload
+install -d -o root -g systemd-journal -m 2755 /var/log/journal
+systemctl restart systemd-journald.service
+journalctl --flush
+/usr/lib/systemd/systemd-sysctl --strict --prefix=/net/ipv4 --prefix=/net/ipv6
+systemctl enable --now unattended-upgrades.service apt-daily.timer apt-daily-upgrade.timer
+echo 'Checking unattended upgrades without installing updates...'
+if ! timeout 300 unattended-upgrade --dry-run --debug > "$backup/unattended-dry-run.log" 2>&1; then
+  tail -n 40 "$backup/unattended-dry-run.log" >&2
+  false
+fi
+
+# Store expected settings and file hashes for drift detection. No secrets.
+python3 - "$stage" "$PROFILE" "$KEEP_SSH" "$REMOVE_POSTFIX" "$JOURNAL_DAYS" \
+  "$JOURNAL_MAX_MB" "$JOURNAL_RUNTIME_MB" "$UPDATE_MAX_AGE" "$TCP_PORTS" "$UDP_PORTS" <<'SAVE_POLICY'
+import hashlib, json, os, pathlib, sys
+stage = pathlib.Path(sys.argv[1])
+_, _, profile, keep, remove, days, maximum, runtime, age, tcp, udp = sys.argv
+files = {}
+for source in stage.rglob('*'):
+    if source.is_file() and source.parent != stage:
+        target = pathlib.Path('/') / source.relative_to(stage)
+        files[str(target)] = hashlib.sha256(target.read_bytes()).hexdigest()
+policy = {'profile': profile, 'keep_ssh': keep == '1', 'remove_postfix': remove == '1',
+          'update_max_age_hours': int(age), 'tcp_ports': list(map(int, tcp.split())),
+          'udp_ports': list(map(int, udp.split())), 'files': files,
+          'journal': {'Storage': 'persistent', 'Compress': 'yes', 'SystemMaxUse': maximum + 'M',
+                      'SystemKeepFree': '128M', 'RuntimeMaxUse': runtime + 'M',
+                      'MaxRetentionSec': days + 'day', 'RateLimitIntervalSec': '30s', 'RateLimitBurst': '10000'}}
+target = pathlib.Path('/var/lib/lab-hardening/policy.json')
+temporary = target.with_suffix('.tmp')
+temporary.write_text(json.dumps(policy, indent=2) + '\n')
+temporary.chmod(0o644)
+os.replace(temporary, target)
+SAVE_POLICY
+systemctl enable --now lab-hardening-check.timer
+if ! systemctl start lab-hardening-check.service; then
+  journalctl -u lab-hardening-check.service -n 50 --no-pager >&2
+  false
+fi
+cat /var/lib/lab-hardening/status.json
+printf '\nShared hardening applied (%s). Backups: %s\n' "$PROFILE" "$backup"
+echo 'Manual check: /usr/local/sbin/lab-hardening-check'
+echo 'Local reports: /var/lib/lab-hardening/status.json and journalctl -u lab-hardening-check'
+echo 'Application image updates, source-specific UFW rules and app health remain with the creator.'
+LAB_HARDENING_GUEST
+)
+# ── End shared hardening block ────────────────────────────────────────────────
+# END VERBATIM lab-hardening-block.sh v1.1
+
+# ── Final verification ────────────────────────────────────────────────────────
+# WARN (reviewed restart needed) is successful; FAIL stops the creator via ERR.
+pct exec "$CT_ID" -- /usr/local/sbin/lab-hardening-check
+pct exec "$CT_ID" -- /usr/local/bin/docmost-maint.sh check --initial
+UFW_RULES_AFTER="$(pct exec "$CT_ID" -- sha256sum /etc/ufw/user.rules /etc/ufw/user6.rules)"
+[[ $UFW_RULES_AFTER == "$UFW_RULES_BEFORE" ]] || {
+  echo "ERROR: UFW user rules changed during hardening; CT $CT_ID is preserved." >&2
+  false
+}
+pct exec "$CT_ID" -- bash -s -- "$APP_PORT" "${UFW_ALLOWED_SOURCES[@]}" <<'UFW_FINAL_VERIFY'
+set -euo pipefail
+export LC_ALL=C
+port=$1; shift
+/usr/local/sbin/docmost-ufw-check
+for source in "$@"; do
+  tool=iptables; prefix=ufw
+  if [[ $source == *:* ]]; then tool=ip6tables; prefix=ufw6; fi
+  "$tool" -w 5 -C "$prefix-user-input" -s "$source" -p tcp -m tcp --dport "$port" -j ACCEPT
+done
+printf '  UFW user rule files unchanged; selected TCP source allows verified.\n'
+UFW_FINAL_VERIFY
+
 VERIFY_FAIL=0
 
 for svc in "$POSTGRES_QUADLET_SERVICE" "$REDIS_QUADLET_SERVICE" "$QUADLET_SERVICE"; do
@@ -1471,177 +2316,8 @@ if (( VERIFY_FAIL == 1 )); then
   echo "" >&2
   echo "  FATAL: Core verification failed — CT $CT_ID is preserved but the install is incomplete." >&2
   echo "  Inspect the named check above; preserve the CT and its data while resolving the failure." >&2
-  exit 1
+  false
 fi
-
-# ── Auto-update timer (policy-driven) ─────────────────────────────────────────
-pct exec "$CT_ID" -- bash -s -- "$UPDATE_TIME" <<'TIMER_INSTALL'
-set -euo pipefail
-cat > /etc/systemd/system/docmost-update.service <<EOF2
-[Unit]
-Description=docmost image maintenance
-After=network-online.target
-Wants=network-online.target
-[Service]
-Type=oneshot
-ExecStart=/usr/local/bin/docmost-maint.sh auto-update
-TimeoutStartSec=infinity
-TimeoutStopSec=180
-EOF2
-cat > /etc/systemd/system/docmost-update.timer <<EOF2
-[Unit]
-Description=docmost daily image maintenance
-[Timer]
-OnCalendar=*-*-* $1:00
-Persistent=true
-[Install]
-WantedBy=timers.target
-EOF2
-systemctl daemon-reload
-TIMER_INSTALL
-if [[ $AUTO_UPDATE == 1 ]]; then
-  pct exec "$CT_ID" -- systemctl enable --now docmost-update.timer
-else
-  pct exec "$CT_ID" -- systemctl disable --now docmost-update.timer
-fi
-
-# ── Unattended upgrades ───────────────────────────────────────────────────────
-pct exec "$CT_ID" -- bash -lc '
-  set -euo pipefail
-  export DEBIAN_FRONTEND=noninteractive
-  apt-get update -qq
-  apt-get install -y unattended-upgrades
-  distro_codename="$(. /etc/os-release && echo "$VERSION_CODENAME")"
-  cat > /etc/apt/apt.conf.d/52unattended-$(hostname).conf <<EOF2
-Unattended-Upgrade::Origins-Pattern {
-        "origin=Debian,codename=${distro_codename},label=Debian-Security";
-        "origin=Debian,codename=${distro_codename}-security";
-        "origin=Debian,codename=${distro_codename},label=Debian";
-        "origin=Debian,codename=${distro_codename}-updates,label=Debian";
-};
-Unattended-Upgrade::Package-Blacklist {};
-Unattended-Upgrade::AutoFixInterruptedDpkg "true";
-Unattended-Upgrade::MinimalSteps "true";
-Unattended-Upgrade::InstallOnShutdown "false";
-Unattended-Upgrade::Remove-New-Unused-Dependencies "true";
-Unattended-Upgrade::Remove-Unused-Dependencies "true";
-Unattended-Upgrade::Automatic-Reboot "false";
-EOF2
-
-  cat > /etc/apt/apt.conf.d/20auto-upgrades <<EOF2
-APT::Periodic::Update-Package-Lists "1";
-APT::Periodic::Unattended-Upgrade "1";
-APT::Periodic::AutocleanInterval "7";
-EOF2
-
-  systemctl enable --now unattended-upgrades
-'
-
-# ── Extra packages ────────────────────────────────────────────────────────────
-if [[ "${#EXTRA_PACKAGES[@]}" -gt 0 ]]; then
-  pct exec "$CT_ID" -- bash -lc "
-    set -euo pipefail
-    export DEBIAN_FRONTEND=noninteractive
-    apt-get install -y ${EXTRA_PACKAGES[*]}
-  "
-fi
-
-# ── Sysctl hardening ──────────────────────────────────────────────────────────
-pct exec "$CT_ID" -- bash -lc '
-  set -euo pipefail
-  cat > /etc/sysctl.d/99-hardening.conf <<EOF2
-net.ipv4.conf.all.rp_filter = 1
-net.ipv4.conf.default.rp_filter = 1
-net.ipv4.conf.all.accept_redirects = 0
-net.ipv4.conf.default.accept_redirects = 0
-net.ipv4.conf.all.send_redirects = 0
-net.ipv4.conf.default.send_redirects = 0
-net.ipv4.conf.all.accept_source_route = 0
-net.ipv4.conf.default.accept_source_route = 0
-net.ipv4.icmp_echo_ignore_broadcasts = 1
-net.ipv4.icmp_ignore_bogus_error_responses = 1
-EOF2
-  if ! sysctl --system >/dev/null 2>&1; then
-    echo "  WARNING: sysctl --system reported errors — some keys may be read-only in this unprivileged CT:" >&2
-    sysctl --system 2>&1 | grep -i "error\|permission" >&2 || true
-  fi
-'
-
-# ── Cleanup packages ──────────────────────────────────────────────────────────
-pct exec "$CT_ID" -- bash -lc '
-  set -euo pipefail
-  export DEBIAN_FRONTEND=noninteractive
-  apt-get purge -y man-db manpages 2>/dev/null || true
-  apt-get -y autoremove
-  apt-get -y clean
-'
-
-# ── MOTD (dynamic drop-ins) ───────────────────────────────────────────────────
-pct exec "$CT_ID" -- bash -lc "
-  set -euo pipefail
-  > /etc/motd
-  chmod -x /etc/update-motd.d/* 2>/dev/null || true
-  rm -f /etc/update-motd.d/*
-
-  cat > /etc/update-motd.d/00-header <<'MOTD'
-#!/bin/sh
-printf '\\n  Docmost (Podman/Quadlet)\\n'
-printf '  ────────────────────────────────────\\n'
-MOTD
-
-  cat > /etc/update-motd.d/10-sysinfo <<'MOTD'
-#!/bin/sh
-ip=\$(ip -4 -o addr show scope global 2>/dev/null | awk '{print \$4}' | cut -d/ -f1 | head -n1)
-printf '  Hostname:  %s\\n' \"\$(hostname)\"
-printf '  IP:        %s\\n' \"\${ip:-n/a}\"
-printf '  Uptime:    %s\\n' \"\$(uptime -p 2>/dev/null || uptime)\"
-printf '  Disk:      %s\\n' \"\$(df -h / | awk 'NR==2{printf \"%s/%s (%s used)\", \$3, \$2, \$5}')\"
-MOTD
-
-  cat > /etc/update-motd.d/30-app <<'MOTD'
-#!/bin/sh
-running=\$(podman ps --filter name=^docmost$ --filter name=^docmost-postgres$ --filter name=^docmost-redis$ --format '{{.Names}}' 2>/dev/null | wc -l)
-svc_status=\$(systemctl is-active docmost.service 2>/dev/null); svc_status=\${svc_status:-unknown}
-pg_status=\$(systemctl is-active docmost-postgres.service 2>/dev/null); pg_status=\${pg_status:-unknown}
-rd_status=\$(systemctl is-active docmost-redis.service 2>/dev/null); rd_status=\${rd_status:-unknown}
-ip=\$(ip -4 -o addr show scope global 2>/dev/null | awk '{print \$4}' | cut -d/ -f1 | head -n1)
-image=\$(awk -F= '/^APP_IMAGE=/{print \$2}' /opt/docmost/.env 2>/dev/null | tail -n1)
-pg_image=\$(awk -F= '/^POSTGRES_IMAGE=/{print \$2}' /opt/docmost/.env 2>/dev/null | tail -n1)
-rd_image=\$(awk -F= '/^REDIS_IMAGE=/{print \$2}' /opt/docmost/.env 2>/dev/null | tail -n1)
-auto=\$(awk -F= '/^AUTO_UPDATE=/{print \$2}' /opt/docmost/.env 2>/dev/null | tail -n1)
-fqdn=\$(awk -F= '/^APP_FQDN=/{print \$2}' /opt/docmost/.env 2>/dev/null | tail -n1)
-port=\$(awk -F= '/^APP_PORT=/{print \$2}' /opt/docmost/.env 2>/dev/null | tail -n1)
-port=\${port:-3000}
-printf '  Containers: docmost + docmost-postgres + docmost-redis (%s running)\\n' \"\$running\"
-printf '  Services:   docmost (%s) | postgres (%s) | redis (%s)\\n' \"\$svc_status\" \"\$pg_status\" \"\$rd_status\"
-printf '  Image:      %s\\n' \"\${image:-n/a}\"
-printf '  PostgreSQL: %s (127.0.0.1:5432)\\n' \"\${pg_image:-n/a}\"
-printf '  Redis:      %s (127.0.0.1:6379)\\n' \"\${rd_image:-n/a}\"
-printf '  Policy:     %s\\n' \"\$([ \"\$auto\" = '1' ] && echo 'auto-update daily (re-pull current tags)' || echo 'manual updates only')\"
-printf '  Data:       /opt/docmost/storage  postgresdata  redis\\n'
-printf '  Secrets:    /opt/docmost/docmost.env  postgres.env\\n'
-printf '  Logs:       journalctl -u docmost.service -f\\n'
-printf '  Maintain:   /usr/local/bin/docmost-maint.sh [update|update-postgres|update-redis|auto-update|version]\\n'
-printf '  Updates:    systemctl status docmost-update.timer\\n'
-if [ -n \"\$fqdn\" ]; then
-  printf '  Web UI:     https://%s/\\n' \"\$fqdn\"
-fi
-printf '  Web UI:     http://%s:%s/\\n' \"\${ip:-n/a}\" \"\$port\"
-MOTD
-
-  cat > /etc/update-motd.d/99-footer <<'MOTD'
-#!/bin/sh
-printf '  ────────────────────────────────────\\n\\n'
-MOTD
-
-  chmod +x /etc/update-motd.d/*
-"
-
-pct exec "$CT_ID" -- bash -lc '
-  set -euo pipefail
-  touch /root/.bashrc
-  grep -q "^export TERM=" /root/.bashrc 2>/dev/null || echo "export TERM=xterm-256color" >> /root/.bashrc
-'
 
 # ── Proxmox UI description ────────────────────────────────────────────────────
 DM_DESC_LINK="http://${CT_IP}:${APP_PORT}/"
@@ -1666,7 +2342,9 @@ cat <<OPERATIONS
   WEB/ADMIN     http://$CT_IP:$APP_PORT/
   ALLOWED FROM  $FIREWALL_ACCESS_LABEL
   FIREWALL      UFW inside the CT, IPv4 and IPv6; no PVE firewall dependency
-  AUTO-UPDATE   $AUTO_UPDATE | daily $UPDATE_TIME ($APP_TZ)
+  IMAGE UPDATES $AUTO_UPDATE | daily $UPDATE_TIME ($APP_TZ)
+  OS UPDATES    Debian automatic updates; no automatic reboot; needrestart reports only
+  HARDENING     v1.1 | boot/hourly drift checks; see status.json for OK/WARN
   IMAGES        exact local IDs, Pull=never; old images retained for review
 
   RUN ON THE PROXMOX HOST
@@ -1675,6 +2353,8 @@ cat <<OPERATIONS
 
   RUN INSIDE THE CT
     /usr/local/bin/docmost-maint.sh check
+    /usr/local/sbin/lab-hardening-check
+    cat /var/lib/lab-hardening/status.json
     /usr/local/bin/docmost-maint.sh update $APP_TAG
     ufw status verbose
     journalctl -u docmost.service --no-pager -n 80
@@ -1727,6 +2407,8 @@ if [[ -z "$APP_FQDN" ]]; then
 fi
 echo "    Port ${APP_PORT} listens on all CT interfaces (Network=host) — access follows the UFW source choice shown above."
 echo "    Health probe: curl -s http://${CT_IP}:${APP_PORT}/api/health"
+echo "    Hardening: pct exec $CT_ID -- /usr/local/sbin/lab-hardening-check (WARN requires review, not an automatic restart)"
+echo "    Reports: /var/lib/lab-hardening/status.json | journalctl -u lab-hardening-check.service"
 echo "    Mail is not configured (MAIL_DRIVER defaults to log): invites/password resets are printed to the journal."
 echo "    Add MAIL_* variables to ${APP_ENV_FILE} and restart docmost.service to enable SMTP/Postmark."
 echo "    Health checks: podman ps shows (healthy) for postgres/redis; systemd waits for that before starting Docmost."
