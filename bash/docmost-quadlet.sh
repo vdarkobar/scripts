@@ -66,6 +66,7 @@ EXTRA_PACKAGES=(
 # Behavior
 CLEANUP_ON_FAIL=1
 
+
 # Service verification and in-CT firewall
 INITIAL_WAIT_SECONDS=180
 UPDATE_WAIT_SECONDS=1800             # permit migrations; a timeout does not stop the app
