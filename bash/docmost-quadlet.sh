@@ -21,7 +21,7 @@ APP_PORT=3000                        # Docmost binds this port on the CT interfa
 APP_TZ="Europe/Berlin"
 APP_FQDN=""                          # e.g. docmost.example.com ; blank = local IP mode
                                      # set → APP_URL=https://FQDN (must match what users type — email links, redirects)
-FILE_UPLOAD_SIZE_LIMIT="50mb"        # upstream default; raise client_max_body_size in NPM to match
+FILE_UPLOAD_SIZE_LIMIT="80mb"        # upstream default; raise client_max_body_size in NPM to match
 DOCMOST_DISABLE_TELEMETRY=0          # 1 = DISABLE_TELEMETRY=true (upstream collects anonymous usage counts)
 TAGS="docmost;podman;quadlet;lxc"
 
@@ -65,7 +65,6 @@ EXTRA_PACKAGES=(
 
 # Behavior
 CLEANUP_ON_FAIL=1
-
 
 # Service verification and in-CT firewall
 INITIAL_WAIT_SECONDS=180
