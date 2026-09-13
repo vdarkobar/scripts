@@ -3,7 +3,9 @@ set -Eeo pipefail
 
 # Fresh-install creator; run on the Proxmox host. Edit the top Config block.
 # Lab baseline: Tier 1 pinned Quadlet images, host networking, PBS/PVE recovery.
-# Revision: 2026-09-07 — UFW inside the CT; no PVE Datacenter firewall dependency.
+# Revision: 2026-09-13 — embedded approved hardening v1.1.1; final verification.
+# PostgreSQL verification fix: validate PGDATA owner UID and mode 0700; its group may be root.
+# Standalone creator: no separate hardening file/download is required.
 # Input fix: NPM subnet entries produce a host-address hint without a traceback.
 # Resolver permissions fix: provisioning uses 022; credential writes retain 077.
 # UFW check fix: use ufw6-* chain names for IPv6 setup and startup verification.
@@ -36,11 +38,12 @@ MAX_UPLOAD_SIZE="90M"                # headroom below a 100 MB upstream request 
 TAGS="matrix;podman;quadlet;lxc"
 
 # Source addresses seen by this CT. Use the NPM CT's address, not Cloudflare's.
-# NPM addresses only: bare IPs, IPv4 /32 or IPv6 /128. Whole subnets are rejected.
+# Selected NPM/client host addresses: bare IPs, IPv4 /32 or IPv6 /128. Whole subnets are rejected.
 # Use the NPM host IP without its LAN subnet mask (e.g. /24 is not a host rule).
 # Empty arrays prompt after confirmation, before pct create.
-# UFW inside the CT permits these NPM sources on the two HTTP ports.
-# Manage Matrix through pct enter/exec and loopback; no management LAN exception.
+# Enter at BOTH prompts allows any source on these two ports; UFW stays enabled.
+# UFW permits the chosen hosts, or any source when both arrays remain empty.
+# Manage Matrix through pct enter/exec and loopback; public HTTPS is for clients.
 # Example: BACKEND_ALLOWED_IPV4=("192.168.1.20/32")
 BACKEND_ALLOWED_IPV4=()
 BACKEND_ALLOWED_IPV6=()
@@ -89,6 +92,21 @@ CLEANUP_ON_FAIL=1                     # until first service start; CT preserved 
 SCRIPT_URL="https://raw.githubusercontent.com/vdarkobar/scripts/main/bash/matrix-quadlet.sh"
 SCRIPT_LOCAL="/root/matrix-quadlet.sh"
 
+# Shared hardening: final port lists inventory/reject external listeners only;
+# they do not create UFW rules or prove health. Empty = inventory-only.
+HARDENING_PROFILE="lxc"              # Debian 13 service LXC; no VPS/VM profile
+HARDENING_RP_FILTER="1"              # 1=strict; 2=loose for asymmetric paths
+HARDENING_KEEP_SSH="0"               # 0=remove SSH; manage with pct enter/exec
+HARDENING_REMOVE_POSTFIX="1"         # 1=remove Postfix; 0=keep intentional mail service
+HARDENING_JOURNAL_DAYS="14"
+HARDENING_JOURNAL_MAX_MB="256"
+HARDENING_JOURNAL_RUNTIME_MB="64"
+HARDENING_UPDATE_MAX_AGE_HOURS="72"
+HARDENING_TCP_PORTS="auto"           # Creator-only auto = finalized Synapse + Element ports
+HARDENING_UDP_PORTS="68 546"          # DHCPv4/v6 can listen even with ip6=manual
+# If retaining SSH/mail, explicitly account for their external listeners in a
+# custom TCP list and separately review UFW access; no SSH/mail rule is added.
+
 # Derived
 APP_DIR="/opt/matrix"
 SYNAPSE_IMAGE="${SYNAPSE_IMAGE_REPO}:${SYNAPSE_TAG}"
@@ -125,19 +143,35 @@ POSTGRES_QUADLET_SERVICE="matrix-postgres.service"
 #   /etc/systemd/system/matrix-update.timer
 #   /etc/update-motd.d/00-header, 10-sysinfo, 30-app, 99-footer
 #   /etc/default/ufw, /etc/ufw/ufw.conf                 (in-CT firewall policy/boot enable)
-#   /etc/ufw/user.rules, /etc/ufw/user6.rules            (UFW-managed NPM-only HTTP rules)
+#   /etc/ufw/user.rules, /etc/ufw/user6.rules            (UFW-managed selected HTTP rules)
 #   /usr/local/sbin/matrix-ufw-check                    (read-only service-start guard)
-#   /etc/apt/apt.conf.d/52unattended-<hostname>.conf
+#   /opt/matrix/firewall-policy.json                   (selected HTTP access policy; no secrets)
+#   /usr/local/sbin/matrix-verify                       (read-only application verifier)
+#   /etc/apt/apt.conf.d/99-lab-hardening
+#   /etc/needrestart/conf.d/99-lab-hardening.conf
+#   /etc/systemd/journald.conf.d/99-lab-hardening.conf
+#   /etc/systemd/system/apt-daily{,-upgrade}.service.d/90-lab-readiness.conf
+#   /etc/systemd/system/lab-hardening-check.{service,timer}
+#   /usr/local/sbin/lab-{apt-wait-online,hardening-check}
+#   /etc/update-motd.d/25-lab-hardening
+#   /var/lib/lab-hardening/                            (policy, status, locks, refresh stamp)
+#   /var/backups/lab-hardening/<run>/                  (managed configuration backups)
 #   /etc/sysctl.d/99-hardening.conf
 
 # ── Trap cleanup ──────────────────────────────────────────────────────────────
 # rc is captured before the trap is reset; $LINENO is the failing line at top
 # level (BASH_LINENO[0] is 0 outside a function). After CREATED=1, failing
 # checks must use `false` rather than `exit 1` so this trap runs cleanup.
+STAGE="preflight"
+# Assigned inside the trap at runtime.
+# shellcheck disable=SC2154
 trap 'rc=$?;
   trap - ERR
-  echo "  ERROR: failed (rc=$rc) near line ${LINENO:-?}" >&2
-  echo "  Command: $BASH_COMMAND" >&2
+  echo "  ERROR: ${STAGE:-unknown} failed (rc=$rc) near line ${LINENO:-?}" >&2
+  # BASH_COMMAND can contain an entire heredoc, including embedded code. Print
+  # only its command word; guest stderr above retains the original failure.
+  command_word=${BASH_COMMAND%%[[:space:]]*}
+  printf "  Command: %.80s (arguments/body omitted)\n" "$command_word" >&2
   if [[ "${CLEANUP_ON_FAIL:-0}" -eq 1 && "${CREATED:-0}" -eq 1 ]]; then
     echo "  Cleanup: stopping/destroying CT ${CT_ID} ..." >&2
     pct stop "${CT_ID}" >/dev/null 2>&1 || true
@@ -148,8 +182,7 @@ trap 'rc=$?;
 
 trap 'rc=130;
   trap - ERR INT TERM HUP
-  echo "  Interrupted (rc=$rc)" >&2
-  echo "  Command: $BASH_COMMAND" >&2
+  echo "  Interrupted during ${STAGE:-unknown} (rc=$rc), line ${LINENO:-?}" >&2
   if [[ "${CLEANUP_ON_FAIL:-0}" -eq 1 && "${CREATED:-0}" -eq 1 ]]; then
     echo "  Cleanup: stopping/destroying CT ${CT_ID} ..." >&2
     pct stop "${CT_ID}" >/dev/null 2>&1 || true
@@ -161,9 +194,15 @@ trap 'rc=130;
 # ── Preflight — root & commands ───────────────────────────────────────────────
 [[ "$(id -u)" -eq 0 ]] || { echo "  ERROR: Run as root on the Proxmox host." >&2; exit 1; }
 
-for cmd in pvesh pveam pct pvesm qm curl python3 ip awk grep sed sort paste seq readlink cp chmod dpkg head tail tr mktemp mv flock rm sleep id cat bash install sync; do
+for cmd in pveversion sha256sum pvesh pveam pct pvesm qm curl python3 ip awk grep sed sort paste seq readlink cp chmod dpkg head tail tr mktemp mv flock rm sleep id cat bash install sync; do
   command -v "$cmd" >/dev/null 2>&1 || { echo "  ERROR: Missing required command: $cmd" >&2; exit 1; }
 done
+
+# Verified Proxmox-only caller: discard the HOST login marker before any guest
+# dispatch. A real SSH session running the standalone block inside a CT retains
+# its marker and is still refused when KEEP_SSH=0.
+pveversion >/dev/null
+unset SSH_CONNECTION
 
 [[ "$HN" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]] || { echo "ERROR: Invalid HN." >&2; exit 1; }
 [[ -f "/usr/share/zoneinfo/$APP_TZ" ]] || { echo "ERROR: Unknown APP_TZ." >&2; exit 1; }
@@ -203,14 +242,11 @@ fi
 
 # Creator scripts are not idempotent: a re-run would create a second CT with the
 # same hostname. Refuse if one already exists on this node (e.g. a preserved
-# failed install) — destroy it first or change HN.
+# failed install). Preserve it and select a fresh hostname/ID.
 EXISTING_CT="$(pct list 2>/dev/null | awk -v h="$HN" 'NR>1 && $NF==h {print $1}' | head -n1)"
 if [[ -n "$EXISTING_CT" ]]; then
   echo "  ERROR: A CT with hostname '${HN}' already exists on this node (CT ${EXISTING_CT})." >&2
-  echo "  Fresh installer: use the existing CT maintenance helper. To discard an UNUSED failed install after checking its data:" >&2
-  echo "    pct set $EXISTING_CT --protection 0" >&2
-  echo "    pct stop $EXISTING_CT" >&2
-  echo "    pct destroy $EXISTING_CT" >&2
+  echo "  Preserve that CT for diagnosis. Choose a new, unused HN and CT_ID for a fresh install." >&2
   exit 1
 fi
 
@@ -243,7 +279,7 @@ cat <<EOF2
   Server name:       $SYNAPSE_SERVER_NAME  (user IDs @user:${SYNAPSE_SERVER_NAME} — IMMUTABLE after first start)
   Synapse FQDN:      $SYNAPSE_FQDN -> port $SYNAPSE_PORT
   Element FQDN:      $ELEMENT_FQDN -> port $ELEMENT_PORT
-  Backend ports:     ${SYNAPSE_PORT}, ${ELEMENT_PORT} — UFW inside this CT permits only NPM sources
+  Backend ports:     ${SYNAPSE_PORT}, ${ELEMENT_PORT} — selected hosts, or Enter twice for any source
   NPM IPv4:          ${BACKEND_ALLOWED_IPV4[*]:-(prompt if neither family configured)}
   NPM IPv6:          ${BACKEND_ALLOWED_IPV6[*]:-(none)}
   Max upload:        $MAX_UPLOAD_SIZE
@@ -349,8 +385,9 @@ esac
 
 # ── Backend source addresses ─────────────────────────────────────────────────
 if (( ${#BACKEND_ALLOWED_IPV4[@]} + ${#BACKEND_ALLOWED_IPV6[@]} == 0 )); then
-  read -r -p "  NPM CT IPv4 addresses (bare IP or /32; omit the LAN /24 mask): " -a BACKEND_ALLOWED_IPV4 <&8
-  read -r -p "  Optional NPM CT IPv6 addresses (Enter to skip): " -a BACKEND_ALLOWED_IPV6 <&8
+  echo "  UFW: Enter at both prompts allows any source on TCP $SYNAPSE_PORT and $ELEMENT_PORT."
+  read -r -p "  Allowed NPM/client IPv4 hosts (bare IP or /32; Enter for none): " -a BACKEND_ALLOWED_IPV4 <&8
+  read -r -p "  Allowed NPM/client IPv6 hosts (bare IP or /128; Enter for none): " -a BACKEND_ALLOWED_IPV6 <&8
 fi
 if ! python3 - "$MATRIX_DOMAIN" "$SYNAPSE_FQDN" "$MATRIX_RTC_AUTH_URL" "$MATRIX_RTC_HEALTH_URL" \
   "${#BACKEND_ALLOWED_IPV4[@]}" "${#BACKEND_ALLOWED_IPV6[@]}" \
@@ -365,7 +402,7 @@ if not valid_domain(domain) or not valid_domain(server):
 if any(domain == x or domain.endswith("." + x) for x in ("example.com", "example.net", "example.org", "invalid", "test", "localhost")):
     raise SystemExit("ERROR: Replace MATRIX_DOMAIN with your real domain before creating an immutable identity.")
 v4, v6 = map(int, sys.argv[5:7]); values = sys.argv[7:]
-if v4 == 0: raise SystemExit("ERROR: Set at least one BACKEND_ALLOWED_IPV4 entry; Synapse uses an IPv4 listener in this DHCP/IPv6-manual CT.")
+if v4 == 0 and v6: raise SystemExit("ERROR: Restricted mode needs an IPv4 source: Synapse listens on IPv4. Leave BOTH arrays empty for any-source mode.")
 for i, value in enumerate(values[:v4+v6]):
     field = "BACKEND_ALLOWED_IPV4" if i < v4 else "BACKEND_ALLOWED_IPV6"
     try:
@@ -401,6 +438,25 @@ then
   exit 1
 fi
 
+
+# Final listener lists: auto is a creator convenience, never passed to the block.
+[[ $HARDENING_TCP_PORTS != auto ]] || HARDENING_TCP_PORTS="$SYNAPSE_PORT $ELEMENT_PORT"
+[[ $HARDENING_PROFILE == lxc ]] || { echo "ERROR: This creator requires HARDENING_PROFILE=lxc." >&2; exit 1; }
+[[ $HARDENING_RP_FILTER =~ ^[12]$ ]] || { echo "ERROR: HARDENING_RP_FILTER must be 1 or 2." >&2; exit 1; }
+for flag in HARDENING_KEEP_SSH HARDENING_REMOVE_POSTFIX; do
+  [[ ${!flag} =~ ^[01]$ ]] || { echo "ERROR: $flag must be 0 or 1." >&2; exit 1; }
+done
+for number in HARDENING_JOURNAL_DAYS HARDENING_JOURNAL_MAX_MB HARDENING_JOURNAL_RUNTIME_MB HARDENING_UPDATE_MAX_AGE_HOURS; do
+  [[ ${!number} =~ ^[1-9][0-9]{0,3}$ ]] || { echo "ERROR: $number must be 1..9999." >&2; exit 1; }
+done
+for port in $HARDENING_TCP_PORTS $HARDENING_UDP_PORTS; do
+  [[ $port =~ ^[1-9][0-9]{0,4}$ ]] && (( port <= 65535 )) || { echo "ERROR: Hardening port lists require integers 1..65535." >&2; exit 1; }
+done
+FIREWALL_ACCESS="selected NPM/client hosts only"
+if (( ${#BACKEND_ALLOWED_IPV4[@]} + ${#BACKEND_ALLOWED_IPV6[@]} == 0 )); then
+  FIREWALL_ACCESS="any source on the two HTTP ports"
+fi
+echo "  Selected UFW access: $FIREWALL_ACCESS"
 
 # ── Preflight — environment ───────────────────────────────────────────────────
 pvesm status | awk -v s="$TEMPLATE_STORAGE" '$1==s && $3=="active"{f=1} END{exit(!f)}' \
@@ -471,6 +527,7 @@ else
   pveam download "$TEMPLATE_STORAGE" "$TEMPLATE"
 fi
 
+STAGE="CT creation"
 # ── Create LXC ────────────────────────────────────────────────────────────────
 # Root password is set after start via chpasswd on stdin, keeping it out of
 # the host process list (pct create -password exposes it in ps).
@@ -511,13 +568,13 @@ echo "  CT $CT_ID is up — IP: $CT_IP"
 printf 'root:%s\n' "$PASSWORD" | pct exec "$CT_ID" -- chpasswd
 unset PASSWORD PW1 PW2
 
+STAGE="OS bootstrap"
 # ── OS update ─────────────────────────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc '
   set -euo pipefail
-  export DEBIAN_FRONTEND=noninteractive
+  export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l
   export LANG=C.UTF-8
   export LC_ALL=C.UTF-8
-  systemctl disable -q --now systemd-networkd-wait-online.service 2>/dev/null || true
   apt-get update -qq
   apt-get -o Dpkg::Options::="--force-confold" -y dist-upgrade
   apt-get -y autoremove
@@ -532,7 +589,7 @@ PODMAN_FUSE_PKG=""
 
 pct exec "$CT_ID" -- bash -lc "
   set -euo pipefail
-  export DEBIAN_FRONTEND=noninteractive
+  export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l
   apt-get update -qq
   apt-get install -y locales curl ca-certificates iproute2 podman tar gzip python3 python3-yaml util-linux ufw iptables ${PODMAN_FUSE_PKG}
   sed -i 's/^# *en_US.UTF-8/en_US.UTF-8/' /etc/locale.gen
@@ -542,18 +599,9 @@ pct exec "$CT_ID" -- bash -lc "
   echo '${APP_TZ}' > /etc/timezone
 "
 
-# ── Remove unnecessary services ───────────────────────────────────────────────
-pct exec "$CT_ID" -- bash -lc '
-  set -euo pipefail
-  export DEBIAN_FRONTEND=noninteractive
-  systemctl disable --now ssh 2>/dev/null || true
-  systemctl disable --now postfix 2>/dev/null || true
-  apt-get purge -y openssh-server postfix 2>/dev/null || true
-  apt-get -y autoremove
-'
-
+STAGE="firewall setup"
 # ── UFW inside the CT ─────────────────────────────────────────────────────────
-# Fresh CT only: replace UFW's initial user rules before app services are created.
+# Fresh CT only: preserve UFW rule files; add only the selected application rules.
 # Network=host means these HTTP listeners use this CT's INPUT chain, without
 # published-port NAT bypasses. Outbound federation, DNS and updates remain allowed.
 # UFW's standard loopback, established-reply, DHCP and ICMP handling is retained.
@@ -562,11 +610,9 @@ pct exec "$CT_ID" -- bash -s -- "$SYNAPSE_PORT" "$ELEMENT_PORT" \
 set -euo pipefail
 export LC_ALL=C
 synapse_port=$1; element_port=$2; shift 2
-(( $# > 0 )) || { echo "ERROR: No NPM source addresses supplied." >&2; exit 1; }
 # Netfilter must be usable inside this unprivileged CT; no privileged fallback.
 iptables -w 5 -S INPUT >/dev/null
 ip6tables -w 5 -S INPUT >/dev/null
-ufw --force reset
 sed -i 's/^IPV6=.*/IPV6=yes/' /etc/default/ufw
 grep -qx 'IPV6=yes' /etc/default/ufw
 # This creator owns /etc/sysctl.d/99-hardening.conf. Avoid a second sysctl writer
@@ -577,6 +623,10 @@ ufw default deny incoming
 ufw default allow outgoing
 ufw default deny routed
 ufw logging off
+if (( $# == 0 )); then
+  ufw allow in proto tcp to any port "$synapse_port"
+  ufw allow in proto tcp to any port "$element_port"
+fi
 for source in "$@"; do
   ufw allow in proto tcp from "$source" to any port "$synapse_port"
   ufw allow in proto tcp from "$source" to any port "$element_port"
@@ -592,8 +642,23 @@ for source in "$@"; do
     "$tool" -w 5 -C "${prefix}-user-input" -s "$source" -p tcp -m tcp --dport "$port" -j ACCEPT
   done
 done
+if (( $# == 0 )); then
+  for tool in iptables ip6tables; do
+    prefix=ufw; [[ $tool != ip6tables ]] || prefix=ufw6
+    for port in "$synapse_port" "$element_port"; do
+      "$tool" -w 5 -C "${prefix}-user-input" -p tcp -m tcp --dport "$port" -j ACCEPT
+    done
+  done
+fi
 ufw status verbose
 UFWSETUP
+
+# Store the selected policy without executing it as shell code.
+python3 - "$SYNAPSE_PORT" "$ELEMENT_PORT" "${BACKEND_ALLOWED_IPV4[@]}" "${BACKEND_ALLOWED_IPV6[@]}" <<'FWPOLICY' | pct exec "$CT_ID" -- bash -c 'set -euo pipefail; install -d -m 0755 /opt/matrix; cat > /opt/matrix/firewall-policy.json; chmod 0644 /opt/matrix/firewall-policy.json'
+import ipaddress, json, sys
+print(json.dumps({'ports': list(map(int, sys.argv[1:3])),
+                  'sources': [str(ipaddress.ip_network(s)) for s in sys.argv[3:]]}))
+FWPOLICY
 
 tmp="$(mktemp)"
 cat > "$tmp" <<'UFWCHECK'
@@ -611,6 +676,8 @@ for tool in /usr/sbin/iptables /usr/sbin/ip6tables; do
   [[ ${tool##*/} != ip6tables ]] || prefix=ufw6
   rules=$("$tool" -w 5 -S INPUT)
   grep -qx -- '-P INPUT DROP' <<< "$rules"
+  rules=$("$tool" -w 5 -S FORWARD)
+  grep -qx -- '-P FORWARD DROP' <<< "$rules"
   # UFW uses ufw-* for IPv4 and ufw6-* for IPv6, even with no allowed IPv6 sources.
   "$tool" -w 5 -C INPUT -j "${prefix}-before-input"
   "$tool" -w 5 -S "${prefix}-user-input" >/dev/null
@@ -661,6 +728,7 @@ GRAPH_DRIVER="$(pct exec "$CT_ID" -- podman info --format '{{.Store.GraphDriverN
 [[ "$GRAPH_DRIVER" == "overlay" ]] || { echo "  ERROR: Podman storage driver is '${GRAPH_DRIVER}', expected overlay." >&2; false; }
 echo "  Podman: cgroup ${CGROUPS_VERSION}, storage driver ${GRAPH_DRIVER}$([ "$PODMAN_FUSE_OVERLAY" -eq 1 ] && echo " (fuse-overlayfs)" || echo " (native)")"
 
+STAGE="image acquisition"
 # ── Pull images ───────────────────────────────────────────────────────────────
 for img in "$POSTGRES_IMAGE" "$SYNAPSE_IMAGE" "$ELEMENT_IMAGE"; do
   echo "  Pulling image: ${img} ..."
@@ -679,6 +747,7 @@ for component in SYNAPSE ELEMENT POSTGRES; do
   printf -v "${component}_IMAGE_ID" 'sha256:%s' "$resolved"
 done
 
+STAGE="image compatibility"
 # ── Detect container UIDs/GIDs for bind mounts ────────────────────────────────
 # PostgreSQL drops to its own service user before touching the mount; the UID
 # differs between the Debian (999) and Alpine (70) variants, so read it from
@@ -712,6 +781,7 @@ pct exec "$CT_ID" -- bash -lc "
   install -d -m 0750 -o ${SYNAPSE_UID}  -g ${SYNAPSE_GID}  '${SYNAPSE_DATA_DIR}' '${SYNAPSE_DATA_DIR}/media_store'
 "
 
+STAGE="application configuration"
 # ── Generate Synapse homeserver.yaml ──────────────────────────────────────────
 # The image's `generate` mode writes homeserver.yaml, the signing key and the log
 # config into /data (as UID:GID) with --open-private-ports, i.e. the listener
@@ -808,7 +878,7 @@ echo "  Synapse configuration parsed successfully"
 # Mounted read-only at /app/config.json. Element talks to Synapse through the
 # public base_url (https://matrix.<domain>), so DNS + reverse proxy must exist
 # before Element is usable. Use public HTTPS with split DNS for LAN clients;
-# direct backend access is restricted to the NPM CT addresses.
+# direct backend access follows the selected UFW source policy.
 # The MapTiler key is optional; without it the map_style_url key is omitted and
 # Element's location-sharing map stays disabled. Element runs as nginx-unprivileged
 # (uid 101) and only needs to read this file — root:root 0644.
@@ -1068,6 +1138,7 @@ EOF2
   chmod 0600 '${APP_DIR}/.env'
 "
 
+STAGE="startup"
 # ── Start via Quadlet ─────────────────────────────────────────────────────────
 # daemon-reload triggers the Quadlet generator which produces matrix-synapse.service,
 # matrix-element.service and matrix-postgres.service as transient systemd units.
@@ -1094,6 +1165,7 @@ pct exec "$CT_ID" -- bash -lc "
   systemctl start '${SYNAPSE_QUADLET_SERVICE}' '${ELEMENT_QUADLET_SERVICE}'
 "
 
+STAGE="early verification"
 # ── Verification ──────────────────────────────────────────────────────────────
 sleep 30
 VERIFY_FAIL=0
@@ -1109,14 +1181,9 @@ for svc in "$POSTGRES_QUADLET_SERVICE" "$SYNAPSE_QUADLET_SERVICE" "$ELEMENT_QUAD
   fi
 done
 
-RUNNING=0
-for i in 1; do
-  RUNNING="$(pct exec "$CT_ID" -- sh -lc \
-    'podman ps --filter name=^matrix-synapse$ --filter name=^matrix-element$ --filter name=^matrix-postgres$ --format "{{.Names}}" 2>/dev/null | wc -l' \
-    2>/dev/null || echo 0)"
-  [[ "$RUNNING" -ge 3 ]] && break
-  sleep 2
-done
+RUNNING="$(pct exec "$CT_ID" -- sh -lc \
+  'podman ps --filter name=^matrix-synapse$ --filter name=^matrix-element$ --filter name=^matrix-postgres$ --format "{{.Names}}" 2>/dev/null | wc -l' \
+  2>/dev/null || echo 0)"
 pct exec "$CT_ID" -- bash -lc 'set -euo pipefail; podman ps' || true
 
 if [[ "$RUNNING" -lt 3 ]]; then
@@ -1220,6 +1287,7 @@ else
 fi
 
 EL_HEALTHY=0
+# shellcheck disable=SC2034
 for i in $(seq 1 30); do
   HTTP_CODE="$(pct exec "$CT_ID" -- sh -lc "curl -s -o /dev/null -w '%{http_code}' --max-time 3 'http://127.0.0.1:${ELEMENT_PORT}/' 2>/dev/null" 2>/dev/null || echo 000)"
   case "$HTTP_CODE" in
@@ -1279,10 +1347,11 @@ fi
 if (( VERIFY_FAIL == 1 )); then
   echo "" >&2
   echo "  FATAL: Core verification failed — CT $CT_ID is preserved but the install is incomplete." >&2
-  echo "  Inspect the container and fix manually, or destroy and re-run." >&2
+  echo "  Collect read-only diagnostics; correct the creator and use a fresh ID and hostname." >&2
   false
 fi
 
+STAGE="maintenance setup"
 # ── Maintenance helper ────────────────────────────────────────────────────────
 tmp="$(mktemp)"
 cat > "$tmp" <<'MAINT'
@@ -1541,11 +1610,20 @@ update_component() {
       -m synapse.config -c /data/homeserver.yaml
   elif [[ $component == POSTGRES ]]; then
     [[ $(cat "$APP_DIR/postgresdata/18/docker/PG_VERSION") == 18 ]] || die "Unexpected on-disk PostgreSQL major."
-    local uid gid actual_owner
+    local uid gid current_uid current_gid actual_owner actual_uid actual_gid actual_mode
     uid=$(podman run --rm --pull=never --network none --entrypoint sh "$new_id" -c 'id -u postgres')
     gid=$(podman run --rm --pull=never --network none --entrypoint sh "$new_id" -c 'id -g postgres')
-    actual_owner=$(stat -c '%u:%g' "$APP_DIR/postgresdata/18/docker")
-    [[ $uid =~ ^[0-9]+$ && $gid =~ ^[0-9]+$ && $actual_owner == "$uid:$gid" ]] || die "Target PostgreSQL UID/GID differs from cluster ownership. No recursive chown is attempted."
+    current_uid=$(podman exec matrix-postgres id -u postgres)
+    current_gid=$(podman exec matrix-postgres id -g postgres)
+    # Keep image account changes as a separate migration guard. PGDATA itself
+    # can have group root: the selected image changes only its owner and sets
+    # mode 0700, so its directory group has no access and need not match postgres.
+    [[ $uid =~ ^[0-9]+$ && $gid =~ ^[0-9]+$ && $uid != 0 && $uid == "$current_uid" && $gid == "$current_gid" ]] \
+      || die "Target PostgreSQL account $uid:$gid differs from running account $current_uid:$current_gid or is invalid. Separate migration review required."
+    actual_owner=$(stat -c '%u:%g:%a' "$APP_DIR/postgresdata/18/docker")
+    IFS=: read -r actual_uid actual_gid actual_mode <<< "$actual_owner"
+    [[ $actual_uid == "$uid" && $actual_mode == 700 ]] \
+      || die "PostgreSQL cluster has uid=$actual_uid gid=$actual_gid mode=$actual_mode; expected uid=$uid and mode=700. No ownership or permission changes are attempted."
     podman run --rm --pull=never --network none --entrypoint postgres "$new_id" --version | grep -Eq '^postgres \(PostgreSQL\) 18\.' \
       || die "Image does not contain PostgreSQL 18."
   else
@@ -1712,81 +1790,30 @@ else
   echo "  Auto-update timer installed but disabled"
 fi
 
-# ── Unattended upgrades ───────────────────────────────────────────────────────
-pct exec "$CT_ID" -- bash -lc '
-  set -euo pipefail
-  export DEBIAN_FRONTEND=noninteractive
-  apt-get update -qq
-  apt-get install -y unattended-upgrades
-  distro_codename="$(. /etc/os-release && echo "$VERSION_CODENAME")"
-  cat > /etc/apt/apt.conf.d/52unattended-$(hostname).conf <<EOF2
-Unattended-Upgrade::Origins-Pattern {
-        "origin=Debian,codename=${distro_codename},label=Debian-Security";
-        "origin=Debian,codename=${distro_codename}-security";
-        "origin=Debian,codename=${distro_codename},label=Debian";
-        "origin=Debian,codename=${distro_codename}-updates,label=Debian";
-};
-Unattended-Upgrade::Package-Blacklist {};
-Unattended-Upgrade::AutoFixInterruptedDpkg "true";
-Unattended-Upgrade::MinimalSteps "true";
-Unattended-Upgrade::InstallOnShutdown "false";
-Unattended-Upgrade::Remove-New-Unused-Dependencies "true";
-Unattended-Upgrade::Remove-Unused-Dependencies "true";
-Unattended-Upgrade::Automatic-Reboot "false";
-EOF2
-
-  cat > /etc/apt/apt.conf.d/20auto-upgrades <<EOF2
-APT::Periodic::Update-Package-Lists "1";
-APT::Periodic::Unattended-Upgrade "1";
-APT::Periodic::AutocleanInterval "7";
-EOF2
-
-  systemctl enable --now unattended-upgrades
-'
-
 # ── Extra packages ────────────────────────────────────────────────────────────
 if [[ "${#EXTRA_PACKAGES[@]}" -gt 0 ]]; then
   pct exec "$CT_ID" -- bash -lc "
     set -euo pipefail
-    export DEBIAN_FRONTEND=noninteractive
+    export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l
     apt-get install -y ${EXTRA_PACKAGES[*]}
   "
 fi
 
-# ── Sysctl hardening ──────────────────────────────────────────────────────────
-pct exec "$CT_ID" -- bash -lc '
-  set -euo pipefail
-  cat > /etc/sysctl.d/99-hardening.conf <<EOF2
-net.ipv4.conf.all.rp_filter = 1
-net.ipv4.conf.default.rp_filter = 1
-net.ipv4.conf.all.accept_redirects = 0
-net.ipv4.conf.default.accept_redirects = 0
-net.ipv4.conf.all.send_redirects = 0
-net.ipv4.conf.default.send_redirects = 0
-net.ipv4.conf.all.accept_source_route = 0
-net.ipv4.conf.default.accept_source_route = 0
-net.ipv4.icmp_echo_ignore_broadcasts = 1
-net.ipv4.icmp_ignore_bogus_error_responses = 1
-EOF2
-  if ! sysctl --system >/dev/null 2>&1; then
-    echo "  WARNING: sysctl --system reported errors — some keys may be read-only in this unprivileged CT:" >&2
-    sysctl --system 2>&1 | grep -i "error\|permission" >&2 || true
-  fi
-'
-
+STAGE="package cleanup"
 # ── Cleanup packages ──────────────────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc '
   set -euo pipefail
-  export DEBIAN_FRONTEND=noninteractive
+  export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l
   apt-get purge -y man-db manpages 2>/dev/null || true
   apt-get -y autoremove
   apt-get -y clean
 '
 
+STAGE="MOTD"
 # ── MOTD (dynamic drop-ins) ───────────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc '
   set -euo pipefail
-  > /etc/motd
+  : > /etc/motd
   install -d /etc/update-motd.d
   chmod -x /etc/update-motd.d/* 2>/dev/null || true
   rm -f /etc/update-motd.d/*
@@ -1824,7 +1851,8 @@ fi
 printf '  Config: /opt/matrix/synapse/homeserver.yaml, /opt/matrix/.env\n'
 printf '  Maintenance: /usr/local/bin/matrix-maint.sh --help\n'
 printf '  Logs: journalctl -u matrix-synapse.service -f\n'
-printf '  Ingress: UFW inside this CT; only NPM may reach Matrix HTTP ports.\n'
+printf '  Ingress: UFW policy in /opt/matrix/firewall-policy.json.\n'
+printf '  Verify: /usr/local/sbin/matrix-verify; /usr/local/sbin/lab-hardening-check\n'
 printf '  Firewall: ufw status verbose; manage locally through pct enter/exec.\n'
 printf '  Before updates: host PBS/PVE checkpoint. Synapse image reversal may be unsafe.\n'
 printf '  Element updates are independent; HTTP readiness does not verify calls.\n'
@@ -1837,10 +1865,900 @@ MOTDFOOTER
 pct push "$CT_ID" "$tmp" /etc/update-motd.d/99-footer --perms 0755
 rm -f "$tmp"
 
+# ── Final verification helper ─────────────────────────────────────────────────
+# Reads configuration/runtime state; no updates, restarts or report-file writes.
+tmp=$(mktemp)
+cat > "$tmp" <<'MATRIX_VERIFY'
+#!/usr/bin/python3
+"""Read-only Matrix checks. No repairs, package/image changes or report writes."""
+import ipaddress
+import json
+import os
+from pathlib import Path
+import re
+import shlex
+import subprocess
+import sys
+import time
+import urllib.request
+import yaml
+
+os.environ['PATH'] = '/usr/sbin:/usr/bin:/sbin:/bin'
+os.environ['LC_ALL'] = 'C'
+errors = []
+
+def require(ok, label):
+    if not ok:
+        raise RuntimeError(label)
+
+def run(args, label, data=None, acceptable=(0,)):
+    p = subprocess.run(args, input=data, text=True, capture_output=True, timeout=30)
+    # Never print argv/environment or raw stderr: either may contain credentials.
+    require(p.returncode in acceptable, f'{label}: command failed (rc={p.returncode})')
+    return p.stdout.strip()
+
+def state_file(path):
+    result = {}
+    for line in Path(path).read_text().splitlines():
+        if not line or line.startswith('#'):
+            continue
+        k, v = line.split('=', 1)
+        require(k not in result, 'Duplicate configuration key')
+        result[k] = v
+    return result
+
+def http(port, path):
+    with urllib.request.urlopen(f'http://127.0.0.1:{port}{path}', timeout=5) as response:
+        require(response.status == 200, 'Unexpected HTTP status')
+        return response.read()
+
+def check_firewall():
+    run(['/usr/local/sbin/matrix-ufw-check'], 'UFW boot guard')
+    policy = json.loads(Path('/opt/matrix/firewall-policy.json').read_text())
+    require(policy['ports'] == [sy_port, el_port], 'Firewall/application ports differ')
+    sources = [ipaddress.ip_network(s) for s in policy['sources']]
+    for family, tool, prefix in [(4, 'iptables', 'ufw'), (6, 'ip6tables', 'ufw6')]:
+        chain = prefix + '-user-input'
+        networks = [s for s in sources if s.version == family] if sources else [None]
+        expected = set()
+        for source in networks:
+            for port in policy['ports']:
+                rule = (['-s', str(source)] if source else []) + ['-p', 'tcp', '-m', 'tcp', '--dport', str(port), '-j', 'ACCEPT']
+                run([tool, '-w', '5', '-C', chain] + rule, f'IPv{family} selected source rule / TCP {port}')
+                expected.add(tuple(['-A', chain] + rule))
+        actual = run([tool, '-w', '5', '-S', chain], f'IPv{family} user rules')
+        # Exact user-chain policy also rejects broad/earlier rules that could
+        # override the selected sources. Normalize host /32 and /128 spelling.
+        actual_rules = set()
+        for line in actual.splitlines():
+            words = shlex.split(line)
+            if words[:1] != ['-A']:
+                continue
+            if '-s' in words:
+                i = words.index('-s') + 1
+                words[i] = str(ipaddress.ip_network(words[i]))
+            actual_rules.add(tuple(words))
+        require(actual_rules == expected, f'IPv{family} UFW user policy has extra/mismatched rules; review without resetting UFW')
+
+def check_identity():
+    for name, key, mounts in [
+        ('synapse', 'SYNAPSE', {'/data': ('/opt/matrix/synapse', True)}),
+        ('element', 'ELEMENT', {'/app/config.json': ('/opt/matrix/element-config.json', False)}),
+        ('postgres', 'POSTGRES', {'/var/lib/postgresql': ('/opt/matrix/postgresdata', True),
+                               '/docker-entrypoint-initdb.d/10-synapse.sh': ('/opt/matrix/postgres-init.sh', False)})]:
+        container = 'matrix-' + name
+        unit = Path('/etc/containers/systemd/' + container + '.container').read_text()
+        ids = re.findall(r'^Image=(sha256:[a-f0-9]{64})$', unit, re.M)
+        require(len(ids) == 1 and ids[0] == state[key + '_IMAGE_ID'], container + ': image metadata mismatch')
+        require(re.findall(r'^Pull=(.*)$', unit, re.M) == ['never'], container + ': Pull policy')
+        info = json.loads(run(['podman', 'inspect', container], container + ' inspection'))[0]
+        require(info['State']['Running'] and 'sha256:' + info['Image'].removeprefix('sha256:') == ids[0], container + ': running image/identity')
+        require(info['HostConfig']['NetworkMode'] == 'host', container + ': host network')
+        actual = {m['Destination']: (m['Source'], m['RW']) for m in info['Mounts']}
+        for destination, value in mounts.items():
+            require(actual.get(destination) == value, container + ': persistent mount ' + destination)
+        run(['systemctl', 'is-active', '--quiet', container + '.service'], container + ' active')
+        before = run(['systemctl', 'show', container + '.service', '-p', 'NRestarts', '--value'], container + ' restarts')
+        require(before.isdigit(), container + ': missing restart counter')
+        restart_counts[container] = before
+        status = Path('/proc/' + str(info['State']['Pid']) + '/status').read_text()
+        uid = int(re.search(r'^Uid:\s+(\d+)', status, re.M)[1])
+        if name == 'synapse':
+            require(uid == 991, 'Synapse main process UID must be 991')
+        elif name == 'postgres':
+            expected_uid = int(run(['podman', 'exec', container, 'id', '-u', 'postgres'], 'PostgreSQL UID'))
+            require(uid == expected_uid and uid != 0, 'PostgreSQL main process UID')
+            cluster = Path('/opt/matrix/postgresdata/18/docker')
+            require((cluster / 'PG_VERSION').read_text().strip() == '18', 'PostgreSQL persistent major')
+            # The selected official entrypoint uses `chown postgres` (UID only)
+            # and chmod 00700. PGDATA can therefore be postgres:root; owner-only
+            # access makes its group irrelevant. Never chown it to satisfy a check.
+            cluster_info = cluster.stat()
+            require(cluster_info.st_uid == expected_uid,
+                    f'PostgreSQL cluster ownership: uid={cluster_info.st_uid}, gid={cluster_info.st_gid}; expected uid={expected_uid}')
+            cluster_mode = cluster_info.st_mode & 0o7777
+            require(cluster_mode == 0o700,
+                    f'PostgreSQL cluster permissions: mode={cluster_mode:04o}; expected 0700')
+        else:
+            require(uid != 0, 'Element main process must remain unprivileged')
+    for path in ['/opt/matrix/synapse', '/opt/matrix/synapse/media_store']:
+        st = Path(path).stat()
+        require((st.st_uid, st.st_gid) == (991, 991), 'Synapse data ownership')
+    for path in ['/opt/matrix/synapse/homeserver.yaml', '/opt/matrix/postgres.env']:
+        require(Path(path).stat().st_mode & 0o777 == 0o600, 'Credential file mode: ' + path)
+
+def check_http():
+    start = time.monotonic()
+    while True:
+        try:
+            http(sy_port, '/health')
+            key = json.loads(http(sy_port, '/_matrix/key/v2/server'))
+            require(key['server_name'] == state['SYNAPSE_SERVER_NAME'], 'Synapse server identity')
+            versions = json.loads(http(sy_port, '/_matrix/client/versions'))
+            require(bool(versions['versions']), 'Matrix client versions response')
+            require(json.loads(http(el_port, '/config.json')) == json.loads(Path('/opt/matrix/element-config.json').read_text()), 'Element served configuration')
+            index = run(['podman', 'exec', 'matrix-element', 'cat', '/app/index.html'], 'Element image index')
+            require(http(el_port, '/').decode().strip() == index, 'Element index differs from running image')
+            return
+        except Exception:
+            if time.monotonic() - start >= 60:
+                raise
+            time.sleep(2)
+
+def check_database():
+    run(['podman', 'exec', 'matrix-postgres', 'pg_isready', '-h', '127.0.0.1', '-U', 'synapse', '-d', 'synapse'], 'Database readiness')
+    password = config['database']['args']['password']
+    env = state_file('/opt/matrix/postgres.env')
+    require(password == env['SYNAPSE_DB_PASSWORD'], 'Synapse/database credential match')
+    for name in ['POSTGRES_PASSWORD', 'SYNAPSE_DB_PASSWORD', 'POSTGRES_INITDB_ARGS']:
+        got = run(['podman', 'exec', 'matrix-postgres', 'printenv', name], name + ' round trip')
+        require(got == env[name], name + ' round trip differs')
+    sql = "SELECT current_user = 'synapse' AND (SELECT count(*) > 0 FROM information_schema.tables WHERE table_schema='public');"
+    output = run(['podman', 'exec', '-i', 'matrix-postgres', 'bash', '-c',
+        'IFS= read -r PGPASSWORD; export PGPASSWORD; exec psql -X -w -v ON_ERROR_STOP=1 -h 127.0.0.1 -U synapse -d synapse -tAc "$1"', 'verify', sql], 'Authenticated application-role query/migrations', password + '\n')
+    require(output == 't', 'Application-role schema/migration query')
+    bad = subprocess.run(['podman', 'exec', '-e', 'PGPASSWORD=deliberately-wrong', 'matrix-postgres', 'psql', '-X', '-w', '-h', '127.0.0.1', '-U', 'synapse', '-d', 'synapse', '-tAc', 'SELECT 1'], capture_output=True, text=True, timeout=15)
+    require(bad.returncode != 0 and 'password authentication failed' in bad.stderr, 'Wrong password must fail specifically with authentication rejection')
+    queries = [
+        "SELECT rolcanlogin AND NOT rolsuper AND NOT rolcreatedb AND NOT rolcreaterole AND NOT rolreplication AND NOT rolbypassrls FROM pg_roles WHERE rolname='synapse'",
+        "SELECT pg_get_userbyid(datdba)='synapse' AND datcollate='C' AND datctype='C' FROM pg_database WHERE datname='synapse'",
+        "SELECT count(*)=0 FROM pg_hba_file_rules WHERE error IS NOT NULL OR (type LIKE 'host%' AND auth_method <> 'scram-sha-256')"]
+    for label, query in zip(['Application role restrictions', 'Database owner/locale', 'SCRAM host policy'], queries):
+        require(run(['podman', 'exec', 'matrix-postgres', 'psql', '-X', '-v', 'ON_ERROR_STOP=1', '-U', 'postgres', '-d', 'postgres', '-tAc', query], label) == 't', label)
+
+def check_sockets():
+    sockets = run(['ss', '-H', '-lnt'], 'TCP socket inventory')
+    ports = {}
+    for line in sockets.splitlines():
+        endpoint = line.split()[3]
+        address, port = endpoint.rsplit(':', 1)
+        address = address.split('%', 1)[0].strip('[]')
+        ports.setdefault(int(port), []).append(address)
+    require(ports.get(5432) == ['127.0.0.1'], 'PostgreSQL must listen on IPv4 loopback only')
+    for port in [sy_port, el_port]:
+        require(any(a == '*' or not ipaddress.ip_address(a).is_loopback for a in ports.get(port, [])), f'External application TCP {port} missing')
+
+require(os.geteuid() == 0, 'Run matrix-verify as root inside the Matrix CT')
+try:
+    state = state_file('/opt/matrix/.env')
+    sy_port, el_port = int(state['SYNAPSE_PORT']), int(state['ELEMENT_PORT'])
+    config = yaml.safe_load(Path('/opt/matrix/synapse/homeserver.yaml').read_text())
+except Exception:
+    raise SystemExit('FAIL: Matrix configuration is missing or malformed; no changes made.')
+restart_counts = {}
+for label, check in [('UFW effective sources', check_firewall), ('Services, images, mounts and ownership', check_identity), ('Application HTTP contracts', check_http), ('Database authentication and privileges', check_database), ('Listener bindings', check_sockets)]:
+    try:
+        check()
+        print('PASS: ' + label)
+    except Exception as exc:
+        # RuntimeError messages above are deliberately secret-free; other
+        # exceptions might embed configuration or request contents.
+        detail = str(exc) if isinstance(exc, RuntimeError) else type(exc).__name__
+        errors.append(label)
+        print('FAIL: ' + label + ': ' + detail)
+if restart_counts:
+    time.sleep(3)
+    for container, before in restart_counts.items():
+        try:
+            after = run(['systemctl', 'show', container + '.service', '-p', 'NRestarts', '--value'], container + ' restart stability')
+            require(before == after, container + ': restarted during verification')
+            run(['systemctl', 'is-active', '--quiet', container + '.service'], container + ' remains active')
+        except Exception:
+            errors.append(container + ' stability')
+            print('FAIL: ' + container + ' did not stay active with stable restart count')
+print('Matrix verification: ' + ('FAIL' if errors else 'PASS'))
+sys.exit(1 if errors else 0)
+MATRIX_VERIFY
+pct push "$CT_ID" "$tmp" /usr/local/sbin/matrix-verify --perms 0755
+rm -f "$tmp"
+
+# ── Shared hardening integration ──────────────────────────────────────────────
+STAGE="hardening"
+# Capture all six persistent rule files and effective filter tables. No counters
+# are included, so normal traffic cannot produce a false preservation failure.
+UFW_FILES_BEFORE=$(pct exec "$CT_ID" -- sha256sum /etc/ufw/before.rules /etc/ufw/after.rules /etc/ufw/user.rules /etc/ufw/before6.rules /etc/ufw/after6.rules /etc/ufw/user6.rules)
+UFW_V4_BEFORE=$(pct exec "$CT_ID" -- iptables -w 5 -S)
+UFW_V6_BEFORE=$(pct exec "$CT_ID" -- ip6tables -w 5 -S)
+# BEGIN APPROVED BASELINE: lab-hardening-block-v1.1.1.sh
+# SHA256: d9a70377b0bea40f2d415f89a26678bf5b266b7812f734706235509dbf18f6b2
+#!/usr/bin/env bash
+# ── Shared Debian 13 LXC hardening block ───────────────────────────────────────
+# Version: 1.1.1 (2026-09-12; scoped IPv6 listener parsing fix)
+# Paste this whole file AFTER the creator's MOTD/cleanup steps and BEFORE its
+# final verification/summary. Later MOTD code must not delete 25-lab-hardening.
+# Replace its old unattended-upgrades and sysctl sections with this block.
+# The initial OS upgrade and application/UFW setup must already have run.
+# Keep application-specific ports, source rules, users, health checks and units.
+# Creators retain set -Eeo pipefail and their ERR trap; do not invoke this block
+# as the condition of an if/! command. Late failures must preserve the CT.
+#
+# On PVE: an existing running CT_ID is mandatory; all changes run via pct exec.
+# Direct: root inside an existing Debian 13 LXC. Other environments are refused.
+# Scope: Proxmox service LXCs without routing, including Podman Network=host.
+# Routers, VPN gateways and containers using bridge forwarding need another policy.
+#
+# Features: dual-stack sysctl policy and UFW checks; scoped service removal;
+# Debian updates without auto-reboot; conservative dependency cleanup;
+# persistent bounded journals; report-only needrestart; APT readiness repair;
+# hourly/boot checks, local status reporting, configuration backups.
+# No remote downloads of scripts; no changes to app images or Proxmox config.
+# Reports are local (journal, status.json, MOTD); no email/webhook is configured.
+# Re-running saves a new config backup; package removals have no automatic undo.
+# UFW logging and all allow/deny rules retain the installer's existing policy.
+#
+# Managed paths:
+#   /etc/sysctl.d/99-hardening.conf
+#   /etc/apt/apt.conf.d/99-lab-hardening
+#   /etc/needrestart/conf.d/99-lab-hardening.conf
+#   /etc/systemd/journald.conf.d/99-lab-hardening.conf
+#   /etc/systemd/system/apt-daily{,-upgrade}.service.d/90-lab-readiness.conf (LXC)
+#   /etc/systemd/system/lab-hardening-check.{service,timer}
+#   /usr/local/sbin/lab-{apt-wait-online,hardening-check}
+#   /etc/update-motd.d/25-lab-hardening
+#   /etc/default/ufw (IPT_SYSCTL only); SSH service/socket masks (when SSH removed)
+#   /var/lib/lab-hardening/{policy.json,status.json,last-index-refresh,check.lock}
+#   /var/backups/lab-hardening/<run>/ (configuration copies and dry-run log)
+# References: Debian trixie apt.conf(5), systemd-sysctl(8), ifquery(8),
+# journald.conf(5), needrestart(1); kernel.org networking/ip-sysctl.html.
+#
+# Settings may instead be assigned in the creator's top config section.
+HARDENING_PROFILE="${HARDENING_PROFILE:-lxc}"              # lxc; auto remains a compatible alias
+HARDENING_RP_FILTER="${HARDENING_RP_FILTER:-1}"            # 1=strict; 2=loose for asymmetric paths
+HARDENING_KEEP_SSH="${HARDENING_KEEP_SSH:-0}"              # 0=remove; 1=preserve
+HARDENING_REMOVE_POSTFIX="${HARDENING_REMOVE_POSTFIX:-1}"   # 0 for intentional mail service
+HARDENING_JOURNAL_DAYS="${HARDENING_JOURNAL_DAYS:-14}"
+HARDENING_JOURNAL_MAX_MB="${HARDENING_JOURNAL_MAX_MB:-256}"
+HARDENING_JOURNAL_RUNTIME_MB="${HARDENING_JOURNAL_RUNTIME_MB:-64}"
+HARDENING_UPDATE_MAX_AGE_HOURS="${HARDENING_UPDATE_MAX_AGE_HOURS:-72}"
+# Optional space-separated external listening ports; leave empty to inventory
+# only. Loopback listeners are excluded. For DHCP include UDP 68 (and 546 if used).
+# Examples: Matrix TCP="8008 8080" UDP="68"; NPM TCP="80 443 81" UDP="68".
+# If preserving SSH, include its actual listening port in the TCP list.
+HARDENING_TCP_PORTS="${HARDENING_TCP_PORTS:-}"
+HARDENING_UDP_PORTS="${HARDENING_UDP_PORTS:-}"
+
+# ── Dispatch into the guest ───────────────────────────────────────────────────
+# The subshell isolates the block's options/variables from its parent creator.
+# shellcheck disable=SC2034
+CLEANUP_ON_FAIL=0
+(
+set -Eeuo pipefail
+export LC_ALL=C
+[[ $EUID == 0 ]] || { echo 'ERROR: Run as root.' >&2; exit 1; }
+hardening_exec=()
+if command -v pveversion >/dev/null 2>&1; then
+  [[ ${CT_ID:-} =~ ^[1-9][0-9]+$ ]] || {
+    echo 'ERROR: On Proxmox, supply an existing CT_ID; the host is never hardened.' >&2; exit 1;
+  }
+  pct status "$CT_ID" | grep -qx 'status: running'
+  hardening_exec=(pct exec "$CT_ID" --)
+fi
+"${hardening_exec[@]}" bash -s -- \
+  "$HARDENING_PROFILE" "$HARDENING_RP_FILTER" "$HARDENING_KEEP_SSH" \
+  "$HARDENING_REMOVE_POSTFIX" "$HARDENING_JOURNAL_DAYS" \
+  "$HARDENING_JOURNAL_MAX_MB" "$HARDENING_JOURNAL_RUNTIME_MB" \
+  "$HARDENING_UPDATE_MAX_AGE_HOURS" "$HARDENING_TCP_PORTS" \
+  "$HARDENING_UDP_PORTS" <<'LAB_HARDENING_GUEST'
+set -Eeuo pipefail
+umask 022
+export LC_ALL=C DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+PROFILE=$1 RP_FILTER=$2 KEEP_SSH=$3 REMOVE_POSTFIX=$4
+JOURNAL_DAYS=$5 JOURNAL_MAX_MB=$6 JOURNAL_RUNTIME_MB=$7 UPDATE_MAX_AGE=$8
+TCP_PORTS=$9 UDP_PORTS=${10}
+[[ $EUID == 0 && -d /run/systemd/system ]] || {
+  echo 'ERROR: A running systemd guest and root access are required.' >&2; exit 1;
+}
+command -v pveversion >/dev/null 2>&1 && {
+  echo 'ERROR: Refusing to change a Proxmox host.' >&2; exit 1;
+}
+# shellcheck disable=SC1091
+. /etc/os-release
+[[ $ID == debian && $VERSION_ID == 13 ]] || {
+  echo 'ERROR: This policy requires Debian 13.' >&2; exit 1;
+}
+container=$(systemd-detect-virt --container || true)
+[[ $container == lxc ]] || {
+  echo 'ERROR: This block requires a Debian 13 LXC container.' >&2; exit 1;
+}
+[[ $PROFILE == lxc || $PROFILE == auto ]] || {
+  echo 'ERROR: Only the lxc hardening profile is supported.' >&2; exit 1;
+}
+PROFILE=lxc
+[[ $RP_FILTER == auto ]] && RP_FILTER=1
+[[ $KEEP_SSH == auto ]] && KEEP_SSH=0
+[[ $RP_FILTER =~ ^[12]$ && $KEEP_SSH =~ ^[01]$ && $REMOVE_POSTFIX =~ ^[01]$ ]] || {
+  echo 'ERROR: Invalid hardening setting.' >&2; exit 1;
+}
+[[ $KEEP_SSH == 1 || -z ${SSH_CONNECTION:-} ]] || {
+  echo 'ERROR: Run through pct exec/console before removing SSH, or set HARDENING_KEEP_SSH=1.' >&2; exit 1;
+}
+for value in "$JOURNAL_DAYS" "$JOURNAL_MAX_MB" "$JOURNAL_RUNTIME_MB" "$UPDATE_MAX_AGE"; do
+  [[ $value =~ ^[1-9][0-9]{0,3}$ ]] || { echo 'ERROR: Numeric policy values must be 1..9999.' >&2; exit 1; }
+done
+for port in $TCP_PORTS $UDP_PORTS; do
+  if [[ ! $port =~ ^[1-9][0-9]{0,4}$ ]] || (( port > 65535 )); then
+    echo 'ERROR: Port lists require space-separated numbers from 1 to 65535.' >&2; exit 1
+  fi
+done
+for command in ufw iptables ip6tables ip ss sysctl python3 systemctl apt-get flock; do
+  command -v "$command" >/dev/null || { echo "ERROR: Missing prerequisite: $command" >&2; exit 1; }
+done
+exec 9>/run/lock/lab-hardening-install.lock
+flock -n 9 || { echo 'ERROR: Hardening is already running.' >&2; exit 1; }
+
+# Check before any changes. Existing forwarding usually means bridge/VPN/router
+# functionality; do not silently break it with a service-host policy.
+for path in /proc/sys/net/ipv4/ip_forward /proc/sys/net/{ipv4,ipv6}/conf/*/forwarding; do
+  [[ -r $path && $(cat "$path") == 0 ]] || {
+    echo "ERROR: Forwarding enabled/unavailable at $path; review the guest network role." >&2; exit 1;
+  }
+done
+ufw status | grep -qx 'Status: active'
+grep -qx 'IPV6=yes' /etc/default/ufw
+for tool in iptables ip6tables; do
+  prefix=ufw; [[ $tool != ip6tables ]] || prefix=ufw6
+  "$tool" -w 5 -S INPUT | grep -qx -- '-P INPUT DROP'
+  "$tool" -w 5 -S FORWARD | grep -qx -- '-P FORWARD DROP'
+  "$tool" -w 5 -C INPUT -j "$prefix-before-input"
+  "$tool" -w 5 -S "$prefix-user-input" >/dev/null
+done
+
+# ── Staging and backups ───────────────────────────────────────────────────────
+stage=$(mktemp -d /var/tmp/lab-hardening.XXXXXX)
+chmod 0700 "$stage"
+backup="/var/backups/lab-hardening/$(date -u +%Y%m%dT%H%M%SZ)-$$"
+install -d -m 0700 "$backup"
+hardening_exit=0
+trap 'hardening_exit=$?; rm -rf -- "$stage"; exit "$hardening_exit"' EXIT
+trap 'echo "ERROR: Hardening failed near guest line $LINENO. Guest preserved; config backups: $backup" >&2' ERR
+install -d -m 0755 /var/lib/lab-hardening
+if [[ $(systemctl show lab-hardening-check.timer -p LoadState --value) == loaded ]]; then
+  systemctl stop lab-hardening-check.timer
+  systemctl stop lab-hardening-check.service
+fi
+
+# APT package operations use locks, strict download errors, and report-only
+# needrestart. No dist-upgrade is performed late in an already running app install.
+apt-get -o DPkg::Lock::Timeout=120 -o APT::Update::Error-Mode=any update
+date +%s > "$stage/index-refreshed"
+apt-get -o DPkg::Lock::Timeout=120 install -y --no-install-recommends \
+  unattended-upgrades needrestart python3-apt ca-certificates procps
+
+mkdir -p "$stage/etc/apt/apt.conf.d" "$stage/etc/needrestart/conf.d" \
+  "$stage/etc/systemd/journald.conf.d" "$stage/etc/sysctl.d" \
+  "$stage/etc/systemd/system" "$stage/usr/local/sbin" "$stage/etc/update-motd.d"
+cat > "$stage/etc/apt/apt.conf.d/99-lab-hardening" <<'APT_POLICY'
+// Managed by lab-hardening-block.sh. Debian release stays fixed at trixie.
+#clear Unattended-Upgrade::Allowed-Origins;
+#clear Unattended-Upgrade::Origins-Pattern;
+Unattended-Upgrade::Origins-Pattern {
+  "origin=Debian,codename=trixie,label=Debian";
+  "origin=Debian,codename=trixie-updates,label=Debian";
+  "origin=Debian,codename=trixie-security,label=Debian-Security";
+};
+// Preserve deliberate package blacklists/holds; report them in the check.
+APT::Periodic::Enable "1";
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Unattended-Upgrade "1";
+APT::Periodic::AutocleanInterval "7";
+APT::Update::Error-Mode "any";
+Unattended-Upgrade::AutoFixInterruptedDpkg "true";
+Unattended-Upgrade::MinimalSteps "true";
+Unattended-Upgrade::InstallOnShutdown "false";
+Unattended-Upgrade::Remove-New-Unused-Dependencies "true";
+Unattended-Upgrade::Remove-Unused-Dependencies "false";
+Unattended-Upgrade::Remove-Unused-Kernel-Packages "false";
+Unattended-Upgrade::Automatic-Reboot "false";
+APT_POLICY
+cat > "$stage/etc/needrestart/conf.d/99-lab-hardening.conf" <<'NEEDRESTART_POLICY'
+# Report only. Package maintainer scripts may still restart their own services.
+$nrconf{restart} = 'l';
+NEEDRESTART_POLICY
+cat > "$stage/etc/systemd/journald.conf.d/99-lab-hardening.conf" <<JOURNAL_POLICY
+[Journal]
+Storage=persistent
+Compress=yes
+SystemMaxUse=${JOURNAL_MAX_MB}M
+SystemKeepFree=128M
+RuntimeMaxUse=${JOURNAL_RUNTIME_MB}M
+MaxRetentionSec=${JOURNAL_DAYS}day
+RateLimitIntervalSec=30s
+RateLimitBurst=10000
+JOURNAL_POLICY
+
+# ── Network policy ───────────────────────────────────────────────────────────
+cat > "$stage/etc/sysctl.d/99-hardening.conf" <<SYSCTL_POLICY
+# Managed by lab-hardening-block.sh: non-routing Debian 13 LXC.
+# Forwarding comes first because changing it can reset IPv4 interface settings.
+net.ipv4.ip_forward = 0
+net.ipv4.conf.all.forwarding = 0
+net.ipv4.conf.default.forwarding = 0
+net.ipv4.conf.*.forwarding = 0
+net.ipv6.conf.all.forwarding = 0
+net.ipv6.conf.default.forwarding = 0
+net.ipv6.conf.*.forwarding = 0
+net.ipv4.conf.all.rp_filter = $RP_FILTER
+net.ipv4.conf.default.rp_filter = $RP_FILTER
+net.ipv4.conf.*.rp_filter = $RP_FILTER
+net.ipv4.conf.all.accept_redirects = 0
+net.ipv4.conf.default.accept_redirects = 0
+net.ipv4.conf.*.accept_redirects = 0
+net.ipv4.conf.all.send_redirects = 0
+net.ipv4.conf.default.send_redirects = 0
+net.ipv4.conf.*.send_redirects = 0
+net.ipv4.conf.all.accept_source_route = 0
+net.ipv4.conf.default.accept_source_route = 0
+net.ipv4.conf.*.accept_source_route = 0
+net.ipv6.conf.all.accept_redirects = 0
+net.ipv6.conf.default.accept_redirects = 0
+net.ipv6.conf.*.accept_redirects = 0
+# -1 rejects all IPv6 routing headers; 0 would still accept type 2.
+net.ipv6.conf.all.accept_source_route = -1
+net.ipv6.conf.default.accept_source_route = -1
+net.ipv6.conf.*.accept_source_route = -1
+net.ipv4.tcp_syncookies = 1
+net.ipv4.icmp_echo_ignore_broadcasts = 1
+net.ipv4.icmp_ignore_bogus_error_responses = 1
+# Preserve IPv6 addressing, router advertisements, autoconf and DHCP.
+SYSCTL_POLICY
+
+# ── APT readiness wrapper ─────────────────────────────────────────────────────
+# No network-manager disabling, DHCP changes or network restarts. Re-evaluate
+# ownership on every APT run; delegate to Debian's helper unless proven safe.
+cat > "$stage/usr/local/sbin/lab-apt-wait-online" <<'APT_WAIT_HELPER'
+#!/usr/bin/python3
+import json
+import os
+import subprocess
+os.environ['LC_ALL'] = 'C'
+os.environ['PATH'] = '/usr/sbin:/usr/bin:/sbin:/bin'
+
+def capture(args):
+    return subprocess.run(args, text=True, capture_output=True, timeout=15, check=True).stdout
+
+try:
+    if capture(['systemd-detect-virt', '--container']).strip() == 'lxc':
+        capture(['systemctl', 'is-active', 'networking.service'])
+        rows = [line.split() for line in capture(
+            ['networkctl', 'list', '--no-legend', '--no-pager']).splitlines() if line.strip()]
+        # An unfamiliar output shape cannot authorize bypassing the stock check.
+        if rows and all(len(row) == 5 and row[4] == 'unmanaged' for row in rows):
+            configured = set(capture(['ifquery', '--list']).split())
+            addresses = json.loads(capture(['ip', '-j', '-4', 'address', 'show']))
+            routes = json.loads(capture(['ip', '-j', '-4', 'route', 'show', 'default']))
+            for link in addresses:
+                name = link['ifname']
+                if (name in configured and 'UP' in link.get('flags', [])
+                        and any(a.get('scope') == 'global' for a in link.get('addr_info', []))
+                        and any(r.get('dev') == name for r in routes)):
+                    capture(['ifquery', '--state', name])
+                    raise SystemExit(0)
+except (OSError, subprocess.SubprocessError, ValueError, KeyError):
+    pass
+os.execv('/usr/lib/apt/apt-helper', ['apt-helper', 'wait-online'])
+APT_WAIT_HELPER
+# Only replace Debian's single stock pre-check, or our own earlier wrapper.
+# Preserve unknown/custom ExecStartPre sequences by refusing to replace them.
+for unit in apt-daily.service apt-daily-upgrade.service; do
+  systemctl show "$unit" -p ExecStartPre --value > "$stage/precheck"
+  python3 - "$stage/precheck" <<'APT_PRECHECK'
+import pathlib, re, sys
+text = pathlib.Path(sys.argv[1]).read_text()
+paths = re.findall(r'path=([^ ;]+)', text)
+if paths not in (['/usr/lib/apt/apt-helper'], ['/usr/local/sbin/lab-apt-wait-online']):
+    raise SystemExit('ERROR: Custom APT ExecStartPre detected; preserve it and review integration.')
+if paths == ['/usr/lib/apt/apt-helper'] and not re.search(r'argv\[\]=/usr/lib/apt/apt-helper wait-online\s*;', text):
+    raise SystemExit('ERROR: Unexpected apt-helper pre-check arguments.')
+APT_PRECHECK
+  mkdir -p "$stage/etc/systemd/system/$unit.d"
+  cat > "$stage/etc/systemd/system/$unit.d/90-lab-readiness.conf" <<'APT_DROPIN'
+[Service]
+ExecStartPre=
+ExecStartPre=-/usr/local/sbin/lab-apt-wait-online
+APT_DROPIN
+done
+
+# ── Reusable verification/report helper ────────────────────────────────────────
+# This helper reads policy/runtime state. Its only writes are its lock and report.
+# It never changes firewall rules, installs updates or restarts applications.
+cat > "$stage/usr/local/sbin/lab-hardening-check" <<'CHECK_HELPER'
+#!/usr/bin/python3
+import fcntl
+import glob
+import hashlib
+import ipaddress
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+import time
+
+os.environ['LC_ALL'] = 'C'
+os.environ['PATH'] = '/usr/sbin:/usr/bin:/sbin:/bin'
+
+STATE = Path('/var/lib/lab-hardening')
+errors, warnings, listeners = [], [], []
+
+def run(args, timeout=30):
+    try:
+        p = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+        return p.returncode, p.stdout.strip()
+    except (OSError, subprocess.SubprocessError) as exc:
+        errors.append(f'Cannot run {args[0]}: {exc}')
+        return 127, ''
+
+def require(condition, message):
+    if not condition:
+        errors.append(message)
+
+def read(path):
+    try:
+        return Path(path).read_text()
+    except OSError as exc:
+        errors.append(f'Cannot read {path}: {exc}')
+        return ''
+
+if os.geteuid() != 0:
+    raise SystemExit('Run lab-hardening-check as root.')
+lock = open(STATE / 'check.lock', 'a')
+try:
+    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except BlockingIOError:
+    raise SystemExit('A hardening check is already running.')
+try:
+    policy = json.loads(read(STATE / 'policy.json'))
+    for path, digest in policy['files'].items():
+        try:
+            require(hashlib.sha256(Path(path).read_bytes()).hexdigest() == digest,
+                    f'Managed file changed: {path}; review and rerun the hardening block.')
+        except OSError:
+            errors.append(f'Managed file missing: {path}')
+
+    # Runtime readback, including dotted interface names through procfs globbing.
+    for line in read('/etc/sysctl.d/99-hardening.conf').splitlines():
+        line = line.split('#', 1)[0].strip()
+        if not line:
+            continue
+        key, expected = (part.strip() for part in line.split('=', 1))
+        paths = glob.glob('/proc/sys/' + key.replace('.', '/'))
+        require(bool(paths), f'Required sysctl unavailable: {key}')
+        for path in paths:
+            require(read(path).strip() == expected, f'Sysctl mismatch: {path}, expected {expected}')
+
+    rc, status = run(['ufw', 'status'])
+    require(rc == 0 and 'Status: active' in status.splitlines(), 'UFW is inactive.')
+    ufw_defaults = read('/etc/default/ufw')
+    require(re.search(r'^IPV6=yes$', ufw_defaults, re.M), 'UFW IPv6 support disabled.')
+    require(re.search(r'^IPT_SYSCTL=$', ufw_defaults, re.M), 'UFW sysctl loading is enabled.')
+    for tool, prefix in [('iptables', 'ufw'), ('ip6tables', 'ufw6')]:
+        for chain in ['INPUT', 'FORWARD']:
+            rc, rules = run([tool, '-w', '5', '-S', chain])
+            require(rc == 0 and f'-P {chain} DROP' in rules.splitlines(), f'{tool} {chain} is not DROP.')
+        rc, _ = run([tool, '-w', '5', '-C', 'INPUT', '-j', prefix + '-before-input'])
+        require(rc == 0, f'{tool} UFW INPUT hook is missing.')
+        rc, _ = run([tool, '-w', '5', '-S', prefix + '-user-input'])
+        require(rc == 0, f'{tool} UFW user chain is missing.')
+
+    # APT lists are compared as sets: vendor/local duplication cannot widen policy.
+    import apt_pkg
+    apt_pkg.init()
+    cfg = apt_pkg.config
+    origins = {
+        'origin=Debian,codename=trixie,label=Debian',
+        'origin=Debian,codename=trixie-updates,label=Debian',
+        'origin=Debian,codename=trixie-security,label=Debian-Security',
+    }
+    require(set(cfg.value_list('Unattended-Upgrade::Origins-Pattern')) == origins,
+            'Effective unattended-upgrade origins differ from policy.')
+    require(not cfg.value_list('Unattended-Upgrade::Allowed-Origins'), 'Additional legacy Allowed-Origins exist.')
+    for key, expected in {
+        'APT::Periodic::Enable': '1', 'APT::Periodic::Update-Package-Lists': '1',
+        'APT::Periodic::Unattended-Upgrade': '1', 'APT::Periodic::AutocleanInterval': '7',
+        'APT::Update::Error-Mode': 'any',
+        'Unattended-Upgrade::Automatic-Reboot': 'false',
+        'Unattended-Upgrade::InstallOnShutdown': 'false',
+        'Unattended-Upgrade::Remove-New-Unused-Dependencies': 'true',
+        'Unattended-Upgrade::Remove-Unused-Dependencies': 'false',
+        'Unattended-Upgrade::Remove-Unused-Kernel-Packages': 'false',
+    }.items():
+        require(cfg.find(key) == expected, f'APT policy conflict: {key}')
+    if cfg.value_list('Unattended-Upgrade::Package-Blacklist'):
+        warnings.append('An unattended-upgrades blacklist is active; review excluded packages.')
+    if cfg.value_list('Unattended-Upgrade::Package-Whitelist'):
+        warnings.append('An unattended-upgrades whitelist is active; review update coverage.')
+    rc, holds = run(['apt-mark', 'showhold'])
+    require(rc == 0, 'Cannot inspect held packages.')
+    if holds:
+        warnings.append('Held packages: ' + ', '.join(holds.splitlines()))
+    for unit in ['ufw.service', 'unattended-upgrades.service', 'apt-daily.timer',
+                 'apt-daily-upgrade.timer', 'lab-hardening-check.timer']:
+        require(run(['systemctl', 'is-enabled', '--quiet', unit])[0] == 0, f'{unit} is not enabled.')
+        require(run(['systemctl', 'is-active', '--quiet', unit])[0] == 0, f'{unit} is not active.')
+    for unit in ['apt-daily.service', 'apt-daily-upgrade.service']:
+        rc, result = run(['systemctl', 'show', unit, '-p', 'Result', '--value'])
+        require(rc == 0 and result == 'success', f'{unit} last result: {result or "unknown"}')
+    now = time.time()
+    stamps = [Path('/var/lib/apt/periodic/update-stamp'), STATE / 'last-index-refresh']
+    last_refresh = max((p.stat().st_mtime for p in stamps if p.exists()), default=0)
+    require(now - last_refresh <= policy['update_max_age_hours'] * 3600,
+            'APT indexes have no recent recorded refresh; inspect apt-daily.service.')
+
+    # Verify the merged journald settings; commented defaults are not assignments.
+    rc, journal = run(['systemd-analyze', 'cat-config', 'systemd/journald.conf'])
+    require(rc == 0, 'Cannot inspect journald policy.')
+    effective = {}
+    section = ''
+    for line in journal.splitlines():
+        line = line.strip()
+        if line.startswith('['):
+            section = line
+        elif section == '[Journal]' and '=' in line and not line.startswith(('#', ';')):
+            k, v = line.split('=', 1)
+            effective[k.strip()] = v.strip()
+    for key, expected in policy['journal'].items():
+        require(effective.get(key) == expected, f'Journald policy conflict: {key}')
+    require(run(['systemctl', 'is-active', '--quiet', 'systemd-journald.service'])[0] == 0,
+            'Journald is not active.')
+    require(bool(glob.glob('/var/log/journal/*/*.journal')), 'Persistent journal files are missing.')
+
+    removed = []
+    if not policy['keep_ssh']:
+        removed.append('openssh-server')
+    if policy['remove_postfix']:
+        removed.append('postfix')
+    for package in removed:
+        _, status = run(['dpkg-query', '-W', '-f=${db:Status-Status}', package])
+        require(status != 'installed', f'Unwanted package installed: {package}')
+    if not policy['keep_ssh']:
+        for unit in ['ssh.service', 'ssh.socket']:
+            require(run(['systemctl', 'is-enabled', unit])[1] == 'masked', f'{unit} is not masked.')
+            require(run(['systemctl', 'is-active', '--quiet', unit])[0] != 0, f'{unit} is active.')
+
+    # Inventory excludes loopback; optional port lists verify external listeners.
+    rc, sockets = run(['ss', '-H', '-lntu'])
+    require(rc == 0, 'Cannot inspect listening sockets.')
+    for line in sockets.splitlines():
+        fields = line.split()
+        if len(fields) < 5:
+            errors.append('Unrecognized ss output.')
+            continue
+        proto, endpoint = fields[0], fields[4]
+        addr, port = endpoint.rsplit(':', 1)
+        # ss may print [IPv6]%interface:port or [IPv6%interface]:port.
+        addr = addr.split('%', 1)[0].strip('[]')
+        try:
+            if ipaddress.ip_address(addr).is_loopback:
+                continue
+        except ValueError:
+            if addr != '*':
+                errors.append(f'Unrecognized socket address: {addr}')
+        listeners.append(f'{proto} {endpoint}')
+        allowed = policy.get(proto + '_ports', [])
+        if allowed:
+            require(int(port) in allowed, f'Unexpected external listener: {proto} {endpoint}')
+    # needrestart's explicit batch/list mode cannot restart applications.
+    rc, restart = run(['needrestart', '-b', '-r', 'l', '-l'], timeout=90)
+    require(rc == 0, 'needrestart report failed.')
+    requests = [line for line in restart.splitlines()
+                if line.startswith(('NEEDRESTART-SVC:', 'NEEDRESTART-CONT:', 'NEEDRESTART-SESS:'))]
+    if requests:
+        warnings.append('Processes need a reviewed restart: ' + '; '.join(requests))
+except Exception as exc:
+    errors.append(f'Check could not complete: {type(exc).__name__}: {exc}')
+
+status = 'FAIL' if errors else ('WARN' if warnings else 'OK')
+report = {'status': status, 'checked_at': int(time.time()), 'errors': errors,
+          'warnings': warnings, 'external_listeners': listeners}
+temporary = STATE / ('status.' + str(os.getpid()) + '.tmp')
+temporary.write_text(json.dumps(report, indent=2) + '\n')
+temporary.chmod(0o644)
+os.replace(temporary, STATE / 'status.json')
+print('Lab hardening: ' + status)
+for entry in errors:
+    print('ERROR: ' + entry)
+for entry in warnings:
+    print('WARNING: ' + entry)
+print('External listeners: ' + (', '.join(listeners) or 'none'))
+raise SystemExit(1 if errors else 0)
+CHECK_HELPER
+
+cat > "$stage/etc/systemd/system/lab-hardening-check.service" <<'CHECK_SERVICE'
+[Unit]
+Description=Verify lab hardening and report update/restart status
+After=network.target systemd-journal-flush.service
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/lab-hardening-check
+Nice=10
+TimeoutStartSec=240
+StandardOutput=journal
+StandardError=journal
+CHECK_SERVICE
+cat > "$stage/etc/systemd/system/lab-hardening-check.timer" <<'CHECK_TIMER'
+[Unit]
+Description=Check lab hardening after boot and hourly
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=1h
+RandomizedDelaySec=60
+Unit=lab-hardening-check.service
+[Install]
+WantedBy=timers.target
+CHECK_TIMER
+cat > "$stage/etc/update-motd.d/25-lab-hardening" <<'MOTD_HELPER'
+#!/usr/bin/python3
+import json
+from pathlib import Path
+import time
+try:
+    p = json.loads(Path('/var/lib/lab-hardening/status.json').read_text())
+    stale = time.time() - p['checked_at'] > 3 * 3600
+    print('  Hardening: ' + ('STALE' if stale else p['status'])
+          + ' | root check: /usr/local/sbin/lab-hardening-check')
+except (OSError, ValueError, KeyError):
+    print('  Hardening: not yet verified | root check: /usr/local/sbin/lab-hardening-check')
+MOTD_HELPER
+
+# ── Install managed files atomically, preserving previous configuration ────────
+python3 - "$stage" "$backup" <<'INSTALL_FILES'
+import os, pathlib, shutil, sys, tempfile
+stage, backup = map(pathlib.Path, sys.argv[1:])
+for source in sorted(stage.rglob('*')):
+    if not source.is_file() or source.parent == stage:
+        continue
+    relative = source.relative_to(stage)
+    target = pathlib.Path('/') / relative
+    if target.is_symlink():
+        raise SystemExit(f'ERROR: Refusing to overwrite symlink: {target}')
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if target.exists():
+        saved = backup / relative
+        saved.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(target, saved)
+    fd, temporary = tempfile.mkstemp(prefix='.lab-hardening-', dir=target.parent)
+    try:
+        with os.fdopen(fd, 'wb') as out:
+            out.write(source.read_bytes())
+        mode = 0o755 if str(relative).startswith(('usr/local/sbin/', 'etc/update-motd.d/')) else 0o644
+        os.chmod(temporary, mode)
+        os.replace(temporary, target)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+# Preserve all UFW policy/rules; only stop its competing sysctl loader.
+target = pathlib.Path('/etc/default/ufw')
+saved = backup / 'etc/default/ufw'
+saved.parent.mkdir(parents=True, exist_ok=True)
+shutil.copy2(target, saved)
+import re
+text, count = re.subn(r'^IPT_SYSCTL=.*$', 'IPT_SYSCTL=', target.read_text(), flags=re.M)
+if count != 1:
+    raise SystemExit('ERROR: Expected one IPT_SYSCTL assignment in /etc/default/ufw.')
+fd, temporary = tempfile.mkstemp(prefix='.lab-ufw-', dir=target.parent)
+with os.fdopen(fd, 'w') as out:
+    out.write(text)
+os.chmod(temporary, target.stat().st_mode & 0o777)
+os.replace(temporary, target)
+INSTALL_FILES
+install -m 0644 "$stage/index-refreshed" /var/lib/lab-hardening/last-index-refresh
+
+# ── Remove and verify unwanted services ───────────────────────────────────────
+remove_packages=()
+if [[ $KEEP_SSH == 0 ]]; then
+  for unit in ssh.service ssh.socket; do
+    if [[ $(systemctl show "$unit" -p LoadState --value) != not-found ]]; then
+      systemctl stop "$unit"
+    fi
+  done
+  remove_packages+=(openssh-server)
+fi
+[[ $REMOVE_POSTFIX == 0 ]] || remove_packages+=(postfix)
+installed_remove=()
+for package in "${remove_packages[@]}"; do
+  if [[ $(dpkg-query -W -f='${db:Status-Status}' "$package" 2>/dev/null || true) == installed ]]; then
+    installed_remove+=("$package")
+  fi
+done
+if (( ${#installed_remove[@]} > 0 )); then
+  # No blanket autoremove: apps outside dpkg may use packages marked automatic.
+  apt-get -o DPkg::Lock::Timeout=120 purge -y "${installed_remove[@]}"
+fi
+if [[ $KEEP_SSH == 0 ]]; then
+  systemctl mask ssh.service ssh.socket
+fi
+
+# ── Activate common policy ────────────────────────────────────────────────────
+systemctl daemon-reload
+install -d -o root -g systemd-journal -m 2755 /var/log/journal
+systemctl restart systemd-journald.service
+journalctl --flush
+/usr/lib/systemd/systemd-sysctl --strict --prefix=/net/ipv4 --prefix=/net/ipv6
+systemctl enable --now unattended-upgrades.service apt-daily.timer apt-daily-upgrade.timer
+echo 'Checking unattended upgrades without installing updates...'
+if ! timeout 300 unattended-upgrade --dry-run --debug > "$backup/unattended-dry-run.log" 2>&1; then
+  tail -n 40 "$backup/unattended-dry-run.log" >&2
+  false
+fi
+
+# Store expected settings and file hashes for drift detection. No secrets.
+python3 - "$stage" "$PROFILE" "$KEEP_SSH" "$REMOVE_POSTFIX" "$JOURNAL_DAYS" \
+  "$JOURNAL_MAX_MB" "$JOURNAL_RUNTIME_MB" "$UPDATE_MAX_AGE" "$TCP_PORTS" "$UDP_PORTS" <<'SAVE_POLICY'
+import hashlib, json, os, pathlib, sys
+stage = pathlib.Path(sys.argv[1])
+_, _, profile, keep, remove, days, maximum, runtime, age, tcp, udp = sys.argv
+files = {}
+for source in stage.rglob('*'):
+    if source.is_file() and source.parent != stage:
+        target = pathlib.Path('/') / source.relative_to(stage)
+        files[str(target)] = hashlib.sha256(target.read_bytes()).hexdigest()
+policy = {'profile': profile, 'keep_ssh': keep == '1', 'remove_postfix': remove == '1',
+          'update_max_age_hours': int(age), 'tcp_ports': list(map(int, tcp.split())),
+          'udp_ports': list(map(int, udp.split())), 'files': files,
+          'journal': {'Storage': 'persistent', 'Compress': 'yes', 'SystemMaxUse': maximum + 'M',
+                      'SystemKeepFree': '128M', 'RuntimeMaxUse': runtime + 'M',
+                      'MaxRetentionSec': days + 'day', 'RateLimitIntervalSec': '30s', 'RateLimitBurst': '10000'}}
+target = pathlib.Path('/var/lib/lab-hardening/policy.json')
+temporary = target.with_suffix('.tmp')
+temporary.write_text(json.dumps(policy, indent=2) + '\n')
+temporary.chmod(0o644)
+os.replace(temporary, target)
+SAVE_POLICY
+systemctl enable --now lab-hardening-check.timer
+if ! systemctl start lab-hardening-check.service; then
+  journalctl -u lab-hardening-check.service -n 50 --no-pager >&2
+  false
+fi
+cat /var/lib/lab-hardening/status.json
+printf '\nShared hardening applied (%s). Backups: %s\n' "$PROFILE" "$backup"
+echo 'Manual check: /usr/local/sbin/lab-hardening-check'
+echo 'Local reports: /var/lib/lab-hardening/status.json and journalctl -u lab-hardening-check'
+echo 'Application image updates, source-specific UFW rules and app health remain with the creator.'
+LAB_HARDENING_GUEST
+)
+# ── End shared hardening block ────────────────────────────────────────────────
+# END APPROVED BASELINE: lab-hardening-block-v1.1.1.sh
+
+STAGE="final verification"
+UFW_FILES_AFTER=$(pct exec "$CT_ID" -- sha256sum /etc/ufw/before.rules /etc/ufw/after.rules /etc/ufw/user.rules /etc/ufw/before6.rules /etc/ufw/after6.rules /etc/ufw/user6.rules)
+UFW_V4_AFTER=$(pct exec "$CT_ID" -- iptables -w 5 -S)
+UFW_V6_AFTER=$(pct exec "$CT_ID" -- ip6tables -w 5 -S)
+[[ $UFW_FILES_BEFORE == "$UFW_FILES_AFTER" && $UFW_V4_BEFORE == "$UFW_V4_AFTER" && $UFW_V6_BEFORE == "$UFW_V6_AFTER" ]] || {
+  echo "ERROR: Hardening changed persistent/effective UFW rules. CT preserved for diagnosis." >&2
+  false
+}
+pct exec "$CT_ID" -- /usr/local/sbin/matrix-verify
+# The common block already ran its check service: WARN is a successful outcome.
+HARDENING_STATUS=$(pct exec "$CT_ID" -- python3 -c 'import json; print(json.load(open("/var/lib/lab-hardening/status.json"))["status"])')
+[[ $HARDENING_STATUS == OK || $HARDENING_STATUS == WARN ]] || { echo "ERROR: Hardening did not pass." >&2; false; }
+echo "  UFW persistent/effective rules preserved; hardening: $HARDENING_STATUS"
+
 # ── Proxmox UI description ────────────────────────────────────────────────────
 LINK_STYLE="text-decoration: none; color: #00617f;"
 MX_DESC="Public: <a href='https://${ELEMENT_FQDN}/' target='_blank' rel='noopener noreferrer' style='${LINK_STYLE}'>Element Web</a> · <a href='https://${SYNAPSE_FQDN}/' target='_blank' rel='noopener noreferrer' style='${LINK_STYLE}'>Synapse</a>
-Backend ingress: UFW inside this CT; NPM source addresses only.
+Backend ingress: UFW inside this CT; ${FIREWALL_ACCESS}.
 <details><summary>Details</summary>Matrix Synapse + Element Web (Podman/Quadlet) on Debian ${DEBIAN_VERSION} LXC
 Server name: ${SYNAPSE_SERVER_NAME} | Synapse: ${SYNAPSE_TAG} | Element: ${ELEMENT_TAG} | PostgreSQL: ${POSTGRES_TAG}
 Created by matrix-quadlet.sh</details>"
@@ -1856,6 +2774,7 @@ pct exec "$CT_ID" -- bash -lc '
   grep -q "^export TERM=" /root/.bashrc 2>/dev/null || echo "export TERM=xterm-256color" >> /root/.bashrc
 '
 
+STAGE="success reporting"
 # ── Summary ───────────────────────────────────────────────────────────────────
 cat <<SUMMARY
 
@@ -1865,6 +2784,8 @@ cat <<SUMMARY
   HOMESERVER         https://${SYNAPSE_FQDN}/
   CONTAINER          $HN | CT $CT_ID | $CT_IP
   LOGIN              root password set
+  HARDENING          $HARDENING_STATUS (v1.1.1); SSH keep=$HARDENING_KEEP_SSH
+  LISTENER POLICY    TCP=${HARDENING_TCP_PORTS:-inventory-only}; UDP=${HARDENING_UDP_PORTS:-inventory-only}
   PERMANENT ID       @user:${SYNAPSE_SERVER_NAME}
 
   IMPORTANT: Keep this Matrix server name. It is part of every user's identity.
@@ -1877,7 +2798,7 @@ cat <<SUMMARY
        Matrix IPv4   $CT_IP
        NPM IPv4      ${BACKEND_ALLOWED_IPV4[*]}
        NPM IPv6      ${BACKEND_ALLOWED_IPV6[*]:-(none)}
-     NPM is the only permitted source for the two backend HTTP ports.
+     Selected backend access: $FIREWALL_ACCESS.
 
   2. CONFIGURE NGINX PROXY MANAGER (NPM)
 
@@ -1918,7 +2839,9 @@ cat <<SUMMARY
        curl -sS -o /dev/null -w 'HTTP %{http_code}\n' --max-time 5 http://${CT_IP}:${SYNAPSE_PORT}/health
        curl -sS -o /dev/null -w 'HTTP %{http_code}\n' --max-time 5 http://${CT_IP}:${ELEMENT_PORT}/
 
-     From another LAN machine, the same backend URLs must be blocked.
+     Restricted mode: other source hosts must be blocked on these URLs.
+     Any-source mode: these URLs are allowed from any routable source.
+     Element login still requires the public HTTPS domains above.
      Installer rule checks do not prove this full network path.
 
      Federation test (open in a browser):
@@ -2015,19 +2938,23 @@ cat <<SUMMARY
   FIREWALL AND TROUBLESHOOTING
 
      UFW filters IPv4 and IPv6 inside this CT. Incoming connections are denied
-     by default; only NPM may reach ports ${SYNAPSE_PORT} and ${ELEMENT_PORT}.
+     by default; ports ${SYNAPSE_PORT} and ${ELEMENT_PORT}: $FIREWALL_ACCESS.
      Outgoing traffic is allowed. Standard loopback, replies, DHCP and ICMP remain.
      PostgreSQL listens only on 127.0.0.1:5432, using SCRAM and a restricted role.
      No Proxmox Datacenter firewall switch or PVE firewall rules are required.
 
      RUN ON THE PROXMOX HOST:
        pct exec $CT_ID -- ufw status verbose
+       pct exec $CT_ID -- /usr/local/sbin/matrix-verify
+       pct exec $CT_ID -- /usr/local/sbin/lab-hardening-check
        pct enter $CT_ID
 
      INSIDE THE MATRIX CT -- follow Synapse logs (Ctrl+C stops following):
        journalctl -u matrix-synapse.service -f
 
-     NPM ADDRESS CHANGED? Run inside the Matrix CT.
+     NPM ADDRESS CHANGED? For a successfully installed CT, run inside it.
+     After a reviewed rule change, update the sources in
+     /opt/matrix/firewall-policy.json to match the intended policy.
      Replace NEW_NPM_IP and OLD_NPM_IP with the exact host addresses.
 
        FIRST add the new address:
