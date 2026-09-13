@@ -2,7 +2,7 @@
 set -Eeo pipefail
 umask 022
 export LC_ALL=C
-# Safety revision: 2026-09-13 r2; Podman process-verifier fix; approved hardening v1.1.1 integration. Fresh Proxmox CT creator; maintenance runs inside the CT.
+# Safety revision: 2026-09-13 r3; corrected shared hardening v1.1.2; Podman process-verifier fix retained. Fresh Proxmox CT creator; maintenance runs inside the CT.
 
 # ── Config ────────────────────────────────────────────────────────────────────
 CT_ID=""                             # empty = auto-assign via pvesh; set e.g. CT_ID=120 to pin
@@ -128,11 +128,12 @@ QUADLET_SERVICE="npm.service"
 #   /etc/systemd/journald.conf.d/99-lab-hardening.conf
 #   /etc/systemd/system/apt-daily{,-upgrade}.service.d/90-lab-readiness.conf
 #   /etc/systemd/system/lab-hardening-check.{service,timer}
-#   /usr/local/sbin/lab-{apt-wait-online,hardening-check}
+#   /usr/local/sbin/lab-{apt-wait-online,hardening-check,postfix-check}
 #   /etc/update-motd.d/25-lab-hardening
 #   /var/lib/lab-hardening/                       (policy, reports, lock, index-refresh stamp)
 #   /var/backups/lab-hardening/<run>/             (common configuration backups)
 #   /etc/systemd/system/ssh.{service,socket}      (masks when SSH is removed)
+#   /etc/systemd/system/postfix*.{service,socket,path} (masks when Postfix is removed)
 #   /etc/cloudflared/token                       (0600; optional)
 #   /etc/systemd/system/cloudflared.service       (optional native tunnel service)
 #   /etc/apt/sources.list.d/cloudflared.list       (optional)
@@ -308,7 +309,7 @@ cat <<EOF2
   App image:         $APP_IMAGE
   Admin port:        $APP_PORT (fixed by NPM)
   Database:          SQLite (embedded)
-  Hardening:         v1.1.1 | lxc | rp_filter=$HARDENING_RP_FILTER
+  Hardening:         v1.1.2 | lxc | rp_filter=$HARDENING_RP_FILTER
   Listener policy:   TCP=$HARDENING_TCP_PORTS | UDP=$HARDENING_UDP_PORTS
   Timezone:          $APP_TZ
   Disable IPv6 app:  $([ "$NPM_DISABLE_IPV6" -eq 1 ] && echo "yes" || echo "no")
@@ -1876,11 +1877,11 @@ target = pathlib.Path('/opt/npm/hardening-settings.json')
 target.write_text(json.dumps(dict(zip(('HARDENING_' + k for k in keys), sys.argv[1:])), indent=2) + '\n')
 target.chmod(0o600)
 NPM_HARDENING_SETTINGS
-STAGE="shared hardening v1.1.1"
-# BEGIN APPROVED STANDALONE HARDENING — all bytes between markers are unchanged
+STAGE="shared hardening v1.1.2"
+# BEGIN SHARED STANDALONE HARDENING — identical to the standalone v1.1.2 deliverable
 #!/usr/bin/env bash
 # ── Shared Debian 13 LXC hardening block ───────────────────────────────────────
-# Version: 1.1.1 (2026-09-12; scoped IPv6 listener parsing fix)
+# Version: 1.1.2 (2026-09-13; Postfix shutdown/runtime verification; retains IPv6 fix)
 # Paste this whole file AFTER the creator's MOTD/cleanup steps and BEFORE its
 # final verification/summary. Later MOTD code must not delete 25-lab-hardening.
 # Replace its old unattended-upgrades and sysctl sections with this block.
@@ -1910,9 +1911,10 @@ STAGE="shared hardening v1.1.1"
 #   /etc/systemd/journald.conf.d/99-lab-hardening.conf
 #   /etc/systemd/system/apt-daily{,-upgrade}.service.d/90-lab-readiness.conf (LXC)
 #   /etc/systemd/system/lab-hardening-check.{service,timer}
-#   /usr/local/sbin/lab-{apt-wait-online,hardening-check}
+#   /usr/local/sbin/lab-{apt-wait-online,hardening-check,postfix-check}
 #   /etc/update-motd.d/25-lab-hardening
 #   /etc/default/ufw (IPT_SYSCTL only); SSH service/socket masks (when SSH removed)
+#   /etc/systemd/system/postfix*.{service,socket,path} masks (when Postfix removed)
 #   /var/lib/lab-hardening/{policy.json,status.json,last-index-refresh,check.lock}
 #   /var/backups/lab-hardening/<run>/ (configuration copies and dry-run log)
 # References: Debian trixie apt.conf(5), systemd-sysctl(8), ifquery(8),
@@ -1998,7 +2000,7 @@ for port in $TCP_PORTS $UDP_PORTS; do
     echo 'ERROR: Port lists require space-separated numbers from 1 to 65535.' >&2; exit 1
   fi
 done
-for command in ufw iptables ip6tables ip ss sysctl python3 systemctl apt-get flock; do
+for command in ufw iptables ip6tables ip ss sysctl python3 systemctl apt-get flock timeout; do
   command -v "$command" >/dev/null || { echo "ERROR: Missing prerequisite: $command" >&2; exit 1; }
 done
 exec 9>/run/lock/lab-hardening-install.lock
@@ -2176,6 +2178,148 @@ ExecStartPre=-/usr/local/sbin/lab-apt-wait-online
 APT_DROPIN
 done
 
+# ── Postfix inventory and runtime verification (read-only) ────────────────────
+cat > "$stage/usr/local/sbin/lab-postfix-check" <<'POSTFIX_CHECK_HELPER'
+#!/usr/bin/python3
+"""Read-only Postfix inventory and removal checks for the native Debian service."""
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+
+os.environ['LC_ALL'] = 'C'
+os.environ['PATH'] = '/usr/sbin:/usr/bin:/sbin:/bin'
+STANDARD_UNITS = {
+    'postfix.service', 'postfix@.service',
+    'postfix.socket', 'postfix@.socket',
+    'postfix-resolvconf.service', 'postfix-resolvconf.path',
+}
+INSTANCE = re.compile(r'postfix@[^/\s]+\.(?:service|socket)')
+TEMPLATES = {'postfix@.service', 'postfix@.socket'}
+# Debian's packaged daemon names are only an ambiguity guard when procfs denies
+# executable inspection, never sufficient identity for stopping/killing a PID.
+DAEMON_NAMES = {'master', 'anvil', 'bounce', 'cleanup', 'discard', 'dnsblog', 'error',
+                'flush', 'fsstone', 'lmtp', 'local', 'nqmgr', 'oqmgr', 'pickup', 'pipe',
+                'postlogd', 'postscreen', 'proxymap', 'qmgr', 'qmqpd', 'scache', 'showq',
+                'smtp', 'smtpd', 'spawn', 'tlsmgr', 'tlsproxy', 'trivial-rewrite',
+                'verify', 'virtual', 'postfix', 'postmulti', 'postdrop', 'postqueue'}
+
+def is_postfix_unit(name):
+    return name in STANDARD_UNITS or INSTANCE.fullmatch(name) is not None
+
+def command(args):
+    result = subprocess.run(args, capture_output=True, text=True, timeout=30)
+    if result.returncode:
+        raise RuntimeError(f'{" ".join(args)} exited {result.returncode}: '
+                           + (result.stderr.strip()[:1500] or '(no stderr)'))
+    return result.stdout
+
+try:
+    if os.geteuid() != 0:
+        raise ValueError('Root is required to inspect process ownership.')
+    if len(sys.argv) != 2 or sys.argv[1] not in {
+            '--units', '--stop-units', '--check-stopped', '--check-removed'}:
+        raise ValueError('Use --units, --stop-units, --check-stopped or --check-removed.')
+    mode = sys.argv[1]
+    runtime = {}
+    # Include not-found/masked units that systemd still has in memory. Never
+    # equate LoadState=not-found or package absence with a stopped service.
+    output = command(['systemctl', 'list-units', '--all', '--plain', '--full',
+                      '--no-legend', '--no-pager', 'postfix*'])
+    for line in output.splitlines():
+        fields = line.split()
+        if not fields:
+            continue
+        if len(fields) < 4:
+            raise ValueError('Malformed systemd unit inventory.')
+        unit, load, active, sub = fields[:4]
+        if is_postfix_unit(unit):
+            runtime[unit] = (load, active, sub)
+    units = set(STANDARD_UNITS) | runtime.keys()
+    if mode in {'--units', '--check-removed'}:
+        output = command(['systemctl', 'list-unit-files', '--full', '--no-legend',
+                          '--no-pager', 'postfix*'])
+        for line in output.splitlines():
+            fields = line.split()
+            if fields and is_postfix_unit(fields[0]):
+                units.add(fields[0])
+    if mode == '--units':
+        print('\n'.join(sorted(units)))
+        raise SystemExit(0)
+    if mode == '--stop-units':
+        # Only instantiated runtime units need stopping. Templates cannot run;
+        # absent/inactive units would make systemctl stop fail needlessly.
+        pending = [unit for unit, (_, active, _) in runtime.items()
+                   if unit not in TEMPLATES and active != 'inactive']
+        print('\n'.join(sorted(pending, key=lambda u: (u.endswith('.service'), u))))
+        raise SystemExit(0)
+
+    errors = []
+    for unit, (load, active, sub) in sorted(runtime.items()):
+        if active != 'inactive':
+            errors.append(f'{unit}: LoadState={load}, ActiveState={active}, SubState={sub}')
+    # Executable paths catch detached daemons and deleted executables. Cgroup
+    # membership catches remaining workers even if the unit file has vanished.
+    # Do not match a bare process name such as "master" and never signal a PID.
+    for process in Path('/proc').iterdir():
+        if not process.name.isdecimal():
+            continue
+        try:
+            groups = process.joinpath('cgroup').read_text()
+            try:
+                executable = os.readlink(process / 'exe').removesuffix(' (deleted)')
+            except FileNotFoundError:
+                executable = ''  # exited process, kernel thread or zombie
+            except PermissionError:
+                executable = ''
+                # LXC root need not have ptrace access to every unrelated
+                # process. Keep cgroup detection and fail on ambiguous daemon
+                # names instead of requiring extra CT capabilities.
+                name = process.joinpath('comm').read_text().strip()
+                if name in DAEMON_NAMES:
+                    errors.append(f'Cannot exclude a Postfix process: PID={process.name}, '
+                                  f'comm={name}; executable inspection denied')
+            group_owned = any(is_postfix_unit(component)
+                              for line in groups.splitlines()
+                              for component in line.split(':', 2)[-1].split('/'))
+            exe_owned = (executable.startswith(('/usr/lib/postfix/', '/usr/libexec/postfix/'))
+                         or executable in {'/usr/sbin/postfix', '/usr/sbin/postmulti',
+                                           '/usr/sbin/postdrop', '/usr/sbin/postqueue'})
+            if group_owned or exe_owned:
+                errors.append(f'Postfix process remains: PID={process.name}, '
+                              f'executable={executable or "unavailable"}')
+        except FileNotFoundError:
+            continue  # process exited during the read-only scan
+        except OSError as exc:
+            errors.append(f'Cannot inspect PID {process.name}: {exc.strerror}')
+    if mode == '--check-removed':
+        package = subprocess.run(['dpkg-query', '-W', '-f=${db:Status-Status}', 'postfix'],
+                                 capture_output=True, text=True, timeout=30)
+        absent = (package.returncode == 0 and package.stdout.strip() == 'not-installed')
+        absent = absent or (package.returncode == 1 and not package.stdout.strip()
+                            and package.stderr.strip() == 'dpkg-query: no packages found matching postfix')
+        if not absent:
+            errors.append('Postfix package is not confirmed purged: '
+                          + (package.stdout.strip() or package.stderr.strip()[:500] or 'unknown status'))
+        for unit in sorted(units):
+            # is-enabled returns nonzero for masked units; validate its text
+            # and reject runtime-only masks, which would disappear at boot.
+            result = subprocess.run(['systemctl', 'is-enabled', unit],
+                                    capture_output=True, text=True, timeout=30)
+            if result.returncode not in (0, 1) or result.stdout.strip() != 'masked':
+                errors.append(f'Persistent Postfix mask missing: {unit}')
+    if errors:
+        for error in errors:
+            print('ERROR: ' + error, file=sys.stderr)
+        raise SystemExit(1)
+    print('Postfix units and processes stopped.' if mode == '--check-stopped' else
+          'Postfix package purged; units masked; no remaining Postfix processes.')
+except Exception as exc:
+    print('ERROR: Postfix verification: ' + str(exc), file=sys.stderr)
+    raise SystemExit(1)
+POSTFIX_CHECK_HELPER
+
 # ── Reusable verification/report helper ────────────────────────────────────────
 # This helper reads policy/runtime state. Its only writes are its lock and report.
 # It never changes firewall rules, installs updates or restarts applications.
@@ -2334,6 +2478,14 @@ try:
             require(run(['systemctl', 'is-enabled', unit])[1] == 'masked', f'{unit} is not masked.')
             require(run(['systemctl', 'is-active', '--quiet', unit])[0] != 0, f'{unit} is active.')
 
+    if policy['remove_postfix']:
+        # Keep the detailed diagnostic in the hardening report. This helper is
+        # read-only and checks runtime units/processes even after package purge.
+        postfix = subprocess.run(['/usr/local/sbin/lab-postfix-check', '--check-removed'],
+                                 capture_output=True, text=True, timeout=90)
+        require(postfix.returncode == 0,
+                'Postfix removal incomplete: ' + (postfix.stderr.strip()[:4000] or 'verification failed'))
+
     # Inventory excludes loopback; optional port lists verify external listeners.
     rc, sockets = run(['ss', '-H', '-lntu'])
     require(rc == 0, 'Cannot inspect listening sockets.')
@@ -2464,6 +2616,22 @@ install -m 0644 "$stage/index-refreshed" /var/lib/lab-hardening/last-index-refre
 
 # ── Remove and verify unwanted services ───────────────────────────────────────
 remove_packages=()
+if [[ $REMOVE_POSTFIX == 1 ]]; then
+  # Scope operations to known Debian Postfix units and actual instances only.
+  # Read inventory before masking/purging; a not-found unit can still be active.
+  postfix_unit_text=$(/usr/local/sbin/lab-postfix-check --units)
+  mapfile -t postfix_units <<< "$postfix_unit_text"
+  postfix_stop_text=$(/usr/local/sbin/lab-postfix-check --stop-units)
+  if [[ -n $postfix_stop_text ]]; then
+    mapfile -t postfix_stop_units <<< "$postfix_stop_text"
+    echo 'Stopping Postfix units before package removal...'
+    timeout 60 systemctl stop "${postfix_stop_units[@]}"
+  fi
+  # Mask without --force: never overwrite a local custom unit. No blanket
+  # process-name kills. If stopping or masking fails, preserve the CT and fail.
+  systemctl mask "${postfix_units[@]}"
+  /usr/local/sbin/lab-postfix-check --check-stopped
+fi
 if [[ $KEEP_SSH == 0 ]]; then
   for unit in ssh.service ssh.socket; do
     if [[ $(systemctl show "$unit" -p LoadState --value) != not-found ]]; then
@@ -2475,7 +2643,10 @@ fi
 [[ $REMOVE_POSTFIX == 0 ]] || remove_packages+=(postfix)
 installed_remove=()
 for package in "${remove_packages[@]}"; do
-  if [[ $(dpkg-query -W -f='${db:Status-Status}' "$package" 2>/dev/null || true) == installed ]]; then
+  package_status=$(dpkg-query -W -f='${db:Status-Status}' "$package" 2>/dev/null || true)
+  if [[ $package_status == installed ]] ||
+     [[ $package == postfix && -n $package_status && $package_status != not-installed ]]; then
+    # Include Postfix config-files/partial states, not just fully installed.
     installed_remove+=("$package")
   fi
 done
@@ -2489,6 +2660,11 @@ fi
 
 # ── Activate common policy ────────────────────────────────────────────────────
 systemctl daemon-reload
+if [[ $REMOVE_POSTFIX == 1 ]]; then
+  # Package maintainer scripts can remove a mask; restore our explicit policy.
+  systemctl mask "${postfix_units[@]}"
+  /usr/local/sbin/lab-postfix-check --check-removed
+fi
 install -d -o root -g systemd-journal -m 2755 /var/log/journal
 systemctl restart systemd-journald.service
 journalctl --flush
@@ -2536,7 +2712,7 @@ echo 'Application image updates, source-specific UFW rules and app health remain
 LAB_HARDENING_GUEST
 )
 # ── End shared hardening block ────────────────────────────────────────────────
-# END APPROVED STANDALONE HARDENING
+# END SHARED STANDALONE HARDENING
 
 # ── Final application and firewall verification ───────────────────────────────
 STAGE="final verification"
@@ -2601,7 +2777,7 @@ cat <<OPERATIONS
     ufw status verbose
     journalctl -u npm.service --no-pager -n 80
 
-  HARDENING     v1.1.1; non-routing LXC; TCP [$HARDENING_TCP_PORTS], UDP [$HARDENING_UDP_PORTS]
+  HARDENING     v1.1.2; non-routing LXC; TCP [$HARDENING_TCP_PORTS], UDP [$HARDENING_UDP_PORTS]
                 /usr/local/sbin/lab-hardening-check (WARN may mean reviewed restarts)
   STREAMS       Additional TCP/UDP streams need explicit listener policy AND
                 separate source-specific UFW rules; NPM UI changes neither policy.
