@@ -2,7 +2,13 @@
 set -Eeo pipefail
 umask 022
 export LC_ALL=C
-# Safety revision: 2026-09-11. Fresh Proxmox CT creator; maintenance runs inside the CT.
+# Hardening integration: 2026-09-15. Fresh Proxmox CT creator.
+# Input: searxng-quadlet(2).sh; original script name: searxng-quadlet.sh.
+# Common block v1.2.0, SHA-256:
+# c1255455c38d2e3d95f25491664912513db437dfa20da8d6e62730eb951276b4
+# User-authorized timezone port from native Debian v1.0.3; LXC scope retained.
+# SearXNG startup: explicit image-derived non-root UID/GID and GRANIAN_HOST.
+# Matching source/fixture checks completed; a fresh live LXC test remains required.
 
 # ── Config ────────────────────────────────────────────────────────────────────
 CT_ID=""                             # empty = auto-assign via pvesh; set e.g. CT_ID=120 to pin
@@ -16,7 +22,9 @@ CONTAINER_STORAGE="local-lvm"
 
 # SearXNG / Podman + Quadlet
 APP_PORT=8080                        # SearXNG binds this port on the CT interface (Network=host)
-APP_TZ="Europe/Berlin"
+SERVER_TIMEZONE="${SERVER_TIMEZONE-Europe/Berlin}"
+PRESERVE_EXISTING_TIMEZONE="${PRESERVE_EXISTING_TIMEZONE-0}" # 0=set; 1=keep guest zone
+APP_TZ=""                           # derived from the guest timezone plan; do not set directly
 APP_FQDN=""                          # e.g. search.example.com ; blank = local IP mode
                                      # set → base_url=https://FQDN/ and public_instance: true (link_token bot detection)
 INSTANCE_NAME="SearXNG"              # shown in the web UI title and results page
@@ -69,7 +77,7 @@ EXTRA_PACKAGES=(
 )
 
 # Behavior
-CLEANUP_ON_FAIL=1
+CLEANUP_ON_FAIL=0                    # preserve failed CTs for diagnosis (also disarmed before startup)
 
 
 # Service verification and in-CT firewall
@@ -81,6 +89,21 @@ UPDATE_WAIT_SECONDS=1800             # permit migrations; a timeout does not sto
 UFW_ALLOWED_SOURCES=()
 SCRIPT_URL="https://raw.githubusercontent.com/vdarkobar/scripts/main/bash/searxng-quadlet.sh"
 SCRIPT_LOCAL="/root/searxng-quadlet.sh"
+
+# Shared LXC hardening (the embedded block retains its own unchanged defaults)
+HARDENING_PROFILE="lxc"              # Debian 13 service LXC; no forwarding
+HARDENING_RP_FILTER=1                # 1=strict; 2=loose for asymmetric paths
+HARDENING_KEEP_SSH=0                 # 0=remove SSH; 1=preserve, without opening UFW
+HARDENING_REMOVE_POSTFIX=1           # 1=remove Postfix; 0=preserve intentional mail service
+HARDENING_JOURNAL_DAYS=14
+HARDENING_JOURNAL_MAX_MB=256
+HARDENING_JOURNAL_RUNTIME_MB=64
+HARDENING_UPDATE_MAX_AGE_HOURS=72
+# Creator-only "auto" becomes the finalized APP_PORT before dispatch. For SSH
+# preservation, supply its actual ports explicitly and review UFW separately.
+# Final empty list = inventory-only for that protocol; these lists NEVER open UFW.
+HARDENING_TCP_PORTS="auto"
+HARDENING_UDP_PORTS="68 546"          # DHCPv4/DHCPv6, including scoped IPv6 sockets
 
 # Derived
 APP_DIR="/opt/searxng"
@@ -96,7 +119,10 @@ PUBLIC_INSTANCE=0
 [[ -n "$APP_FQDN" ]] && PUBLIC_INSTANCE=1
 
 # ── Custom configs created by this script ─────────────────────────────────────
+#   /etc/localtime; existing /etc/timezone        (common timezone policy)
+#   /usr/local/sbin/lab-timezone                  (LXC timezone plan/apply/check)
 #   /usr/local/sbin/searxng-ufw-check                  (service-start firewall guard)
+#   /usr/local/sbin/searxng-image-check                (isolated image compatibility probe)
 #   /etc/default/ufw, /etc/ufw/ufw.conf               (in-CT IPv4/IPv6 policy)
 #   /etc/ufw/user.rules, /etc/ufw/user6.rules         (configured source allows)
 #   /etc/containers/systemd/searxng.container         (Quadlet unit — source of truth)
@@ -113,10 +139,40 @@ PUBLIC_INSTANCE=0
 #   /etc/update-motd.d/10-sysinfo
 #   /etc/update-motd.d/30-app
 #   /etc/update-motd.d/99-footer
-#   /etc/apt/apt.conf.d/52unattended-<hostname>.conf
-#   /etc/sysctl.d/99-hardening.conf
+#   /opt/searxng/ufw-policy.json                     (selected sources/port for startup checks)
+#   /etc/sysctl.d/99-hardening.conf                 (shared dual-stack policy)
+#   /etc/apt/apt.conf.d/99-lab-hardening
+#   /etc/needrestart/conf.d/99-lab-hardening.conf
+#   /etc/systemd/journald.conf.d/99-lab-hardening.conf
+#   /etc/systemd/system/apt-daily{,-upgrade}.service.d/90-lab-readiness.conf
+#   /etc/systemd/system/lab-hardening-check.{service,timer}
+#   /usr/local/sbin/lab-{apt-wait-online,hardening-check,postfix-check}
+#   /etc/update-motd.d/25-lab-hardening
+#   /etc/systemd/system/ssh.{service,socket}          (masks when SSH removed)
+#   /etc/systemd/system/postfix*.{service,socket,path} (masks when Postfix removed)
+#   /var/lib/lab-hardening/{policy.json,status.json,last-index-refresh,check.lock}
+#   /var/backups/lab-hardening/<run>/                 (shared config backups/dry-run log)
 
 # ── Config validation ─────────────────────────────────────────────────────────
+[[ $HARDENING_PROFILE == lxc ]] || { echo "ERROR: This creator requires HARDENING_PROFILE=lxc." >&2; exit 1; }
+[[ $HARDENING_RP_FILTER =~ ^[12]$ && $HARDENING_KEEP_SSH =~ ^[01]$ && $HARDENING_REMOVE_POSTFIX =~ ^[01]$ ]] \
+  || { echo "ERROR: Invalid hardening flag." >&2; exit 1; }
+for policy_var in HARDENING_JOURNAL_DAYS HARDENING_JOURNAL_MAX_MB HARDENING_JOURNAL_RUNTIME_MB HARDENING_UPDATE_MAX_AGE_HOURS; do
+  [[ ${!policy_var} =~ ^[1-9][0-9]{0,3}$ ]] || { echo "ERROR: $policy_var must be 1..9999." >&2; exit 1; }
+done
+for policy_var in HARDENING_TCP_PORTS HARDENING_UDP_PORTS; do
+  [[ $policy_var != HARDENING_TCP_PORTS || ${!policy_var} != auto ]] || continue
+  read -r -a policy_ports <<< "${!policy_var}"
+  [[ ${!policy_var} != *$'\n'* && ${!policy_var} != *$'\r'* ]] || { echo "ERROR: $policy_var must be one line." >&2; exit 1; }
+  for policy_port in "${policy_ports[@]}"; do
+    [[ $policy_port =~ ^[1-9][0-9]{0,4}$ ]] && (( policy_port <= 65535 )) \
+      || { echo "ERROR: $policy_var requires ports 1..65535, separated by spaces." >&2; exit 1; }
+  done
+done
+if [[ $HARDENING_KEEP_SSH == 1 && $HARDENING_TCP_PORTS == auto ]]; then
+  echo "ERROR: With SSH preserved, set HARDENING_TCP_PORTS explicitly (actual SSH and app ports, or empty for inventory). Review SSH UFW access separately." >&2
+  exit 1
+fi
 [[ "$HN" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$ ]] || { echo "  ERROR: HN is not a valid hostname: $HN" >&2; exit 1; }
 [[ "$CPU" =~ ^(0|[1-9][0-9]*)$ ]] && (( CPU >= 1 )) || { echo "  ERROR: CPU must be a positive integer." >&2; exit 1; }
 [[ "$RAM" =~ ^(0|[1-9][0-9]*)$ ]] && (( RAM >= 256 )) || { echo "  ERROR: RAM must be >= 256 MB." >&2; exit 1; }
@@ -152,8 +208,19 @@ PUBLIC_INSTANCE=0
   exit 1
 }
 [[ "$UPDATE_TIME" =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]] || { echo "  ERROR: UPDATE_TIME must be HH:MM (24h), e.g. 03:00." >&2; exit 1; }
-[[ -e "/usr/share/zoneinfo/${APP_TZ}" ]] || { echo "  ERROR: APP_TZ not found in /usr/share/zoneinfo: $APP_TZ" >&2; exit 1; }
-[[ "$APP_TZ" =~ ^[A-Za-z0-9._+-]+(/[A-Za-z0-9._+-]+)+$ ]] || { echo "  ERROR: APP_TZ contains invalid characters." >&2; exit 1; }
+# Syntax only on Proxmox; availability and effective zone are checked in the guest.
+[[ $PRESERVE_EXISTING_TIMEZONE =~ ^[01]$ ]] || {
+  echo '  ERROR: PRESERVE_EXISTING_TIMEZONE must be exactly 0 or 1.' >&2; exit 1;
+}
+TIMEZONE_ACTION=preserved
+TIMEZONE_LABEL='preserve existing guest timezone'
+if [[ $PRESERVE_EXISTING_TIMEZONE == 0 ]]; then
+  [[ $SERVER_TIMEZONE =~ ^[A-Za-z0-9_+-]+(/[A-Za-z0-9_+-]+)*$ ]] || {
+    echo '  ERROR: SERVER_TIMEZONE must be a nonempty IANA timezone name.' >&2; exit 1;
+  }
+  TIMEZONE_ACTION=set
+  TIMEZONE_LABEL=$SERVER_TIMEZONE
+fi
 if [[ -n "$APP_FQDN" ]]; then
   [[ "$APP_FQDN" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)+$ ]] \
     || { echo "  ERROR: APP_FQDN is not a valid hostname: $APP_FQDN" >&2; exit 1; }
@@ -201,10 +268,13 @@ done
 [[ $UPDATE_TIME =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]] || { echo "ERROR: Invalid UPDATE_TIME." >&2; exit 1; }
 
 # ── Trap cleanup ──────────────────────────────────────────────────────────────
-trap 'rc=$?;
+INSTALL_STAGE="preflight"
+trap 'rc=$? err_line=$LINENO err_op=${BASH_COMMAND%%[[:space:]]*};
   trap - ERR
-  echo "  ERROR: failed (rc=$rc) near line ${LINENO:-?}" >&2
-  echo "  Command: $BASH_COMMAND" >&2
+  # The parent reports command-substitution failures and owns CT cleanup.
+  if (( BASH_SUBSHELL > 0 )); then exit "$rc"; fi
+  echo "  ERROR: stage=$INSTALL_STAGE rc=$rc line=$err_line operation=$err_op" >&2
+  echo "  See the original diagnostic above; command arguments and heredocs are omitted." >&2
   if [[ "${CLEANUP_ON_FAIL:-0}" -eq 1 && "${CREATED:-0}" -eq 1 ]]; then
     echo "  Cleanup: stopping/destroying CT ${CT_ID} ..." >&2
     pct stop "${CT_ID}" >/dev/null 2>&1 || true
@@ -215,8 +285,7 @@ trap 'rc=$?;
 
 trap 'rc=130;
   trap - ERR INT TERM HUP
-  echo "  Interrupted (rc=$rc)" >&2
-  echo "  Command: $BASH_COMMAND" >&2
+  echo "  Interrupted: stage=$INSTALL_STAGE rc=$rc line=$LINENO" >&2
   if [[ "${CLEANUP_ON_FAIL:-0}" -eq 1 && "${CREATED:-0}" -eq 1 ]]; then
     echo "  Cleanup: stopping/destroying CT ${CT_ID} ..." >&2
     pct stop "${CT_ID}" >/dev/null 2>&1 || true
@@ -228,9 +297,13 @@ trap 'rc=130;
 # ── Preflight — root & commands ───────────────────────────────────────────────
 [[ "$(id -u)" -eq 0 ]] || { echo "  ERROR: Run as root on the Proxmox host." >&2; exit 1; }
 
-for cmd in pvesh pveam pct pvesm qm curl python3 ip awk grep sed sort paste seq readlink cp chmod dpkg head tr flock mktemp mv rm tail bash stat timeout; do
+for cmd in pveversion pvesh pveam pct pvesm qm curl python3 ip awk grep sed sort paste seq readlink cp chmod dpkg head tr flock mktemp mv rm tail bash stat timeout; do
   command -v "$cmd" >/dev/null 2>&1 || { echo "  ERROR: Missing required command: $cmd" >&2; exit 1; }
 done
+
+# Prove the caller is the Proxmox host before the unchanged block dispatches.
+[[ -d /etc/pve ]] || { echo "ERROR: /etc/pve is absent; run on the Proxmox host." >&2; exit 1; }
+pveversion >/dev/null
 
 # pveam lists templates for more than one CPU architecture. Selecting only by
 # Debian version can pick an ARM64 rootfs on an AMD64 host (or vice versa),
@@ -268,11 +341,11 @@ fi
 
 # Creator scripts are not idempotent: a re-run would create a second CT with the
 # same hostname. Refuse if one already exists on this node (e.g. a preserved
-# failed install) — destroy it first or change HN.
+# failed install). Preserve it and choose a new, non-conflicting ID and HN.
 EXISTING_CT="$(pct list 2>/dev/null | awk -v h="$HN" 'NR>1 && $NF==h {print $1}' | head -n1)"
 if [[ -n "$EXISTING_CT" ]]; then
   echo "  ERROR: A CT with hostname '${HN}' already exists on this node (CT ${EXISTING_CT})." >&2
-  echo "  Fresh creator: use the existing CT maintenance helper, or review the retained CT before removing it." >&2
+  echo "  Preserve that CT. For a fresh installation, select a new unused CT_ID and HN." >&2
   exit 1
 fi
 
@@ -302,7 +375,7 @@ cat <<EOF2
   Valkey image:      $VALKEY_IMAGE (limiter backend, always deployed)
   App port:          $APP_PORT
   Instance name:     $INSTANCE_NAME
-  Timezone:          $APP_TZ
+  Timezone:          $TIMEZONE_LABEL
   FQDN:              $([ -n "$APP_FQDN" ] && echo "$APP_FQDN" || echo "(no public FQDN — local IP mode)")
   public_instance:   $([ "$PUBLIC_INSTANCE" -eq 1 ] && echo "true (link_token bot detection)" || echo "false (local/private)")
   Trusted proxies:   ${TRUSTED_PROXIES:-(none — clients identified by connecting IP)}
@@ -316,7 +389,9 @@ cat <<EOF2
   Podman storage:    $([ "$PODMAN_FUSE_OVERLAY" -eq 1 ] && echo "fuse-overlayfs (fuse=1)" || echo "native overlay (no FUSE)")
   Tags:              $TAGS
   Auto-update:       $([ "$AUTO_UPDATE" -eq 1 ] && echo "enabled — daily at ${UPDATE_TIME} (re-pull $APP_TAG / $VALKEY_TAG)" || echo "disabled ($APP_TAG / $VALKEY_TAG, manual)")
-  Cleanup on fail:   $CLEANUP_ON_FAIL (disarmed before first persistent start)
+  Cleanup on fail:   $CLEANUP_ON_FAIL (default: preserve failed CT; always disarmed before app start)
+  Hardening:         v1.2.0 | SSH keep=$HARDENING_KEEP_SSH | Postfix remove=$HARDENING_REMOVE_POSTFIX
+  Listener policy:   TCP=$HARDENING_TCP_PORTS (auto=app port); UDP=$HARDENING_UDP_PORTS
   ────────────────────────────────────────
   To change defaults, press Enter and
   edit the Config section at the top of
@@ -410,6 +485,9 @@ fi
 FIREWALL_ACCESS_LABEL="${FIREWALL_ACCESS_LABEL:-${UFW_ALLOWED_SOURCES[*]}}"
 echo "  UFW TCP $APP_PORT allowed sources: $FIREWALL_ACCESS_LABEL"
 
+# All prompts that can select app ports/sources have now completed.
+[[ $HARDENING_TCP_PORTS != auto ]] || HARDENING_TCP_PORTS="$APP_PORT"
+
 # ── Preflight — environment ───────────────────────────────────────────────────
 pvesm status | awk -v s="$TEMPLATE_STORAGE" '$1==s{f=1} END{exit(!f)}' \
   || { echo "  ERROR: Template storage not found: $TEMPLATE_STORAGE" >&2; exit 1; }
@@ -469,6 +547,7 @@ else
 fi
 
 # ── Create LXC ────────────────────────────────────────────────────────────────
+INSTALL_STAGE="create LXC"
 # Root password is set after start via chpasswd on stdin, keeping it out of
 # the host process list (pct create -password exposes it in ps).
 CT_FEATURES="nesting=1,keyctl=1"
@@ -508,46 +587,216 @@ printf 'root:%s\n' "$PASSWORD" | pct exec "$CT_ID" -- chpasswd
 unset PASSWORD PW1 PW2
 
 # ── OS update ─────────────────────────────────────────────────────────────────
+INSTALL_STAGE="OS bootstrap"
 pct exec "$CT_ID" -- bash -lc '
   set -euo pipefail
-  export DEBIAN_FRONTEND=noninteractive
+  export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l
   export LANG=C.UTF-8
   export LC_ALL=C.UTF-8
-  systemctl disable -q --now systemd-networkd-wait-online.service 2>/dev/null || true
   apt-get update -qq
   apt-get -o Dpkg::Options::="--force-confold" -y dist-upgrade
   apt-get -y autoremove
   apt-get clean
 '
 
-# ── Base packages, locale, timezone ───────────────────────────────────────────
+# ── Base packages and locale         ───────────────────────────────────────────
 PODMAN_FUSE_PKG=""
 [[ "$PODMAN_FUSE_OVERLAY" -eq 1 ]] && PODMAN_FUSE_PKG="fuse-overlayfs"
 
 pct exec "$CT_ID" -- bash -lc "
   set -euo pipefail
-  export DEBIAN_FRONTEND=noninteractive
+  export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l
   apt-get update -qq
-  apt-get install -y locales curl ca-certificates iproute2 python3 python3-yaml ufw iptables util-linux podman tar gzip ${PODMAN_FUSE_PKG}
+  apt-get install -y tzdata locales curl ca-certificates iproute2 python3 python3-yaml ufw iptables util-linux podman tar gzip ${PODMAN_FUSE_PKG}
   sed -i 's/^# *en_US.UTF-8/en_US.UTF-8/' /etc/locale.gen
   locale-gen
   update-locale LANG=en_US.UTF-8
-  ln -sf /usr/share/zoneinfo/${APP_TZ} /etc/localtime
-  echo '${APP_TZ}' > /etc/timezone
 "
 
-# ── Remove unnecessary services ───────────────────────────────────────────────
-pct exec "$CT_ID" -- bash -lc '
-  set -euo pipefail
-  export DEBIAN_FRONTEND=noninteractive
-  systemctl disable --now ssh 2>/dev/null || true
-  systemctl disable --now postfix 2>/dev/null || true
-  apt-get purge -y openssh-server postfix 2>/dev/null || true
-  apt-get -y autoremove
-'
+# ── Timezone planning before persistent application startup ──────────────────
+# The helper bytes match the implementation embedded in the common block below.
+# This early call installs the helper and READS a plan; only late hardening applies it.
+INSTALL_STAGE="guest timezone validation"
+pct exec "$CT_ID" -- bash -s <<'TIMEZONE_BOOTSTRAP'
+set -euo pipefail
+install -d -m 0755 /usr/local/sbin
+cat > /usr/local/sbin/lab-timezone <<'TIMEZONE_BOOTSTRAP_HELPER'
+#!/usr/bin/python3
+"""LXC timezone policy, adapted from debian-hardening.sh v1.0.3.
+
+Only apply writes timezone files; plan/check are read-only. No timedated,
+clock, RTC, NTP, SSH, or access-recovery operations are performed.
+"""
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+from zoneinfo import ZoneInfo
+
+ZONES = Path('/usr/share/zoneinfo')
+LOCALTIME = Path('/etc/localtime')
+TIMEZONE = Path('/etc/timezone')
+
+
+def guest_guard():
+    if os.geteuid() != 0 or shutil.which('pveversion') or Path('/etc/pve').exists():
+        raise ValueError('Timezone operations require root inside the selected Debian 13 LXC.')
+    release = dict(line.split('=', 1) for line in Path('/etc/os-release').read_text().splitlines()
+                   if '=' in line and not line.startswith('#'))
+    if release.get('ID', '').strip('"') != 'debian' or release.get('VERSION_ID', '').strip('"') != '13':
+        raise ValueError('Timezone policy requires Debian 13.')
+    result = subprocess.run(['systemd-detect-virt', '--container'], text=True,
+                            capture_output=True, timeout=10)
+    if result.returncode or result.stdout.strip() != 'lxc':
+        raise ValueError('Timezone policy refuses environments other than LXC.')
+
+
+def zone_path(name):
+    # Same name grammar as the native source; validate against guest tzdata.
+    if not re.fullmatch(r'[A-Za-z0-9_+-]+(?:/[A-Za-z0-9_+-]+)*', name):
+        raise ValueError('Invalid SERVER_TIMEZONE; use an installed IANA timezone name.')
+    if name.split('/')[0] in ('posix', 'right', 'localtime', 'posixrules'):
+        raise ValueError('SERVER_TIMEZONE must identify an IANA zone, not a special tzdata tree.')
+    path = ZONES / name
+    try:
+        path.resolve(strict=True).relative_to(ZONES.resolve(strict=True))
+        with path.open('rb') as stream:
+            ZoneInfo.from_file(stream, key=name)
+    except (OSError, ValueError) as exc:
+        raise ValueError('Timezone is unavailable or invalid in this guest: ' + name) from exc
+    return path
+
+
+def effective_timezone():
+    if not LOCALTIME.exists() and not LOCALTIME.is_symlink():
+        zone_path('UTC')
+        return 'UTC'  # localtime(5): absent /etc/localtime means UTC.
+    if LOCALTIME.is_symlink():
+        # Keep the selected alias, rather than resolving US/Eastern to another name.
+        link = Path(os.path.normpath(LOCALTIME.parent / os.readlink(LOCALTIME)))
+        try:
+            name = str(link.relative_to(ZONES))
+        except ValueError as exc:
+            raise ValueError('/etc/localtime does not link into the guest zoneinfo tree.') from exc
+        zone_path(name)
+        return name
+    if LOCALTIME.is_file() and TIMEZONE.is_file() and not TIMEZONE.is_symlink():
+        name = TIMEZONE.read_text().strip()
+        if LOCALTIME.read_bytes() == zone_path(name).read_bytes():
+            return name
+    raise ValueError('Cannot identify the guest timezone from /etc/localtime and /etc/timezone.')
+
+
+def fingerprint(path):
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return {'kind': 'absent'}
+    if stat.S_ISLNK(info.st_mode):
+        return {'kind': 'symlink', 'target': os.readlink(path)}
+    if stat.S_ISREG(info.st_mode):
+        return {'kind': 'file', 'sha256': hashlib.sha256(path.read_bytes()).hexdigest()}
+    raise ValueError('Unsupported timezone file type: ' + str(path))
+
+
+def fingerprints():
+    return {str(path): fingerprint(path) for path in (LOCALTIME, TIMEZONE)}
+
+
+def plan(preserve, requested):
+    if preserve not in ('0', '1'):
+        raise ValueError('PRESERVE_EXISTING_TIMEZONE must be exactly 0 or 1.')
+    if preserve == '0':
+        zone_path(requested)
+        if TIMEZONE.is_symlink() or (TIMEZONE.exists() and not TIMEZONE.is_file()):
+            raise ValueError('Refusing to replace a non-regular /etc/timezone.')
+    before = effective_timezone()
+    return {'preserve': preserve == '1', 'requested': None if preserve == '1' else requested,
+            'before': before, 'effective': before if preserve == '1' else requested,
+            'files_before': fingerprints()}
+
+
+def verify(setting):
+    actual = effective_timezone()
+    if actual != setting['effective']:
+        raise ValueError('Guest timezone drift: expected ' + setting['effective'] + ', found ' + actual)
+    expected_files = setting.get('files', setting['files_before'])
+    if fingerprints() != expected_files:
+        raise ValueError('Guest timezone files changed; review /etc/localtime and /etc/timezone.')
+    return actual
+
+
+def apply(setting, backup):
+    if fingerprints() != setting['files_before'] or effective_timezone() != setting['before']:
+        raise ValueError('Guest timezone changed after validation; refusing to overwrite it.')
+    if not setting['preserve']:
+        target = zone_path(setting['requested'])
+        saved = Path(backup) / 'timezone'
+        saved.mkdir(mode=0o700, parents=True, exist_ok=False)
+        (saved / 'before.json').write_text(json.dumps(setting, indent=2) + '\n')
+        for path in (LOCALTIME, TIMEZONE):
+            if path.exists() or path.is_symlink():
+                shutil.copy2(path, saved / path.name, follow_symlinks=False)
+        # Atomic per-file replacement; no automatic undo of a later failure.
+        if setting['before'] != setting['requested']:
+            with tempfile.TemporaryDirectory(prefix='.lab-timezone-', dir=LOCALTIME.parent) as tmp:
+                replacement = Path(tmp) / 'localtime'
+                replacement.symlink_to(target)
+                os.replace(replacement, LOCALTIME)
+        # Debian uses /etc/localtime. Keep an existing legacy file consistent;
+        # do not introduce /etc/timezone when the template does not maintain it.
+        desired = setting['requested'] + '\n'
+        if TIMEZONE.exists() and TIMEZONE.read_text() != desired:
+            with tempfile.TemporaryDirectory(prefix='.lab-timezone-', dir=TIMEZONE.parent) as tmp:
+                replacement = Path(tmp) / 'timezone'
+                replacement.write_text(desired)
+                replacement.chmod(0o644)
+                os.replace(replacement, TIMEZONE)
+    final = {**setting, 'files': fingerprints()}
+    if setting['preserve'] and final['files'] != setting['files_before']:
+        raise ValueError('Preserve mode detected a timezone-file change.')
+    verify(final)
+    return final
+
+
+def main():
+    guest_guard()
+    if len(sys.argv) == 4 and sys.argv[1] == 'plan':
+        print(json.dumps(plan(sys.argv[2], sys.argv[3])))
+    elif len(sys.argv) == 4 and sys.argv[1] == 'apply':
+        setting = json.loads(Path(sys.argv[2]).read_text())
+        print(json.dumps(apply(setting, sys.argv[3])))
+    elif len(sys.argv) == 3 and sys.argv[1] == 'check':
+        policy = json.loads(Path(sys.argv[2]).read_text())
+        print(verify(policy['timezone']))
+    else:
+        raise ValueError('Invalid timezone helper arguments.')
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except Exception as exc:
+        print('ERROR: LXC timezone: ' + str(exc), file=sys.stderr)
+        raise SystemExit(1)
+TIMEZONE_BOOTSTRAP_HELPER
+chmod 0755 /usr/local/sbin/lab-timezone
+TIMEZONE_BOOTSTRAP
+TIMEZONE_PLAN=$(pct exec "$CT_ID" -- /usr/local/sbin/lab-timezone plan "$PRESERVE_EXISTING_TIMEZONE" "$SERVER_TIMEZONE")
+APP_TZ=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["effective"])' "$TIMEZONE_PLAN")
+unset TIMEZONE_PLAN
+echo "  Guest timezone plan: $APP_TZ ($TIMEZONE_ACTION during shared hardening)."
 
 # ── UFW inside the CT ─────────────────────────────────────────────────────────
 # Fresh CT only. Network=host uses this CT's INPUT chain.
+# Preserve existing before/after/user rules; no UFW reset.
+INSTALL_STAGE="UFW setup"
 pct exec "$CT_ID" -- bash -s -- "$APP_PORT" "${UFW_ALLOWED_SOURCES[@]}" <<'UFWSETUP'
 set -euo pipefail
 export LC_ALL=C
@@ -555,10 +804,9 @@ port=$1; shift
 (( $# > 0 )) || { echo "ERROR: No allowed source addresses."; false; }
 iptables -w 5 -S INPUT >/dev/null
 ip6tables -w 5 -S INPUT >/dev/null
-ufw --force reset
 sed -i 's/^IPV6=.*/IPV6=yes/' /etc/default/ufw
 grep -qx 'IPV6=yes' /etc/default/ufw
-# The creator owns sysctl hardening; avoid a second writer in ufw-init.
+# The shared block owns sysctl hardening; avoid a second writer in ufw-init.
 grep -q '^IPT_SYSCTL=' /etc/default/ufw
 sed -i 's|^IPT_SYSCTL=.*|IPT_SYSCTL=|' /etc/default/ufw
 ufw default deny incoming
@@ -576,6 +824,13 @@ for source in "$@"; do
   if [[ $source == *:* ]]; then tool=ip6tables; prefix=ufw6; fi
   "$tool" -w 5 -C "$prefix-user-input" -s "$source" -p tcp -m tcp --dport "$port" -j ACCEPT
 done
+python3 - "$port" "$@" <<'UFW_SAVE_POLICY'
+import json, os, pathlib, sys
+path = pathlib.Path('/opt/searxng/ufw-policy.json')
+path.parent.mkdir(parents=True, exist_ok=True)
+path.write_text(json.dumps({'port': int(sys.argv[1]), 'sources': sys.argv[2:]}) + '\n')
+os.chmod(path, 0o644)
+UFW_SAVE_POLICY
 UFWSETUP
 
 tmp=$(mktemp)
@@ -592,11 +847,25 @@ grep -qx 'Status: active' <<< "$status"
 for tool in /usr/sbin/iptables /usr/sbin/ip6tables; do
   prefix=ufw
   [[ ${tool##*/} != ip6tables ]] || prefix=ufw6
-  rules=$("$tool" -w 5 -S INPUT)
-  grep -qx -- '-P INPUT DROP' <<< "$rules"
+  for chain in INPUT FORWARD; do
+    rules=$("$tool" -w 5 -S "$chain")
+    grep -qx -- "-P $chain DROP" <<< "$rules"
+  done
   "$tool" -w 5 -C INPUT -j "$prefix-before-input"
   "$tool" -w 5 -S "$prefix-user-input" >/dev/null
 done
+# Check the selected source allows on every boot and maintenance verification.
+python3 - <<'UFW_CHECK_POLICY'
+import ipaddress, json, pathlib, subprocess
+policy = json.loads(pathlib.Path('/opt/searxng/ufw-policy.json').read_text())
+if type(policy['port']) is not int or not 1024 <= policy['port'] <= 65535 or not policy['sources']:
+    raise SystemExit('ERROR: Invalid SearXNG UFW policy.')
+for source in policy['sources']:
+    network = ipaddress.ip_network(source, strict=True)
+    tool, prefix = ('/usr/sbin/iptables', 'ufw') if network.version == 4 else ('/usr/sbin/ip6tables', 'ufw6')
+    subprocess.run([tool, '-w', '5', '-C', prefix + '-user-input', '-s', source,
+                    '-p', 'tcp', '-m', 'tcp', '--dport', str(policy['port']), '-j', 'ACCEPT'], check=True)
+UFW_CHECK_POLICY
 UFWCHECK
 pct push "$CT_ID" "$tmp" /usr/local/sbin/searxng-ufw-check --perms 0755
 rm -f -- "$tmp"
@@ -640,6 +909,7 @@ GRAPH_DRIVER="$(pct exec "$CT_ID" -- podman info --format '{{.Store.GraphDriverN
 echo "  Podman: cgroup ${CGROUPS_VERSION}, storage driver ${GRAPH_DRIVER}$([ "$PODMAN_FUSE_OVERLAY" -eq 1 ] && echo " (fuse-overlayfs)" || echo " (native)")"
 
 # ── Pull images ───────────────────────────────────────────────────────────────
+INSTALL_STAGE="image pull and compatibility"
 echo "  Pulling SearXNG image: ${APP_IMAGE} ..."
 pct exec "$CT_ID" -- bash -lc "
   set -euo pipefail
@@ -661,14 +931,177 @@ for component in VALKEY APP; do
   [[ $resolved =~ ^[a-f0-9]{64}$ ]] || { echo "ERROR: Invalid image ID for $component." >&2; false; }
   printf -v "${component}_IMAGE_ID" 'sha256:%s' "$resolved"
 done
+echo "  Resolved SearXNG image ID: $APP_IMAGE_ID"
+echo "  Resolved Valkey image ID:  $VALKEY_IMAGE_ID"
+
+# ── Selected-image initialization contract ────────────────────────────────────
+# Source: searxng/searxng ca49650407a04cc0cc043759d5cb2cd2c92efd20,
+# container/entrypoint.sh and dist.dockerfile; Granian 2.8.2 CLI/worker/socket code.
+# Re-exercise the selected immutable image rather than trusting a moving tag.
+pct exec "$CT_ID" -- bash -s <<'IMAGE_CHECK_INSTALL'
+set -euo pipefail
+cat > /usr/local/sbin/searxng-image-check <<'IMAGE_CHECK_HELPER'
+#!/usr/bin/python3
+"""Inspect an immutable image, then probe its initializer without application data."""
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+import tempfile
+import uuid
+
+PROBE = '''#!/usr/local/searxng/.venv/bin/python
+import json
+import os
+from pathlib import Path
+import sys
+
+class ContractError(Exception):
+    pass
+
+def require(ok, message):
+    if not ok:
+        raise ContractError(message)
+
+try:
+    require(sys.argv[1:] == ['searx.webapp:app'], 'Unexpected Granian startup arguments')
+    require(os.geteuid() != 0 and os.getegid() != 0, 'Initializer did not retain a non-root identity')
+    from granian.cli import cli
+    with cli.make_context('granian', sys.argv[1:], auto_envvar_prefix='GRANIAN') as context:
+        options = context.params
+    require(options['host'] == '0.0.0.0', 'Initializer/Granian did not retain the IPv4 bind')
+    require(options['port'] == int(os.environ['SEARXNG_PORT']), 'Initializer/Granian port mismatch')
+    require(getattr(options['interface'], 'value', options['interface']) == 'wsgi', 'Expected WSGI interface')
+    require(not options.get('env_files'), 'Unreviewed worker environment files')
+    require(not options.get('metrics_enabled'), 'Unreviewed metrics listener')
+    require(not options.get('uds'), 'Unexpected Unix socket override')
+    require(os.environ.get('__SEARXNG_CONFIG_PATH') == '/etc/searxng', 'Configuration path changed')
+    require(os.environ.get('__SEARXNG_DATA_PATH') == '/var/cache/searxng', 'Data path changed')
+    require(os.environ.get('__SEARXNG_SETTINGS_PATH') == '/etc/searxng/settings.yml', 'Settings path changed')
+    for directory in ('/etc/searxng', '/var/cache/searxng'):
+        info = Path(directory).stat()
+        require((info.st_uid, info.st_gid) == (os.geteuid(), os.getegid()), 'Probe mount ownership mismatch')
+        marker = Path(directory, '.lab-write-probe')
+        marker.write_text('temporary compatibility probe')
+        marker.unlink()
+    require(os.access('/etc/searxng/settings.yml', os.R_OK), 'Initialized settings are unreadable')
+    require(os.access('/usr/local/searxng/searx/webapp.py', os.R_OK), 'Application module is unreadable')
+    print('LAB_SEARXNG_PROBE=' + json.dumps({'uid': os.geteuid(), 'gid': os.getegid(),
+          'host': options['host'], 'port': options['port'], 'tz': os.environ.get('TZ')}))
+except Exception as exc:
+    detail = str(exc) if isinstance(exc, ContractError) else type(exc).__name__
+    print('LAB_SEARXNG_PROBE_ERROR=' + detail)
+    raise SystemExit(1)
+'''
+
+def diagnostic(step, stderr):
+    if not stderr:
+        return
+    if isinstance(stderr, bytes):
+        stderr = stderr.decode('utf-8', errors='replace')
+    # Probe commands receive no production credentials or application data.
+    # Keep useful engine errors, with bounded output and common secret fields redacted.
+    stderr = re.sub(r'(?im)(\bauthorization\s*[:=]\s*)[^\r\n]+', r'\1<redacted>', stderr)
+    stderr = re.sub(r'(?i)((?:password|passwd|secret(?:_key)?|token|authorization)\s*[:=]\s*)'
+                    r'''(?:"[^"]*"|'[^']*'|[^\s,;]+)''', r'\1<redacted>', stderr)
+    stderr = ''.join(char if char.isprintable() or char in '\n\t' else '?' for char in stderr)
+    print('  ' + step + ' stderr:\n' + stderr[:4000].rstrip(), file=sys.stderr)
+    if len(stderr) > 4000:
+        print('  [remaining diagnostic truncated]', file=sys.stderr)
+
+def run(args, *, step, timeout=60):
+    try:
+        result = subprocess.run(args, text=True, capture_output=True, timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        diagnostic(step, exc.stderr)
+        raise RuntimeError(step + ' timed out after ' + str(timeout) + ' seconds') from None
+    if result.returncode:
+        diagnostic(step, result.stderr)
+        # Application stdout is restricted to the generated probe's error marker.
+        detail = next((line for line in result.stdout.splitlines()
+                       if line.startswith('LAB_SEARXNG_PROBE_ERROR=')), '')
+        raise RuntimeError(step + ' failed (rc=' + str(result.returncode)
+                           + (', ' + detail if detail else '') + ')')
+    return result.stdout.strip()
+
+def main():
+    if len(sys.argv) != 4 or not re.fullmatch(r'sha256:[a-f0-9]{64}', sys.argv[1]):
+        raise ValueError('Usage: searxng-image-check sha256:IMAGE_ID PORT TIMEZONE')
+    image, port_text, timezone = sys.argv[1:]
+    port = int(port_text)
+    if not 1024 <= port <= 65535:
+        raise ValueError('Expected an unprivileged application port')
+    info = json.loads(run(['podman', 'image', 'inspect', image], step='image metadata inspection'))
+    if len(info) != 1:
+        raise ValueError('Ambiguous image identity')
+    config = info[0]['Config']
+    if config.get('Entrypoint') != ['/usr/local/searxng/entrypoint.sh'] or config.get('Cmd'):
+        raise ValueError('Unreviewed image entrypoint/CMD; inspect its startup contract')
+    name = 'searxng-image-probe-' + uuid.uuid4().hex
+    base = ['podman', 'run', '--rm', '--name', name, '--pull=never', '--network=none',
+            '--user=searxng:searxng']
+    try:
+        identity = run(base + ['--entrypoint=/bin/sh', image, '-c', 'id -u; id -g'],
+                       step='service-account inspection')
+        if not re.fullmatch(r'[1-9][0-9]*\n[1-9][0-9]*', identity):
+            raise ValueError('Image has no usable non-root searxng:searxng account')
+        uid, gid = map(int, identity.splitlines())
+        with tempfile.TemporaryDirectory(prefix='searxng-image-probe-', dir='/run') as tmp:
+            # Instrument ONLY the temporary container's final Granian executable.
+            # The real initializer and installed Granian parser run; no server/app
+            # callback is invoked. Production keeps its unmodified image entrypoint.
+            probe = Path(tmp, 'granian-probe')
+            probe.write_text(PROBE)
+            probe.chmod(0o555)
+            os.chmod(tmp, 0o755)
+            args = base + ['--env=TZ=' + timezone, '--env=GRANIAN_HOST=0.0.0.0',
+                           '--env=SEARXNG_PORT=' + str(port), '--env=FORCE_OWNERSHIP=false',
+                           '--volume=' + str(probe) + ':/usr/local/searxng/.venv/bin/granian:ro']
+            # Podman 5.4.2 rejects uid=/gid= in --tmpfs options. Prepare owned
+            # disposable bind directories instead, matching production mount semantics.
+            for directory, leaf in (('/etc/searxng', 'config'), ('/var/cache/searxng', 'cache')):
+                source = Path(tmp, leaf)
+                source.mkdir(mode=0o755)
+                os.chown(source, uid, gid)
+                args += ['--volume=' + str(source) + ':' + directory + ':rw']
+            output = run(args + [image], step='initializer/Granian probe')
+            records = [line.removeprefix('LAB_SEARXNG_PROBE=') for line in output.splitlines()
+                       if line.startswith('LAB_SEARXNG_PROBE=')]
+            expected = dict(uid=uid, gid=gid, host='0.0.0.0', port=port, tz=timezone)
+            if len(records) != 1 or json.loads(records[0]) != expected:
+                raise ValueError('Initializer/Granian identity or environment contract changed')
+    finally:
+        # --rm handles success. This unique disposable name also covers timeouts;
+        # neither installed service nor any production volume is targeted.
+        subprocess.run(['podman', 'rm', '--force', '--ignore', name],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=20)
+    print(str(uid) + ':' + str(gid))
+
+if __name__ == '__main__':
+    try:
+        main()
+    except Exception as exc:
+        print('ERROR: SearXNG image compatibility: ' + str(exc), file=sys.stderr)
+        raise SystemExit(1)
+IMAGE_CHECK_HELPER
+chmod 0755 /usr/local/sbin/searxng-image-check
+IMAGE_CHECK_INSTALL
+APP_OWNER=$(pct exec "$CT_ID" -- /usr/local/sbin/searxng-image-check "$APP_IMAGE_ID" "$APP_PORT" "$APP_TZ")
+[[ $APP_OWNER =~ ^[1-9][0-9]*:[1-9][0-9]*$ ]] || { echo "ERROR: Invalid SearXNG service identity." >&2; false; }
+APP_UID=${APP_OWNER%%:*}
+APP_GID=${APP_OWNER##*:}
+echo "  SearXNG image initializer and Granian options verified; service UID:GID=$APP_OWNER"
 
 # ── Prepare persistent paths ──────────────────────────────────────────────────
 # SearXNG persistent state (all of it):
 #   /opt/searxng/config/   settings.yml, limiter.toml  (→ /etc/searxng)
 #   /opt/searxng/cache/    faviconcache.db, other persistent cache (→ /var/cache/searxng)
-# The image entrypoint starts as root and, with FORCE_OWNERSHIP=true (image
-# default), chowns both mounts to searxng:searxng before dropping privileges —
-# no UID detection needed. Valkey has no persistent state here: it only holds
+# The inspected image entrypoint chowns files but does NOT drop privileges.
+# Resolve its service account before startup, pre-own the mounts, and set
+# Quadlet's container User/Group explicitly. Keep the image entrypoint intact.
+# Valkey has no persistent state here: it only holds
 # rate-limit counters, RDB/AOF are disabled in valkey.conf, so no volume is mounted.
 pct exec "$CT_ID" -- bash -lc "
   set -euo pipefail
@@ -769,6 +1202,10 @@ trusted_proxies = [
 ${TRUSTED_PROXIES_TOML}]
 LIMITER
 
+# Fresh-CT paths only. Maintenance rejects an image UID/GID change before switch;
+# it never recursively changes an existing deployment's data ownership.
+pct exec "$CT_ID" -- chown -R -- "$APP_OWNER" "$APP_DIR/config" "$APP_DIR/cache"
+
 # ── Valkey config ─────────────────────────────────────────────────────────────
 # Network=host means Valkey would otherwise listen on every CT interface; bind
 # it to loopback. Persistence stays off: the limiter counters reset harmlessly
@@ -789,12 +1226,14 @@ EOF2
 "
 
 # ── Quadlet unit files ────────────────────────────────────────────────────────
-# Rootful Quadlet: /etc/containers/systemd/ — no linger, no --user flags needed.
+# Rootful Quadlet: /etc/containers/systemd/ — no linger or user-systemd instance.
+# [Container] User/Group selects the application identity inside the container.
 # systemd daemon-reload triggers the Quadlet generator; searxng.service and
 # searxng-valkey.service are created as transient units and
 # WantedBy=multi-user.target handles boot start.
-# Network=host bypasses Netavark NAT issues on Debian LXC; SEARXNG_PORT tells
-# the app which port to bind on the CT interface instead of PublishPort=.
+# Network=host bypasses Netavark NAT issues on Debian LXC; the image maps
+# SEARXNG_PORT to GRANIAN_PORT. GRANIAN_HOST controls the production listener;
+# settings.yml's bind_address/SEARXNG_BIND_ADDRESS affects the development server.
 # Both containers share the CT network stack, so SearXNG reaches Valkey on
 # 127.0.0.1:6379. Requires=/After= order Valkey before SearXNG.
 # No secrets in either unit file — secret_key lives in settings.yml (0640).
@@ -851,10 +1290,12 @@ Image=${APP_IMAGE_ID}
 Pull=never
 ContainerName=searxng
 Network=host
+User=${APP_UID}
+Group=${APP_GID}
 Environment=TZ=${APP_TZ}
-Environment=SEARXNG_BIND_ADDRESS=0.0.0.0
+Environment=GRANIAN_HOST=0.0.0.0
 Environment=SEARXNG_PORT=${APP_PORT}
-Environment=FORCE_OWNERSHIP=true
+Environment=FORCE_OWNERSHIP=false
 Volume=${APP_DIR}/config:/etc/searxng
 Volume=${APP_DIR}/cache:/var/cache/searxng
 StopTimeout=50
@@ -949,7 +1390,7 @@ read_state() {
   (( STATE[INITIAL_WAIT_SECONDS] >= 30 && STATE[INITIAL_WAIT_SECONDS] <= 86400 )) || die "Invalid initial wait."
   (( STATE[UPDATE_WAIT_SECONDS] >= 30 && STATE[UPDATE_WAIT_SECONDS] <= 86400 )) || die "Invalid update wait."
   [[ ${STATE[AUTO_UPDATE]} =~ ^[01]$ && ${STATE[PODMAN_FUSE_OVERLAY]} =~ ^[01]$ ]] || die "Invalid policy flag."
-  (( STATE[APP_PORT] != 5432 && STATE[APP_PORT] != 6379 )) || die "Backend port collision."
+  (( STATE[APP_PORT] != 6379 )) || die "Backend port collision."
 }
 unit_value() {
   local prefix=$1 file=$2
@@ -1030,9 +1471,9 @@ wait_service() {
     if [[ $state == active ]]; then
       case $kind in
         app)
-          code=$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 2 --max-time 3 \
-            "http://127.0.0.1:${STATE[APP_PORT]}/healthz") || code=000
-          [[ $code =~ ^200$ ]] && value=1
+          code=$(curl -sS -w '\n%{http_code}' --connect-timeout 2 --max-time 3 \
+            "http://127.0.0.1:${STATE[APP_PORT]}/healthz") || code=""
+          [[ $code == $'OK\n200' || $code == $'OK\n\n200' ]] && value=1
           ;;
         postgres)
           timeout 5 podman exec "$container" pg_isready -q -h 127.0.0.1 -U postgres -d postgres && value=1
@@ -1054,7 +1495,15 @@ wait_service() {
   return 1
 }
 validate_candidate() {
-  local id=$1 old_user new_user actual major uid gid path version
+  local id=$1 old_user new_user candidate_owner current_uid current_gid
+  if [[ $COMPONENT == APP ]]; then
+    candidate_owner=$(/usr/local/sbin/searxng-image-check "$id" "${STATE[APP_PORT]}" "${STATE[APP_TZ]}")
+    current_uid=$(podman exec searxng id -u searxng)
+    current_gid=$(podman exec searxng id -g searxng)
+    [[ $candidate_owner == "$current_uid:$current_gid" ]] \
+      || die "SearXNG image UID/GID changed; review ownership before updating. No image switch performed."
+    return 0
+  fi
   # Only the image shell runs, without network or data mounts. The candidate
   # application never gets production data during validation.
   podman run --rm --pull=never --network none --entrypoint /bin/sh "$id" -c true
@@ -1075,9 +1524,129 @@ with open(sys.argv[2], "rb") as f:
 CONFIG_CHECK
   :
 }
-post_update_checks() {
+runtime_checks() {
+python3 - "${STATE[APP_PORT]}" "${STATE[APP_TZ]}" <<'RUNTIME_CHECK'
+import hashlib
+import ipaddress
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
 
-  :
+def capture(args):
+    result = subprocess.run(args, text=True, capture_output=True, timeout=20)
+    if result.returncode:
+        raise RuntimeError('Inspection failed: ' + args[0] + ' (rc=' + str(result.returncode) + ')')
+    return result.stdout.strip()
+
+def require(ok, label):
+    if not ok:
+        raise ValueError(label)
+
+try:
+    port = int(sys.argv[1])
+    firewall = json.loads(Path('/opt/searxng/ufw-policy.json').read_text())
+    require(firewall['port'] == port, 'Application and firewall ports disagree')
+    # Early readiness precedes hardening; later checks verify the guest's final zone.
+    timezone_policy = Path('/var/lib/lab-hardening/policy.json')
+    if timezone_policy.exists():
+        actual_timezone = capture(['/usr/local/sbin/lab-timezone', 'check', str(timezone_policy)])
+        require(actual_timezone == sys.argv[2], 'SearXNG TZ differs from the effective guest timezone')
+    processes = {}
+    for name, user, mounts, files in (
+        ('searxng', 'searxng',
+         {'/etc/searxng': '/opt/searxng/config', '/var/cache/searxng': '/opt/searxng/cache'},
+         {'/etc/searxng/settings.yml': '/opt/searxng/config/settings.yml',
+          '/etc/searxng/limiter.toml': '/opt/searxng/config/limiter.toml'}),
+        ('searxng-valkey', 'valkey',
+         {'/etc/valkey/valkey.conf': '/opt/searxng/valkey.conf'},
+         {'/etc/valkey/valkey.conf': '/opt/searxng/valkey.conf'}),
+    ):
+        inspection = json.loads(capture(['podman', 'inspect', name]))
+        require(len(inspection) == 1, name + ': ambiguous container identity')
+        data = inspection[0]
+        require(data['Name'].lstrip('/') == name and data['State']['Running'], name + ': not running')
+        require(data['HostConfig']['NetworkMode'] == 'host', name + ': expected host networking')
+        actual = {item['Destination']: item for item in data['Mounts']}
+        for destination, source in mounts.items():
+            item = actual.get(destination, {})
+            require(item.get('Type') == 'bind' and item.get('Source') == source,
+                    name + ': incorrect persistent/config mount ' + destination)
+            require(item.get('RW') == (name == 'searxng'), name + ': wrong mount write access ' + destination)
+        for destination, source in files.items():
+            expected = hashlib.sha256(Path(source).read_bytes()).hexdigest()
+            seen = capture(['podman', 'exec', name, 'sha256sum', destination]).split()[0]
+            require(seen == expected, name + ': configuration delivery mismatch ' + destination)
+        uid = int(capture(['podman', 'exec', name, 'id', '-u', user]))
+        gid = int(capture(['podman', 'exec', name, 'id', '-g', user]))
+        require(uid != 0, name + ': service account is root')
+        rows = capture(['podman', 'top', name, 'hpid']).splitlines()
+        require(rows and rows[0].strip() == 'HPID', name + ': unrecognized process inventory')
+        pids = {int(row.strip()) for row in rows[1:]}
+        require(pids, name + ': missing process inventory')
+        owned = set()
+        unexpected = []
+        for pid in pids:
+            try:
+                status = Path('/proc', str(pid), 'status').read_text()
+            except FileNotFoundError:
+                continue
+            values = re.search(r'^Uid:\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)', status, re.M)
+            groups = re.search(r'^Gid:\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)', status, re.M)
+            if values and groups and all(int(value) == uid for value in values.groups()) \
+                    and all(int(value) == gid for value in groups.groups()):
+                owned.add(pid)
+            else:
+                unexpected.append(str(pid) + ':UID=' + (values[2] if values else '?')
+                                  + ':GID=' + (groups[2] if groups else '?'))
+        require(not unexpected, name + ': expected every process to use UID:GID='
+                + str(uid) + ':' + str(gid) + '; observed ' + ', '.join(unexpected))
+        require(owned, name + ': no readable process running under the expected service UID/GID')
+        processes[name] = owned
+        if name == 'searxng':
+            require(data['Config'].get('User') == str(uid) + ':' + str(gid),
+                    'SearXNG container User/Group does not match its service account')
+            for path in (*mounts.values(), *files.values()):
+                info = Path(path).stat()
+                require((info.st_uid, info.st_gid) == (uid, gid), 'SearXNG ownership mismatch: ' + path)
+            require(Path('/opt/searxng/config/settings.yml').stat().st_mode & 0o007 == 0,
+                    'SearXNG settings/secret readable by other users')
+            environment = dict(item.split('=', 1) for item in data['Config']['Env'] if '=' in item)
+            for key, expected in {'SEARXNG_PORT': str(port), 'GRANIAN_HOST': '0.0.0.0',
+                                  'FORCE_OWNERSHIP': 'false', 'TZ': sys.argv[2]}.items():
+                require(environment.get(key) == expected, 'SearXNG environment mismatch: ' + key)
+        print('  Runtime identity: ' + name + ' UID:GID=' + str(uid) + ':' + str(gid)
+              + '; mounts and configuration delivery verified.')
+
+    seen = set()
+    for line in capture(['ss', '-H', '-lntp']).splitlines():
+        fields = line.split()
+        require(len(fields) >= 4, 'Unrecognized TCP socket inventory')
+        address, socket_port = fields[3].rsplit(':', 1)
+        socket_port = int(socket_port)
+        if socket_port not in (port, 6379):
+            continue
+        address = address.split('%', 1)[0].strip('[]')
+        owners = {int(value) for value in re.findall(r'pid=(\d+)', line)}
+        name = 'searxng' if socket_port == port else 'searxng-valkey'
+        require(bool(owners & processes[name]), name + ': listener has no verified service process owner')
+        if socket_port == 6379:
+            require(ipaddress.ip_address(address).is_loopback, 'Valkey listener is exposed beyond loopback')
+        else:
+            require(address == '0.0.0.0', 'SearXNG listener is not on the configured IPv4 address')
+        seen.add(socket_port)
+    require(seen == {port, 6379}, 'Required SearXNG/Valkey listener missing')
+    print('  TCP listener owners verified: SearXNG 0.0.0.0:' + str(port) + '; Valkey loopback:6379.')
+except Exception as exc:
+    print('ERROR: SearXNG runtime verification: ' + str(exc), file=sys.stderr)
+    raise SystemExit(1)
+RUNTIME_CHECK
+}
+
+post_update_checks() {
+  runtime_checks
 }
 finish() {
   local rc=$? restored=1
@@ -1247,7 +1816,8 @@ case $cmd in
       actual=$(podman inspect --format '{{.Image}}' "$CONTAINER")
       [[ $(image_id "$actual") == "$OLD_ID" ]] || die "Running/configured image mismatch: $SERVICE"
     done
-    printf '  Service readiness, stable restart counts, image IDs and UFW checks passed.\n'
+    runtime_checks
+    printf '  Readiness, stable restart counts, image IDs, mounts, ownership, sockets and UFW checks passed.\n'
     ;;
   version)
     (( $# == 1 )) || die "version takes no argument."
@@ -1269,6 +1839,7 @@ pct push "$CT_ID" "$tmp" /usr/local/bin/searxng-maint.sh --perms 0755
 rm -f -- "$tmp"
 
 # ── Start via Quadlet ─────────────────────────────────────────────────────────
+INSTALL_STAGE="Quadlet compatibility"
 pct exec "$CT_ID" -- bash -s -- searxng-valkey searxng <<'QUADLET_VALIDATE'
 set -euo pipefail
 output=$(mktemp)
@@ -1285,16 +1856,15 @@ QUADLET_VALIDATE
 pct exec "$CT_ID" -- /usr/local/sbin/searxng-ufw-check
 # Preserve the CT even if the first persistent start fails partway through.
 CLEANUP_ON_FAIL=0
+INSTALL_STAGE="application startup"
 pct exec "$CT_ID" -- systemctl start searxng.service
 
 # Destructive cleanup was disarmed before the first persistent service start.
 
-# ── Verification ──────────────────────────────────────────────────────────────
+# ── Early application readiness ───────────────────────────────────────────────
+INSTALL_STAGE="early application verification"
 sleep 30
-if ! pct exec "$CT_ID" -- /usr/local/bin/searxng-maint.sh check --initial; then
-  echo "ERROR: Initial readiness/image/firewall verification failed; CT $CT_ID is preserved." >&2
-  exit 1
-fi
+pct exec "$CT_ID" -- /usr/local/bin/searxng-maint.sh check --initial
 VERIFY_FAIL=0
 
 for svc in "$VALKEY_QUADLET_SERVICE" "$QUADLET_SERVICE"; do
@@ -1337,9 +1907,10 @@ fi
 # /healthz is exempt from the limiter, so this probe is valid from inside the CT.
 SX_HEALTHY=0
 for i in $(seq 1 90); do
-  HTTP_CODE="$(pct exec "$CT_ID" -- sh -lc "curl -s -o /dev/null -w '%{http_code}' --max-time 3 'http://127.0.0.1:${APP_PORT}/healthz' 2>/dev/null" 2>/dev/null || echo 000)"
-  case "$HTTP_CODE" in
-    200)
+  HTTP_RESPONSE=$(pct exec "$CT_ID" -- curl -sS -w '\n%{http_code}' --connect-timeout 2 --max-time 3 "http://127.0.0.1:${APP_PORT}/healthz") || HTTP_RESPONSE=""
+  HTTP_CODE=${HTTP_RESPONSE##*$'\n'}
+  case "$HTTP_RESPONSE" in
+    $'OK\n200'|$'OK\n\n200')
       SX_HEALTHY=1
       break
       ;;
@@ -1350,7 +1921,7 @@ done
 if [[ "$SX_HEALTHY" -eq 1 ]]; then
   echo "  SearXNG health check passed (HTTP $HTTP_CODE)"
 else
-  echo "  ERROR: SearXNG /healthz did not return 200 on port ${APP_PORT}" >&2
+  echo "  ERROR: SearXNG /healthz did not return HTTP 200 with body OK on port ${APP_PORT}" >&2
   echo "  Check: pct exec $CT_ID -- systemctl status searxng.service" >&2
   echo "  Check: pct exec $CT_ID -- journalctl -u searxng.service --no-pager -n 80" >&2
   VERIFY_FAIL=1
@@ -1364,14 +1935,14 @@ if pct exec "$CT_ID" -- sh -lc 'journalctl -u searxng.service --no-pager -o cat 
   echo "  Check: pct exec $CT_ID -- journalctl -u searxng.service --no-pager -n 80" >&2
   VERIFY_FAIL=1
 else
-  echo "  Limiter connected to Valkey (no connection errors in startup log)"
+  echo "  No limiter/Valkey connection errors detected in the startup log."
 fi
 
 
 if (( VERIFY_FAIL == 1 )); then
   echo "" >&2
   echo "  FATAL: Core verification failed — CT $CT_ID is preserved but the install is incomplete." >&2
-  echo "  Inspect the container and fix manually, or destroy and re-run." >&2
+  echo "  Keep this CT for read-only diagnosis. Use a corrected creator with a new unused CT_ID and HN." >&2
   exit 1
 fi
 
@@ -1406,74 +1977,21 @@ else
   pct exec "$CT_ID" -- systemctl disable --now searxng-update.timer
 fi
 
-# ── Unattended upgrades ───────────────────────────────────────────────────────
-pct exec "$CT_ID" -- bash -lc '
-  set -euo pipefail
-  export DEBIAN_FRONTEND=noninteractive
-  apt-get update -qq
-  apt-get install -y unattended-upgrades
-  distro_codename="$(. /etc/os-release && echo "$VERSION_CODENAME")"
-  cat > /etc/apt/apt.conf.d/52unattended-$(hostname).conf <<EOF2
-Unattended-Upgrade::Origins-Pattern {
-        "origin=Debian,codename=${distro_codename},label=Debian-Security";
-        "origin=Debian,codename=${distro_codename}-security";
-        "origin=Debian,codename=${distro_codename},label=Debian";
-        "origin=Debian,codename=${distro_codename}-updates,label=Debian";
-};
-Unattended-Upgrade::Package-Blacklist {};
-Unattended-Upgrade::AutoFixInterruptedDpkg "true";
-Unattended-Upgrade::MinimalSteps "true";
-Unattended-Upgrade::InstallOnShutdown "false";
-Unattended-Upgrade::Remove-New-Unused-Dependencies "true";
-Unattended-Upgrade::Remove-Unused-Dependencies "true";
-Unattended-Upgrade::Automatic-Reboot "false";
-EOF2
-
-  cat > /etc/apt/apt.conf.d/20auto-upgrades <<EOF2
-APT::Periodic::Update-Package-Lists "1";
-APT::Periodic::Unattended-Upgrade "1";
-APT::Periodic::AutocleanInterval "7";
-EOF2
-
-  systemctl enable --now unattended-upgrades
-'
-
 # ── Extra packages ────────────────────────────────────────────────────────────
 if [[ "${#EXTRA_PACKAGES[@]}" -gt 0 ]]; then
   pct exec "$CT_ID" -- bash -lc "
     set -euo pipefail
-    export DEBIAN_FRONTEND=noninteractive
+    export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l
     apt-get install -y ${EXTRA_PACKAGES[*]}
   "
 fi
 
-# ── Sysctl hardening ──────────────────────────────────────────────────────────
-pct exec "$CT_ID" -- bash -lc '
-  set -euo pipefail
-  cat > /etc/sysctl.d/99-hardening.conf <<EOF2
-net.ipv4.conf.all.rp_filter = 1
-net.ipv4.conf.default.rp_filter = 1
-net.ipv4.conf.all.accept_redirects = 0
-net.ipv4.conf.default.accept_redirects = 0
-net.ipv4.conf.all.send_redirects = 0
-net.ipv4.conf.default.send_redirects = 0
-net.ipv4.conf.all.accept_source_route = 0
-net.ipv4.conf.default.accept_source_route = 0
-net.ipv4.icmp_echo_ignore_broadcasts = 1
-net.ipv4.icmp_ignore_bogus_error_responses = 1
-EOF2
-  if ! sysctl --system >/dev/null 2>&1; then
-    echo "  WARNING: sysctl --system reported errors — some keys may be read-only in this unprivileged CT:" >&2
-    sysctl --system 2>&1 | grep -i "error\|permission" >&2 || true
-  fi
-'
-
 # ── Cleanup packages ──────────────────────────────────────────────────────────
+INSTALL_STAGE="package cleanup and MOTD"
 pct exec "$CT_ID" -- bash -lc '
   set -euo pipefail
-  export DEBIAN_FRONTEND=noninteractive
-  apt-get purge -y man-db manpages 2>/dev/null || true
-  apt-get -y autoremove
+  export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l
+  apt-get purge -y man-db manpages
   apt-get -y clean
 '
 
@@ -1543,6 +2061,1072 @@ pct exec "$CT_ID" -- bash -lc '
   grep -q "^export TERM=" /root/.bashrc 2>/dev/null || echo "export TERM=xterm-256color" >> /root/.bashrc
 '
 
+# ── Shared hardening caller boundary ─────────────────────────────────────────
+INSTALL_STAGE="shared hardening"
+CLEANUP_ON_FAIL=0
+# Verified Proxmox-only caller: a host login marker is not a guest SSH session.
+# The standalone block's real guest-SSH guard remains intact.
+unset SSH_CONNECTION
+UFW_RULES_BEFORE=$(pct exec "$CT_ID" -- bash -s <<'UFW_SNAPSHOT_BEFORE'
+set -euo pipefail
+sha256sum /etc/ufw/{before,after,user}{,6}.rules
+iptables -w 5 -S
+ip6tables -w 5 -S
+UFW_SNAPSHOT_BEFORE
+)
+
+# BEGIN LAB HARDENING v1.2.0 (byte-for-byte timezone-adapted standalone)
+#!/usr/bin/env bash
+# ── Shared Debian 13 LXC hardening block ───────────────────────────────────────
+# Version: 1.2.0 (2026-09-15; user-authorized LXC timezone adaptation)
+# Base v1.1.2 SHA-256: ae2fa917d7dfe007c5f3700ea9d8c6686867a892d4323af2eb78c847092c3774
+# Timezone policy source: debian-hardening.sh v1.0.3; native access code excluded.
+# Guest-only /etc/localtime handling replaces the native timedated dependency.
+# Timezone backups are observational; later failures have no automatic undo.
+# Paste this whole file AFTER the creator's MOTD/cleanup steps and BEFORE its
+# final verification/summary. Later MOTD code must not delete 25-lab-hardening.
+# Replace its old unattended-upgrades and sysctl sections with this block.
+# The initial OS upgrade and application/UFW setup must already have run.
+# Keep application-specific ports, source rules, users, health checks and units.
+# Creators retain set -Eeo pipefail and their ERR trap; do not invoke this block
+# as the condition of an if/! command. Late failures must preserve the CT.
+#
+# On PVE: an existing running CT_ID is mandatory; all changes run via pct exec.
+# Direct: root inside an existing Debian 13 LXC. Other environments are refused.
+# Scope: Proxmox service LXCs without routing, including Podman Network=host.
+# Routers, VPN gateways and containers using bridge forwarding need another policy.
+#
+# Features: dual-stack sysctl policy and UFW checks; scoped service removal;
+# Debian updates without auto-reboot; conservative dependency cleanup;
+# persistent bounded journals; report-only needrestart; APT readiness repair;
+# hourly/boot checks, local status reporting, configuration backups.
+# No remote downloads of scripts; no changes to app images or Proxmox config.
+# Reports are local (journal, status.json, MOTD); no email/webhook is configured.
+# Re-running saves a new config backup; package removals have no automatic undo.
+# UFW logging and all allow/deny rules retain the installer's existing policy.
+#
+# Managed paths:
+#   /etc/localtime; existing /etc/timezone (set mode only)
+#   /usr/local/sbin/lab-timezone (plan/check read-only; apply internal)
+#   /etc/sysctl.d/99-hardening.conf
+#   /etc/apt/apt.conf.d/99-lab-hardening
+#   /etc/needrestart/conf.d/99-lab-hardening.conf
+#   /etc/systemd/journald.conf.d/99-lab-hardening.conf
+#   /etc/systemd/system/apt-daily{,-upgrade}.service.d/90-lab-readiness.conf (LXC)
+#   /etc/systemd/system/lab-hardening-check.{service,timer}
+#   /usr/local/sbin/lab-{apt-wait-online,hardening-check,postfix-check}
+#   /etc/update-motd.d/25-lab-hardening
+#   /etc/default/ufw (IPT_SYSCTL only); SSH service/socket masks (when SSH removed)
+#   /etc/systemd/system/postfix*.{service,socket,path} masks (when Postfix removed)
+#   /var/lib/lab-hardening/{policy.json,status.json,last-index-refresh,check.lock}
+#   /var/backups/lab-hardening/<run>/ (configuration copies and dry-run log)
+# References: Debian trixie apt.conf(5), systemd-sysctl(8), ifquery(8),
+# journald.conf(5), needrestart(1); kernel.org networking/ip-sysctl.html.
+#
+# Settings may instead be assigned in the creator's top config section.
+SERVER_TIMEZONE="${SERVER_TIMEZONE-Europe/Berlin}"
+PRESERVE_EXISTING_TIMEZONE="${PRESERVE_EXISTING_TIMEZONE-0}" # 0=set; 1=keep guest zone
+HARDENING_PROFILE="${HARDENING_PROFILE:-lxc}"              # lxc; auto remains a compatible alias
+HARDENING_RP_FILTER="${HARDENING_RP_FILTER:-1}"            # 1=strict; 2=loose for asymmetric paths
+HARDENING_KEEP_SSH="${HARDENING_KEEP_SSH:-0}"              # 0=remove; 1=preserve
+HARDENING_REMOVE_POSTFIX="${HARDENING_REMOVE_POSTFIX:-1}"   # 0 for intentional mail service
+HARDENING_JOURNAL_DAYS="${HARDENING_JOURNAL_DAYS:-14}"
+HARDENING_JOURNAL_MAX_MB="${HARDENING_JOURNAL_MAX_MB:-256}"
+HARDENING_JOURNAL_RUNTIME_MB="${HARDENING_JOURNAL_RUNTIME_MB:-64}"
+HARDENING_UPDATE_MAX_AGE_HOURS="${HARDENING_UPDATE_MAX_AGE_HOURS:-72}"
+# Optional space-separated external listening ports; leave empty to inventory
+# only. Loopback listeners are excluded. For DHCP include UDP 68 (and 546 if used).
+# Examples: Matrix TCP="8008 8080" UDP="68"; NPM TCP="80 443 81" UDP="68".
+# If preserving SSH, include its actual listening port in the TCP list.
+HARDENING_TCP_PORTS="${HARDENING_TCP_PORTS:-}"
+HARDENING_UDP_PORTS="${HARDENING_UDP_PORTS:-}"
+
+# ── Dispatch into the guest ───────────────────────────────────────────────────
+# The subshell isolates the block's options/variables from its parent creator.
+# shellcheck disable=SC2034
+CLEANUP_ON_FAIL=0
+(
+set -Eeuo pipefail
+export LC_ALL=C
+[[ $EUID == 0 ]] || { echo 'ERROR: Run as root.' >&2; exit 1; }
+hardening_exec=()
+if command -v pveversion >/dev/null 2>&1; then
+  [[ ${CT_ID:-} =~ ^[1-9][0-9]+$ ]] || {
+    echo 'ERROR: On Proxmox, supply an existing CT_ID; the host is never hardened.' >&2; exit 1;
+  }
+  pct status "$CT_ID" | grep -qx 'status: running'
+  hardening_exec=(pct exec "$CT_ID" --)
+fi
+"${hardening_exec[@]}" bash -s -- \
+  "$HARDENING_PROFILE" "$HARDENING_RP_FILTER" "$HARDENING_KEEP_SSH" \
+  "$HARDENING_REMOVE_POSTFIX" "$HARDENING_JOURNAL_DAYS" \
+  "$HARDENING_JOURNAL_MAX_MB" "$HARDENING_JOURNAL_RUNTIME_MB" \
+  "$HARDENING_UPDATE_MAX_AGE_HOURS" "$HARDENING_TCP_PORTS" \
+  "$HARDENING_UDP_PORTS" "$PRESERVE_EXISTING_TIMEZONE" "$SERVER_TIMEZONE" <<'LAB_HARDENING_GUEST'
+set -Eeuo pipefail
+umask 022
+export LC_ALL=C DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+PROFILE=$1 RP_FILTER=$2 KEEP_SSH=$3 REMOVE_POSTFIX=$4
+JOURNAL_DAYS=$5 JOURNAL_MAX_MB=$6 JOURNAL_RUNTIME_MB=$7 UPDATE_MAX_AGE=$8
+TCP_PORTS=$9 UDP_PORTS=${10}
+PRESERVE_TIMEZONE=${11} REQUESTED_TIMEZONE=${12}
+[[ $EUID == 0 && -d /run/systemd/system ]] || {
+  echo 'ERROR: A running systemd guest and root access are required.' >&2; exit 1;
+}
+command -v pveversion >/dev/null 2>&1 && {
+  echo 'ERROR: Refusing to change a Proxmox host.' >&2; exit 1;
+}
+# shellcheck disable=SC1091
+. /etc/os-release
+[[ $ID == debian && $VERSION_ID == 13 ]] || {
+  echo 'ERROR: This policy requires Debian 13.' >&2; exit 1;
+}
+container=$(systemd-detect-virt --container || true)
+[[ $container == lxc ]] || {
+  echo 'ERROR: This block requires a Debian 13 LXC container.' >&2; exit 1;
+}
+[[ $PROFILE == lxc || $PROFILE == auto ]] || {
+  echo 'ERROR: Only the lxc hardening profile is supported.' >&2; exit 1;
+}
+PROFILE=lxc
+[[ $RP_FILTER == auto ]] && RP_FILTER=1
+[[ $KEEP_SSH == auto ]] && KEEP_SSH=0
+[[ $RP_FILTER =~ ^[12]$ && $KEEP_SSH =~ ^[01]$ && $REMOVE_POSTFIX =~ ^[01]$ ]] || {
+  echo 'ERROR: Invalid hardening setting.' >&2; exit 1;
+}
+[[ $KEEP_SSH == 1 || -z ${SSH_CONNECTION:-} ]] || {
+  echo 'ERROR: Run through pct exec/console before removing SSH, or set HARDENING_KEEP_SSH=1.' >&2; exit 1;
+}
+for value in "$JOURNAL_DAYS" "$JOURNAL_MAX_MB" "$JOURNAL_RUNTIME_MB" "$UPDATE_MAX_AGE"; do
+  [[ $value =~ ^[1-9][0-9]{0,3}$ ]] || { echo 'ERROR: Numeric policy values must be 1..9999.' >&2; exit 1; }
+done
+for port in $TCP_PORTS $UDP_PORTS; do
+  if [[ ! $port =~ ^[1-9][0-9]{0,4}$ ]] || (( port > 65535 )); then
+    echo 'ERROR: Port lists require space-separated numbers from 1 to 65535.' >&2; exit 1
+  fi
+done
+for command in ufw iptables ip6tables ip ss sysctl python3 systemctl apt-get flock timeout; do
+  command -v "$command" >/dev/null || { echo "ERROR: Missing prerequisite: $command" >&2; exit 1; }
+done
+exec 9>/run/lock/lab-hardening-install.lock
+flock -n 9 || { echo 'ERROR: Hardening is already running.' >&2; exit 1; }
+
+# Check before any changes. Existing forwarding usually means bridge/VPN/router
+# functionality; do not silently break it with a service-host policy.
+for path in /proc/sys/net/ipv4/ip_forward /proc/sys/net/{ipv4,ipv6}/conf/*/forwarding; do
+  [[ -r $path && $(cat "$path") == 0 ]] || {
+    echo "ERROR: Forwarding enabled/unavailable at $path; review the guest network role." >&2; exit 1;
+  }
+done
+ufw status | grep -qx 'Status: active'
+grep -qx 'IPV6=yes' /etc/default/ufw
+for tool in iptables ip6tables; do
+  prefix=ufw; [[ $tool != ip6tables ]] || prefix=ufw6
+  "$tool" -w 5 -S INPUT | grep -qx -- '-P INPUT DROP'
+  "$tool" -w 5 -S FORWARD | grep -qx -- '-P FORWARD DROP'
+  "$tool" -w 5 -C INPUT -j "$prefix-before-input"
+  "$tool" -w 5 -S "$prefix-user-input" >/dev/null
+done
+
+# ── Staging and backups ───────────────────────────────────────────────────────
+stage=$(mktemp -d /var/tmp/lab-hardening.XXXXXX)
+chmod 0700 "$stage"
+backup="/var/backups/lab-hardening/$(date -u +%Y%m%dT%H%M%SZ)-$$"
+install -d -m 0700 "$backup"
+hardening_exit=0
+trap 'hardening_exit=$?; rm -rf -- "$stage"; exit "$hardening_exit"' EXIT
+trap 'echo "ERROR: Hardening failed near guest line $LINENO. Guest preserved; config backups: $backup" >&2' ERR
+# Timezone policy is owned here, inside the verified LXC dispatch boundary.
+# Validate and apply before package operations; preserve mode makes no timezone writes.
+cat > "$stage/timezone.py" <<'TIMEZONE_HELPER'
+#!/usr/bin/python3
+"""LXC timezone policy, adapted from debian-hardening.sh v1.0.3.
+
+Only apply writes timezone files; plan/check are read-only. No timedated,
+clock, RTC, NTP, SSH, or access-recovery operations are performed.
+"""
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+from zoneinfo import ZoneInfo
+
+ZONES = Path('/usr/share/zoneinfo')
+LOCALTIME = Path('/etc/localtime')
+TIMEZONE = Path('/etc/timezone')
+
+
+def guest_guard():
+    if os.geteuid() != 0 or shutil.which('pveversion') or Path('/etc/pve').exists():
+        raise ValueError('Timezone operations require root inside the selected Debian 13 LXC.')
+    release = dict(line.split('=', 1) for line in Path('/etc/os-release').read_text().splitlines()
+                   if '=' in line and not line.startswith('#'))
+    if release.get('ID', '').strip('"') != 'debian' or release.get('VERSION_ID', '').strip('"') != '13':
+        raise ValueError('Timezone policy requires Debian 13.')
+    result = subprocess.run(['systemd-detect-virt', '--container'], text=True,
+                            capture_output=True, timeout=10)
+    if result.returncode or result.stdout.strip() != 'lxc':
+        raise ValueError('Timezone policy refuses environments other than LXC.')
+
+
+def zone_path(name):
+    # Same name grammar as the native source; validate against guest tzdata.
+    if not re.fullmatch(r'[A-Za-z0-9_+-]+(?:/[A-Za-z0-9_+-]+)*', name):
+        raise ValueError('Invalid SERVER_TIMEZONE; use an installed IANA timezone name.')
+    if name.split('/')[0] in ('posix', 'right', 'localtime', 'posixrules'):
+        raise ValueError('SERVER_TIMEZONE must identify an IANA zone, not a special tzdata tree.')
+    path = ZONES / name
+    try:
+        path.resolve(strict=True).relative_to(ZONES.resolve(strict=True))
+        with path.open('rb') as stream:
+            ZoneInfo.from_file(stream, key=name)
+    except (OSError, ValueError) as exc:
+        raise ValueError('Timezone is unavailable or invalid in this guest: ' + name) from exc
+    return path
+
+
+def effective_timezone():
+    if not LOCALTIME.exists() and not LOCALTIME.is_symlink():
+        zone_path('UTC')
+        return 'UTC'  # localtime(5): absent /etc/localtime means UTC.
+    if LOCALTIME.is_symlink():
+        # Keep the selected alias, rather than resolving US/Eastern to another name.
+        link = Path(os.path.normpath(LOCALTIME.parent / os.readlink(LOCALTIME)))
+        try:
+            name = str(link.relative_to(ZONES))
+        except ValueError as exc:
+            raise ValueError('/etc/localtime does not link into the guest zoneinfo tree.') from exc
+        zone_path(name)
+        return name
+    if LOCALTIME.is_file() and TIMEZONE.is_file() and not TIMEZONE.is_symlink():
+        name = TIMEZONE.read_text().strip()
+        if LOCALTIME.read_bytes() == zone_path(name).read_bytes():
+            return name
+    raise ValueError('Cannot identify the guest timezone from /etc/localtime and /etc/timezone.')
+
+
+def fingerprint(path):
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return {'kind': 'absent'}
+    if stat.S_ISLNK(info.st_mode):
+        return {'kind': 'symlink', 'target': os.readlink(path)}
+    if stat.S_ISREG(info.st_mode):
+        return {'kind': 'file', 'sha256': hashlib.sha256(path.read_bytes()).hexdigest()}
+    raise ValueError('Unsupported timezone file type: ' + str(path))
+
+
+def fingerprints():
+    return {str(path): fingerprint(path) for path in (LOCALTIME, TIMEZONE)}
+
+
+def plan(preserve, requested):
+    if preserve not in ('0', '1'):
+        raise ValueError('PRESERVE_EXISTING_TIMEZONE must be exactly 0 or 1.')
+    if preserve == '0':
+        zone_path(requested)
+        if TIMEZONE.is_symlink() or (TIMEZONE.exists() and not TIMEZONE.is_file()):
+            raise ValueError('Refusing to replace a non-regular /etc/timezone.')
+    before = effective_timezone()
+    return {'preserve': preserve == '1', 'requested': None if preserve == '1' else requested,
+            'before': before, 'effective': before if preserve == '1' else requested,
+            'files_before': fingerprints()}
+
+
+def verify(setting):
+    actual = effective_timezone()
+    if actual != setting['effective']:
+        raise ValueError('Guest timezone drift: expected ' + setting['effective'] + ', found ' + actual)
+    expected_files = setting.get('files', setting['files_before'])
+    if fingerprints() != expected_files:
+        raise ValueError('Guest timezone files changed; review /etc/localtime and /etc/timezone.')
+    return actual
+
+
+def apply(setting, backup):
+    if fingerprints() != setting['files_before'] or effective_timezone() != setting['before']:
+        raise ValueError('Guest timezone changed after validation; refusing to overwrite it.')
+    if not setting['preserve']:
+        target = zone_path(setting['requested'])
+        saved = Path(backup) / 'timezone'
+        saved.mkdir(mode=0o700, parents=True, exist_ok=False)
+        (saved / 'before.json').write_text(json.dumps(setting, indent=2) + '\n')
+        for path in (LOCALTIME, TIMEZONE):
+            if path.exists() or path.is_symlink():
+                shutil.copy2(path, saved / path.name, follow_symlinks=False)
+        # Atomic per-file replacement; no automatic undo of a later failure.
+        if setting['before'] != setting['requested']:
+            with tempfile.TemporaryDirectory(prefix='.lab-timezone-', dir=LOCALTIME.parent) as tmp:
+                replacement = Path(tmp) / 'localtime'
+                replacement.symlink_to(target)
+                os.replace(replacement, LOCALTIME)
+        # Debian uses /etc/localtime. Keep an existing legacy file consistent;
+        # do not introduce /etc/timezone when the template does not maintain it.
+        desired = setting['requested'] + '\n'
+        if TIMEZONE.exists() and TIMEZONE.read_text() != desired:
+            with tempfile.TemporaryDirectory(prefix='.lab-timezone-', dir=TIMEZONE.parent) as tmp:
+                replacement = Path(tmp) / 'timezone'
+                replacement.write_text(desired)
+                replacement.chmod(0o644)
+                os.replace(replacement, TIMEZONE)
+    final = {**setting, 'files': fingerprints()}
+    if setting['preserve'] and final['files'] != setting['files_before']:
+        raise ValueError('Preserve mode detected a timezone-file change.')
+    verify(final)
+    return final
+
+
+def main():
+    guest_guard()
+    if len(sys.argv) == 4 and sys.argv[1] == 'plan':
+        print(json.dumps(plan(sys.argv[2], sys.argv[3])))
+    elif len(sys.argv) == 4 and sys.argv[1] == 'apply':
+        setting = json.loads(Path(sys.argv[2]).read_text())
+        print(json.dumps(apply(setting, sys.argv[3])))
+    elif len(sys.argv) == 3 and sys.argv[1] == 'check':
+        policy = json.loads(Path(sys.argv[2]).read_text())
+        print(verify(policy['timezone']))
+    else:
+        raise ValueError('Invalid timezone helper arguments.')
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except Exception as exc:
+        print('ERROR: LXC timezone: ' + str(exc), file=sys.stderr)
+        raise SystemExit(1)
+TIMEZONE_HELPER
+python3 "$stage/timezone.py" plan "$PRESERVE_TIMEZONE" "$REQUESTED_TIMEZONE" > "$stage/timezone-plan.json"
+python3 "$stage/timezone.py" apply "$stage/timezone-plan.json" "$backup" > "$stage/timezone-policy.json"
+install -d -m 0755 /var/lib/lab-hardening
+if [[ $(systemctl show lab-hardening-check.timer -p LoadState --value) == loaded ]]; then
+  systemctl stop lab-hardening-check.timer
+  systemctl stop lab-hardening-check.service
+fi
+
+# APT package operations use locks, strict download errors, and report-only
+# needrestart. No dist-upgrade is performed late in an already running app install.
+apt-get -o DPkg::Lock::Timeout=120 -o APT::Update::Error-Mode=any update
+date +%s > "$stage/index-refreshed"
+apt-get -o DPkg::Lock::Timeout=120 install -y --no-install-recommends \
+  unattended-upgrades needrestart python3-apt ca-certificates procps
+
+mkdir -p "$stage/etc/apt/apt.conf.d" "$stage/etc/needrestart/conf.d" \
+  "$stage/etc/systemd/journald.conf.d" "$stage/etc/sysctl.d" \
+  "$stage/etc/systemd/system" "$stage/usr/local/sbin" "$stage/etc/update-motd.d"
+install -m 0755 "$stage/timezone.py" "$stage/usr/local/sbin/lab-timezone"
+cat > "$stage/etc/apt/apt.conf.d/99-lab-hardening" <<'APT_POLICY'
+// Managed by lab-hardening-block.sh. Debian release stays fixed at trixie.
+#clear Unattended-Upgrade::Allowed-Origins;
+#clear Unattended-Upgrade::Origins-Pattern;
+Unattended-Upgrade::Origins-Pattern {
+  "origin=Debian,codename=trixie,label=Debian";
+  "origin=Debian,codename=trixie-updates,label=Debian";
+  "origin=Debian,codename=trixie-security,label=Debian-Security";
+};
+// Preserve deliberate package blacklists/holds; report them in the check.
+APT::Periodic::Enable "1";
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Unattended-Upgrade "1";
+APT::Periodic::AutocleanInterval "7";
+APT::Update::Error-Mode "any";
+Unattended-Upgrade::AutoFixInterruptedDpkg "true";
+Unattended-Upgrade::MinimalSteps "true";
+Unattended-Upgrade::InstallOnShutdown "false";
+Unattended-Upgrade::Remove-New-Unused-Dependencies "true";
+Unattended-Upgrade::Remove-Unused-Dependencies "false";
+Unattended-Upgrade::Remove-Unused-Kernel-Packages "false";
+Unattended-Upgrade::Automatic-Reboot "false";
+APT_POLICY
+cat > "$stage/etc/needrestart/conf.d/99-lab-hardening.conf" <<'NEEDRESTART_POLICY'
+# Report only. Package maintainer scripts may still restart their own services.
+$nrconf{restart} = 'l';
+NEEDRESTART_POLICY
+cat > "$stage/etc/systemd/journald.conf.d/99-lab-hardening.conf" <<JOURNAL_POLICY
+[Journal]
+Storage=persistent
+Compress=yes
+SystemMaxUse=${JOURNAL_MAX_MB}M
+SystemKeepFree=128M
+RuntimeMaxUse=${JOURNAL_RUNTIME_MB}M
+MaxRetentionSec=${JOURNAL_DAYS}day
+RateLimitIntervalSec=30s
+RateLimitBurst=10000
+JOURNAL_POLICY
+
+# ── Network policy ───────────────────────────────────────────────────────────
+cat > "$stage/etc/sysctl.d/99-hardening.conf" <<SYSCTL_POLICY
+# Managed by lab-hardening-block.sh: non-routing Debian 13 LXC.
+# Forwarding comes first because changing it can reset IPv4 interface settings.
+net.ipv4.ip_forward = 0
+net.ipv4.conf.all.forwarding = 0
+net.ipv4.conf.default.forwarding = 0
+net.ipv4.conf.*.forwarding = 0
+net.ipv6.conf.all.forwarding = 0
+net.ipv6.conf.default.forwarding = 0
+net.ipv6.conf.*.forwarding = 0
+net.ipv4.conf.all.rp_filter = $RP_FILTER
+net.ipv4.conf.default.rp_filter = $RP_FILTER
+net.ipv4.conf.*.rp_filter = $RP_FILTER
+net.ipv4.conf.all.accept_redirects = 0
+net.ipv4.conf.default.accept_redirects = 0
+net.ipv4.conf.*.accept_redirects = 0
+net.ipv4.conf.all.send_redirects = 0
+net.ipv4.conf.default.send_redirects = 0
+net.ipv4.conf.*.send_redirects = 0
+net.ipv4.conf.all.accept_source_route = 0
+net.ipv4.conf.default.accept_source_route = 0
+net.ipv4.conf.*.accept_source_route = 0
+net.ipv6.conf.all.accept_redirects = 0
+net.ipv6.conf.default.accept_redirects = 0
+net.ipv6.conf.*.accept_redirects = 0
+# -1 rejects all IPv6 routing headers; 0 would still accept type 2.
+net.ipv6.conf.all.accept_source_route = -1
+net.ipv6.conf.default.accept_source_route = -1
+net.ipv6.conf.*.accept_source_route = -1
+net.ipv4.tcp_syncookies = 1
+net.ipv4.icmp_echo_ignore_broadcasts = 1
+net.ipv4.icmp_ignore_bogus_error_responses = 1
+# Preserve IPv6 addressing, router advertisements, autoconf and DHCP.
+SYSCTL_POLICY
+
+# ── APT readiness wrapper ─────────────────────────────────────────────────────
+# No network-manager disabling, DHCP changes or network restarts. Re-evaluate
+# ownership on every APT run; delegate to Debian's helper unless proven safe.
+cat > "$stage/usr/local/sbin/lab-apt-wait-online" <<'APT_WAIT_HELPER'
+#!/usr/bin/python3
+import json
+import os
+import subprocess
+os.environ['LC_ALL'] = 'C'
+os.environ['PATH'] = '/usr/sbin:/usr/bin:/sbin:/bin'
+
+def capture(args):
+    return subprocess.run(args, text=True, capture_output=True, timeout=15, check=True).stdout
+
+try:
+    if capture(['systemd-detect-virt', '--container']).strip() == 'lxc':
+        capture(['systemctl', 'is-active', 'networking.service'])
+        rows = [line.split() for line in capture(
+            ['networkctl', 'list', '--no-legend', '--no-pager']).splitlines() if line.strip()]
+        # An unfamiliar output shape cannot authorize bypassing the stock check.
+        if rows and all(len(row) == 5 and row[4] == 'unmanaged' for row in rows):
+            configured = set(capture(['ifquery', '--list']).split())
+            addresses = json.loads(capture(['ip', '-j', '-4', 'address', 'show']))
+            routes = json.loads(capture(['ip', '-j', '-4', 'route', 'show', 'default']))
+            for link in addresses:
+                name = link['ifname']
+                if (name in configured and 'UP' in link.get('flags', [])
+                        and any(a.get('scope') == 'global' for a in link.get('addr_info', []))
+                        and any(r.get('dev') == name for r in routes)):
+                    capture(['ifquery', '--state', name])
+                    raise SystemExit(0)
+except (OSError, subprocess.SubprocessError, ValueError, KeyError):
+    pass
+os.execv('/usr/lib/apt/apt-helper', ['apt-helper', 'wait-online'])
+APT_WAIT_HELPER
+# Only replace Debian's single stock pre-check, or our own earlier wrapper.
+# Preserve unknown/custom ExecStartPre sequences by refusing to replace them.
+for unit in apt-daily.service apt-daily-upgrade.service; do
+  systemctl show "$unit" -p ExecStartPre --value > "$stage/precheck"
+  python3 - "$stage/precheck" <<'APT_PRECHECK'
+import pathlib, re, sys
+text = pathlib.Path(sys.argv[1]).read_text()
+paths = re.findall(r'path=([^ ;]+)', text)
+if paths not in (['/usr/lib/apt/apt-helper'], ['/usr/local/sbin/lab-apt-wait-online']):
+    raise SystemExit('ERROR: Custom APT ExecStartPre detected; preserve it and review integration.')
+if paths == ['/usr/lib/apt/apt-helper'] and not re.search(r'argv\[\]=/usr/lib/apt/apt-helper wait-online\s*;', text):
+    raise SystemExit('ERROR: Unexpected apt-helper pre-check arguments.')
+APT_PRECHECK
+  mkdir -p "$stage/etc/systemd/system/$unit.d"
+  cat > "$stage/etc/systemd/system/$unit.d/90-lab-readiness.conf" <<'APT_DROPIN'
+[Service]
+ExecStartPre=
+ExecStartPre=-/usr/local/sbin/lab-apt-wait-online
+APT_DROPIN
+done
+
+# ── Postfix inventory and runtime verification (read-only) ────────────────────
+cat > "$stage/usr/local/sbin/lab-postfix-check" <<'POSTFIX_CHECK_HELPER'
+#!/usr/bin/python3
+"""Read-only Postfix inventory and removal checks for the native Debian service."""
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+
+os.environ['LC_ALL'] = 'C'
+os.environ['PATH'] = '/usr/sbin:/usr/bin:/sbin:/bin'
+STANDARD_UNITS = {
+    'postfix.service', 'postfix@.service',
+    'postfix.socket', 'postfix@.socket',
+    'postfix-resolvconf.service', 'postfix-resolvconf.path',
+}
+INSTANCE = re.compile(r'postfix@[^/\s]+\.(?:service|socket)')
+TEMPLATES = {'postfix@.service', 'postfix@.socket'}
+# Debian's packaged daemon names are only an ambiguity guard when procfs denies
+# executable inspection, never sufficient identity for stopping/killing a PID.
+DAEMON_NAMES = {'master', 'anvil', 'bounce', 'cleanup', 'discard', 'dnsblog', 'error',
+                'flush', 'fsstone', 'lmtp', 'local', 'nqmgr', 'oqmgr', 'pickup', 'pipe',
+                'postlogd', 'postscreen', 'proxymap', 'qmgr', 'qmqpd', 'scache', 'showq',
+                'smtp', 'smtpd', 'spawn', 'tlsmgr', 'tlsproxy', 'trivial-rewrite',
+                'verify', 'virtual', 'postfix', 'postmulti', 'postdrop', 'postqueue'}
+
+def is_postfix_unit(name):
+    return name in STANDARD_UNITS or INSTANCE.fullmatch(name) is not None
+
+def command(args):
+    result = subprocess.run(args, capture_output=True, text=True, timeout=30)
+    if result.returncode:
+        raise RuntimeError(f'{" ".join(args)} exited {result.returncode}: '
+                           + (result.stderr.strip()[:1500] or '(no stderr)'))
+    return result.stdout
+
+try:
+    if os.geteuid() != 0:
+        raise ValueError('Root is required to inspect process ownership.')
+    if len(sys.argv) != 2 or sys.argv[1] not in {
+            '--units', '--stop-units', '--check-stopped', '--check-removed'}:
+        raise ValueError('Use --units, --stop-units, --check-stopped or --check-removed.')
+    mode = sys.argv[1]
+    runtime = {}
+    # Include not-found/masked units that systemd still has in memory. Never
+    # equate LoadState=not-found or package absence with a stopped service.
+    output = command(['systemctl', 'list-units', '--all', '--plain', '--full',
+                      '--no-legend', '--no-pager', 'postfix*'])
+    for line in output.splitlines():
+        fields = line.split()
+        if not fields:
+            continue
+        if len(fields) < 4:
+            raise ValueError('Malformed systemd unit inventory.')
+        unit, load, active, sub = fields[:4]
+        if is_postfix_unit(unit):
+            runtime[unit] = (load, active, sub)
+    units = set(STANDARD_UNITS) | runtime.keys()
+    if mode in {'--units', '--check-removed'}:
+        output = command(['systemctl', 'list-unit-files', '--full', '--no-legend',
+                          '--no-pager', 'postfix*'])
+        for line in output.splitlines():
+            fields = line.split()
+            if fields and is_postfix_unit(fields[0]):
+                units.add(fields[0])
+    if mode == '--units':
+        print('\n'.join(sorted(units)))
+        raise SystemExit(0)
+    if mode == '--stop-units':
+        # Only instantiated runtime units need stopping. Templates cannot run;
+        # absent/inactive units would make systemctl stop fail needlessly.
+        pending = [unit for unit, (_, active, _) in runtime.items()
+                   if unit not in TEMPLATES and active != 'inactive']
+        print('\n'.join(sorted(pending, key=lambda u: (u.endswith('.service'), u))))
+        raise SystemExit(0)
+
+    errors = []
+    for unit, (load, active, sub) in sorted(runtime.items()):
+        if active != 'inactive':
+            errors.append(f'{unit}: LoadState={load}, ActiveState={active}, SubState={sub}')
+    # Executable paths catch detached daemons and deleted executables. Cgroup
+    # membership catches remaining workers even if the unit file has vanished.
+    # Do not match a bare process name such as "master" and never signal a PID.
+    for process in Path('/proc').iterdir():
+        if not process.name.isdecimal():
+            continue
+        try:
+            groups = process.joinpath('cgroup').read_text()
+            try:
+                executable = os.readlink(process / 'exe').removesuffix(' (deleted)')
+            except FileNotFoundError:
+                executable = ''  # exited process, kernel thread or zombie
+            except PermissionError:
+                executable = ''
+                # LXC root need not have ptrace access to every unrelated
+                # process. Keep cgroup detection and fail on ambiguous daemon
+                # names instead of requiring extra CT capabilities.
+                name = process.joinpath('comm').read_text().strip()
+                if name in DAEMON_NAMES:
+                    errors.append(f'Cannot exclude a Postfix process: PID={process.name}, '
+                                  f'comm={name}; executable inspection denied')
+            group_owned = any(is_postfix_unit(component)
+                              for line in groups.splitlines()
+                              for component in line.split(':', 2)[-1].split('/'))
+            exe_owned = (executable.startswith(('/usr/lib/postfix/', '/usr/libexec/postfix/'))
+                         or executable in {'/usr/sbin/postfix', '/usr/sbin/postmulti',
+                                           '/usr/sbin/postdrop', '/usr/sbin/postqueue'})
+            if group_owned or exe_owned:
+                errors.append(f'Postfix process remains: PID={process.name}, '
+                              f'executable={executable or "unavailable"}')
+        except FileNotFoundError:
+            continue  # process exited during the read-only scan
+        except OSError as exc:
+            errors.append(f'Cannot inspect PID {process.name}: {exc.strerror}')
+    if mode == '--check-removed':
+        package = subprocess.run(['dpkg-query', '-W', '-f=${db:Status-Status}', 'postfix'],
+                                 capture_output=True, text=True, timeout=30)
+        absent = (package.returncode == 0 and package.stdout.strip() == 'not-installed')
+        absent = absent or (package.returncode == 1 and not package.stdout.strip()
+                            and package.stderr.strip() == 'dpkg-query: no packages found matching postfix')
+        if not absent:
+            errors.append('Postfix package is not confirmed purged: '
+                          + (package.stdout.strip() or package.stderr.strip()[:500] or 'unknown status'))
+        for unit in sorted(units):
+            # is-enabled returns nonzero for masked units; validate its text
+            # and reject runtime-only masks, which would disappear at boot.
+            result = subprocess.run(['systemctl', 'is-enabled', unit],
+                                    capture_output=True, text=True, timeout=30)
+            if result.returncode not in (0, 1) or result.stdout.strip() != 'masked':
+                errors.append(f'Persistent Postfix mask missing: {unit}')
+    if errors:
+        for error in errors:
+            print('ERROR: ' + error, file=sys.stderr)
+        raise SystemExit(1)
+    print('Postfix units and processes stopped.' if mode == '--check-stopped' else
+          'Postfix package purged; units masked; no remaining Postfix processes.')
+except Exception as exc:
+    print('ERROR: Postfix verification: ' + str(exc), file=sys.stderr)
+    raise SystemExit(1)
+POSTFIX_CHECK_HELPER
+
+# ── Reusable verification/report helper ────────────────────────────────────────
+# This helper reads policy/runtime state. Its only writes are its lock and report.
+# It never changes firewall rules, installs updates or restarts applications.
+cat > "$stage/usr/local/sbin/lab-hardening-check" <<'CHECK_HELPER'
+#!/usr/bin/python3
+import fcntl
+import glob
+import hashlib
+import ipaddress
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+import time
+
+os.environ['LC_ALL'] = 'C'
+os.environ['PATH'] = '/usr/sbin:/usr/bin:/sbin:/bin'
+
+STATE = Path('/var/lib/lab-hardening')
+errors, warnings, listeners = [], [], []
+timezone = None
+
+def run(args, timeout=30):
+    try:
+        p = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+        return p.returncode, p.stdout.strip()
+    except (OSError, subprocess.SubprocessError) as exc:
+        errors.append(f'Cannot run {args[0]}: {exc}')
+        return 127, ''
+
+def require(condition, message):
+    if not condition:
+        errors.append(message)
+
+def read(path):
+    try:
+        return Path(path).read_text()
+    except OSError as exc:
+        errors.append(f'Cannot read {path}: {exc}')
+        return ''
+
+if os.geteuid() != 0:
+    raise SystemExit('Run lab-hardening-check as root.')
+lock = open(STATE / 'check.lock', 'a')
+try:
+    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except BlockingIOError:
+    raise SystemExit('A hardening check is already running.')
+try:
+    policy = json.loads(read(STATE / 'policy.json'))
+    for path, digest in policy['files'].items():
+        try:
+            require(hashlib.sha256(Path(path).read_bytes()).hexdigest() == digest,
+                    f'Managed file changed: {path}; review and rerun the hardening block.')
+        except OSError:
+            errors.append(f'Managed file missing: {path}')
+
+    # Check selected zone and file identity without freezing tzdata database bytes.
+    tz_result = subprocess.run(['/usr/local/sbin/lab-timezone', 'check', str(STATE / 'policy.json')],
+                               text=True, capture_output=True, timeout=30)
+    timezone = tz_result.stdout.strip() if tz_result.returncode == 0 else None
+    require(tz_result.returncode == 0, 'Timezone policy verification failed: '
+            + (tz_result.stderr.strip()[:1000] or 'see guest timezone files'))
+
+    # Runtime readback, including dotted interface names through procfs globbing.
+    for line in read('/etc/sysctl.d/99-hardening.conf').splitlines():
+        line = line.split('#', 1)[0].strip()
+        if not line:
+            continue
+        key, expected = (part.strip() for part in line.split('=', 1))
+        paths = glob.glob('/proc/sys/' + key.replace('.', '/'))
+        require(bool(paths), f'Required sysctl unavailable: {key}')
+        for path in paths:
+            require(read(path).strip() == expected, f'Sysctl mismatch: {path}, expected {expected}')
+
+    rc, status = run(['ufw', 'status'])
+    require(rc == 0 and 'Status: active' in status.splitlines(), 'UFW is inactive.')
+    ufw_defaults = read('/etc/default/ufw')
+    require(re.search(r'^IPV6=yes$', ufw_defaults, re.M), 'UFW IPv6 support disabled.')
+    require(re.search(r'^IPT_SYSCTL=$', ufw_defaults, re.M), 'UFW sysctl loading is enabled.')
+    for tool, prefix in [('iptables', 'ufw'), ('ip6tables', 'ufw6')]:
+        for chain in ['INPUT', 'FORWARD']:
+            rc, rules = run([tool, '-w', '5', '-S', chain])
+            require(rc == 0 and f'-P {chain} DROP' in rules.splitlines(), f'{tool} {chain} is not DROP.')
+        rc, _ = run([tool, '-w', '5', '-C', 'INPUT', '-j', prefix + '-before-input'])
+        require(rc == 0, f'{tool} UFW INPUT hook is missing.')
+        rc, _ = run([tool, '-w', '5', '-S', prefix + '-user-input'])
+        require(rc == 0, f'{tool} UFW user chain is missing.')
+
+    # APT lists are compared as sets: vendor/local duplication cannot widen policy.
+    import apt_pkg
+    apt_pkg.init()
+    cfg = apt_pkg.config
+    origins = {
+        'origin=Debian,codename=trixie,label=Debian',
+        'origin=Debian,codename=trixie-updates,label=Debian',
+        'origin=Debian,codename=trixie-security,label=Debian-Security',
+    }
+    require(set(cfg.value_list('Unattended-Upgrade::Origins-Pattern')) == origins,
+            'Effective unattended-upgrade origins differ from policy.')
+    require(not cfg.value_list('Unattended-Upgrade::Allowed-Origins'), 'Additional legacy Allowed-Origins exist.')
+    for key, expected in {
+        'APT::Periodic::Enable': '1', 'APT::Periodic::Update-Package-Lists': '1',
+        'APT::Periodic::Unattended-Upgrade': '1', 'APT::Periodic::AutocleanInterval': '7',
+        'APT::Update::Error-Mode': 'any',
+        'Unattended-Upgrade::Automatic-Reboot': 'false',
+        'Unattended-Upgrade::InstallOnShutdown': 'false',
+        'Unattended-Upgrade::Remove-New-Unused-Dependencies': 'true',
+        'Unattended-Upgrade::Remove-Unused-Dependencies': 'false',
+        'Unattended-Upgrade::Remove-Unused-Kernel-Packages': 'false',
+    }.items():
+        require(cfg.find(key) == expected, f'APT policy conflict: {key}')
+    if cfg.value_list('Unattended-Upgrade::Package-Blacklist'):
+        warnings.append('An unattended-upgrades blacklist is active; review excluded packages.')
+    if cfg.value_list('Unattended-Upgrade::Package-Whitelist'):
+        warnings.append('An unattended-upgrades whitelist is active; review update coverage.')
+    rc, holds = run(['apt-mark', 'showhold'])
+    require(rc == 0, 'Cannot inspect held packages.')
+    if holds:
+        warnings.append('Held packages: ' + ', '.join(holds.splitlines()))
+    for unit in ['ufw.service', 'unattended-upgrades.service', 'apt-daily.timer',
+                 'apt-daily-upgrade.timer', 'lab-hardening-check.timer']:
+        require(run(['systemctl', 'is-enabled', '--quiet', unit])[0] == 0, f'{unit} is not enabled.')
+        require(run(['systemctl', 'is-active', '--quiet', unit])[0] == 0, f'{unit} is not active.')
+    for unit in ['apt-daily.service', 'apt-daily-upgrade.service']:
+        rc, result = run(['systemctl', 'show', unit, '-p', 'Result', '--value'])
+        require(rc == 0 and result == 'success', f'{unit} last result: {result or "unknown"}')
+    now = time.time()
+    stamps = [Path('/var/lib/apt/periodic/update-stamp'), STATE / 'last-index-refresh']
+    last_refresh = max((p.stat().st_mtime for p in stamps if p.exists()), default=0)
+    require(now - last_refresh <= policy['update_max_age_hours'] * 3600,
+            'APT indexes have no recent recorded refresh; inspect apt-daily.service.')
+
+    # Verify the merged journald settings; commented defaults are not assignments.
+    rc, journal = run(['systemd-analyze', 'cat-config', 'systemd/journald.conf'])
+    require(rc == 0, 'Cannot inspect journald policy.')
+    effective = {}
+    section = ''
+    for line in journal.splitlines():
+        line = line.strip()
+        if line.startswith('['):
+            section = line
+        elif section == '[Journal]' and '=' in line and not line.startswith(('#', ';')):
+            k, v = line.split('=', 1)
+            effective[k.strip()] = v.strip()
+    for key, expected in policy['journal'].items():
+        require(effective.get(key) == expected, f'Journald policy conflict: {key}')
+    require(run(['systemctl', 'is-active', '--quiet', 'systemd-journald.service'])[0] == 0,
+            'Journald is not active.')
+    require(bool(glob.glob('/var/log/journal/*/*.journal')), 'Persistent journal files are missing.')
+
+    removed = []
+    if not policy['keep_ssh']:
+        removed.append('openssh-server')
+    if policy['remove_postfix']:
+        removed.append('postfix')
+    for package in removed:
+        _, status = run(['dpkg-query', '-W', '-f=${db:Status-Status}', package])
+        require(status != 'installed', f'Unwanted package installed: {package}')
+    if not policy['keep_ssh']:
+        for unit in ['ssh.service', 'ssh.socket']:
+            require(run(['systemctl', 'is-enabled', unit])[1] == 'masked', f'{unit} is not masked.')
+            require(run(['systemctl', 'is-active', '--quiet', unit])[0] != 0, f'{unit} is active.')
+
+    if policy['remove_postfix']:
+        # Keep the detailed diagnostic in the hardening report. This helper is
+        # read-only and checks runtime units/processes even after package purge.
+        postfix = subprocess.run(['/usr/local/sbin/lab-postfix-check', '--check-removed'],
+                                 capture_output=True, text=True, timeout=90)
+        require(postfix.returncode == 0,
+                'Postfix removal incomplete: ' + (postfix.stderr.strip()[:4000] or 'verification failed'))
+
+    # Inventory excludes loopback; optional port lists verify external listeners.
+    rc, sockets = run(['ss', '-H', '-lntu'])
+    require(rc == 0, 'Cannot inspect listening sockets.')
+    for line in sockets.splitlines():
+        fields = line.split()
+        if len(fields) < 5:
+            errors.append('Unrecognized ss output.')
+            continue
+        proto, endpoint = fields[0], fields[4]
+        addr, port = endpoint.rsplit(':', 1)
+        # ss may print [IPv6]%interface:port or [IPv6%interface]:port.
+        addr = addr.split('%', 1)[0].strip('[]')
+        try:
+            if ipaddress.ip_address(addr).is_loopback:
+                continue
+        except ValueError:
+            if addr != '*':
+                errors.append(f'Unrecognized socket address: {addr}')
+        listeners.append(f'{proto} {endpoint}')
+        allowed = policy.get(proto + '_ports', [])
+        if allowed:
+            require(int(port) in allowed, f'Unexpected external listener: {proto} {endpoint}')
+    # needrestart's explicit batch/list mode cannot restart applications.
+    rc, restart = run(['needrestart', '-b', '-r', 'l', '-l'], timeout=90)
+    require(rc == 0, 'needrestart report failed.')
+    requests = [line for line in restart.splitlines()
+                if line.startswith(('NEEDRESTART-SVC:', 'NEEDRESTART-CONT:', 'NEEDRESTART-SESS:'))]
+    if requests:
+        warnings.append('Processes need a reviewed restart: ' + '; '.join(requests))
+except Exception as exc:
+    errors.append(f'Check could not complete: {type(exc).__name__}: {exc}')
+
+status = 'FAIL' if errors else ('WARN' if warnings else 'OK')
+report = {'status': status, 'checked_at': int(time.time()), 'errors': errors,
+          'warnings': warnings, 'external_listeners': listeners, 'timezone': timezone}
+temporary = STATE / ('status.' + str(os.getpid()) + '.tmp')
+temporary.write_text(json.dumps(report, indent=2) + '\n')
+temporary.chmod(0o644)
+os.replace(temporary, STATE / 'status.json')
+print('Lab hardening: ' + status)
+for entry in errors:
+    print('ERROR: ' + entry)
+for entry in warnings:
+    print('WARNING: ' + entry)
+print('External listeners: ' + (', '.join(listeners) or 'none'))
+raise SystemExit(1 if errors else 0)
+CHECK_HELPER
+
+cat > "$stage/etc/systemd/system/lab-hardening-check.service" <<'CHECK_SERVICE'
+[Unit]
+Description=Verify lab hardening and report update/restart status
+After=network.target systemd-journal-flush.service
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/lab-hardening-check
+Nice=10
+TimeoutStartSec=240
+StandardOutput=journal
+StandardError=journal
+CHECK_SERVICE
+cat > "$stage/etc/systemd/system/lab-hardening-check.timer" <<'CHECK_TIMER'
+[Unit]
+Description=Check lab hardening after boot and hourly
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=1h
+RandomizedDelaySec=60
+Unit=lab-hardening-check.service
+[Install]
+WantedBy=timers.target
+CHECK_TIMER
+cat > "$stage/etc/update-motd.d/25-lab-hardening" <<'MOTD_HELPER'
+#!/usr/bin/python3
+import json
+from pathlib import Path
+import time
+try:
+    p = json.loads(Path('/var/lib/lab-hardening/status.json').read_text())
+    stale = time.time() - p['checked_at'] > 3 * 3600
+    print('  Hardening: ' + ('STALE' if stale else p['status'])
+          + ' | root check: /usr/local/sbin/lab-hardening-check')
+except (OSError, ValueError, KeyError):
+    print('  Hardening: not yet verified | root check: /usr/local/sbin/lab-hardening-check')
+MOTD_HELPER
+
+# ── Install managed files atomically, preserving previous configuration ────────
+python3 - "$stage" "$backup" <<'INSTALL_FILES'
+import os, pathlib, shutil, sys, tempfile
+stage, backup = map(pathlib.Path, sys.argv[1:])
+for source in sorted(stage.rglob('*')):
+    if not source.is_file() or source.parent == stage:
+        continue
+    relative = source.relative_to(stage)
+    target = pathlib.Path('/') / relative
+    if target.is_symlink():
+        raise SystemExit(f'ERROR: Refusing to overwrite symlink: {target}')
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if target.exists():
+        saved = backup / relative
+        saved.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(target, saved)
+    fd, temporary = tempfile.mkstemp(prefix='.lab-hardening-', dir=target.parent)
+    try:
+        with os.fdopen(fd, 'wb') as out:
+            out.write(source.read_bytes())
+        mode = 0o755 if str(relative).startswith(('usr/local/sbin/', 'etc/update-motd.d/')) else 0o644
+        os.chmod(temporary, mode)
+        os.replace(temporary, target)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+# Preserve all UFW policy/rules; only stop its competing sysctl loader.
+target = pathlib.Path('/etc/default/ufw')
+saved = backup / 'etc/default/ufw'
+saved.parent.mkdir(parents=True, exist_ok=True)
+shutil.copy2(target, saved)
+import re
+text, count = re.subn(r'^IPT_SYSCTL=.*$', 'IPT_SYSCTL=', target.read_text(), flags=re.M)
+if count != 1:
+    raise SystemExit('ERROR: Expected one IPT_SYSCTL assignment in /etc/default/ufw.')
+fd, temporary = tempfile.mkstemp(prefix='.lab-ufw-', dir=target.parent)
+with os.fdopen(fd, 'w') as out:
+    out.write(text)
+os.chmod(temporary, target.stat().st_mode & 0o777)
+os.replace(temporary, target)
+INSTALL_FILES
+install -m 0644 "$stage/index-refreshed" /var/lib/lab-hardening/last-index-refresh
+
+# ── Remove and verify unwanted services ───────────────────────────────────────
+remove_packages=()
+if [[ $REMOVE_POSTFIX == 1 ]]; then
+  # Scope operations to known Debian Postfix units and actual instances only.
+  # Read inventory before masking/purging; a not-found unit can still be active.
+  postfix_unit_text=$(/usr/local/sbin/lab-postfix-check --units)
+  mapfile -t postfix_units <<< "$postfix_unit_text"
+  postfix_stop_text=$(/usr/local/sbin/lab-postfix-check --stop-units)
+  if [[ -n $postfix_stop_text ]]; then
+    mapfile -t postfix_stop_units <<< "$postfix_stop_text"
+    echo 'Stopping Postfix units before package removal...'
+    timeout 60 systemctl stop "${postfix_stop_units[@]}"
+  fi
+  # Mask without --force: never overwrite a local custom unit. No blanket
+  # process-name kills. If stopping or masking fails, preserve the CT and fail.
+  systemctl mask "${postfix_units[@]}"
+  /usr/local/sbin/lab-postfix-check --check-stopped
+fi
+if [[ $KEEP_SSH == 0 ]]; then
+  for unit in ssh.service ssh.socket; do
+    if [[ $(systemctl show "$unit" -p LoadState --value) != not-found ]]; then
+      systemctl stop "$unit"
+    fi
+  done
+  remove_packages+=(openssh-server)
+fi
+[[ $REMOVE_POSTFIX == 0 ]] || remove_packages+=(postfix)
+installed_remove=()
+for package in "${remove_packages[@]}"; do
+  package_status=$(dpkg-query -W -f='${db:Status-Status}' "$package" 2>/dev/null || true)
+  if [[ $package_status == installed ]] ||
+     [[ $package == postfix && -n $package_status && $package_status != not-installed ]]; then
+    # Include Postfix config-files/partial states, not just fully installed.
+    installed_remove+=("$package")
+  fi
+done
+if (( ${#installed_remove[@]} > 0 )); then
+  # No blanket autoremove: apps outside dpkg may use packages marked automatic.
+  apt-get -o DPkg::Lock::Timeout=120 purge -y "${installed_remove[@]}"
+fi
+if [[ $KEEP_SSH == 0 ]]; then
+  systemctl mask ssh.service ssh.socket
+fi
+
+# ── Activate common policy ────────────────────────────────────────────────────
+systemctl daemon-reload
+if [[ $REMOVE_POSTFIX == 1 ]]; then
+  # Package maintainer scripts can remove a mask; restore our explicit policy.
+  systemctl mask "${postfix_units[@]}"
+  /usr/local/sbin/lab-postfix-check --check-removed
+fi
+install -d -o root -g systemd-journal -m 2755 /var/log/journal
+systemctl restart systemd-journald.service
+journalctl --flush
+/usr/lib/systemd/systemd-sysctl --strict --prefix=/net/ipv4 --prefix=/net/ipv6
+systemctl enable --now unattended-upgrades.service apt-daily.timer apt-daily-upgrade.timer
+echo 'Checking unattended upgrades without installing updates...'
+if ! timeout 300 unattended-upgrade --dry-run --debug > "$backup/unattended-dry-run.log" 2>&1; then
+  tail -n 40 "$backup/unattended-dry-run.log" >&2
+  false
+fi
+
+# Store expected settings and file hashes for drift detection. No secrets.
+python3 - "$stage" "$PROFILE" "$KEEP_SSH" "$REMOVE_POSTFIX" "$JOURNAL_DAYS" \
+  "$JOURNAL_MAX_MB" "$JOURNAL_RUNTIME_MB" "$UPDATE_MAX_AGE" "$TCP_PORTS" "$UDP_PORTS" <<'SAVE_POLICY'
+import hashlib, json, os, pathlib, sys
+stage = pathlib.Path(sys.argv[1])
+_, _, profile, keep, remove, days, maximum, runtime, age, tcp, udp = sys.argv
+files = {}
+for source in stage.rglob('*'):
+    if source.is_file() and source.parent != stage:
+        target = pathlib.Path('/') / source.relative_to(stage)
+        files[str(target)] = hashlib.sha256(target.read_bytes()).hexdigest()
+policy = {'profile': profile, 'keep_ssh': keep == '1', 'remove_postfix': remove == '1',
+          'update_max_age_hours': int(age), 'tcp_ports': list(map(int, tcp.split())),
+          'udp_ports': list(map(int, udp.split())), 'files': files,
+          'version': '1.2.0',
+          'timezone': json.loads((stage / 'timezone-policy.json').read_text()),
+          'journal': {'Storage': 'persistent', 'Compress': 'yes', 'SystemMaxUse': maximum + 'M',
+                      'SystemKeepFree': '128M', 'RuntimeMaxUse': runtime + 'M',
+                      'MaxRetentionSec': days + 'day', 'RateLimitIntervalSec': '30s', 'RateLimitBurst': '10000'}}
+target = pathlib.Path('/var/lib/lab-hardening/policy.json')
+temporary = target.with_suffix('.tmp')
+temporary.write_text(json.dumps(policy, indent=2) + '\n')
+temporary.chmod(0o644)
+os.replace(temporary, target)
+SAVE_POLICY
+systemctl enable --now lab-hardening-check.timer
+if ! systemctl start lab-hardening-check.service; then
+  journalctl -u lab-hardening-check.service -n 50 --no-pager >&2
+  false
+fi
+cat /var/lib/lab-hardening/status.json
+effective_timezone=$(/usr/local/sbin/lab-timezone check /var/lib/lab-hardening/policy.json)
+timezone_action=set; [[ $PRESERVE_TIMEZONE != 1 ]] || timezone_action=preserved
+printf "Timezone: %s (%s; guest files verified).\n" "$effective_timezone" "$timezone_action"
+printf '\nShared hardening applied (%s). Backups: %s\n' "$PROFILE" "$backup"
+echo 'Manual check: /usr/local/sbin/lab-hardening-check'
+echo 'Local reports: /var/lib/lab-hardening/status.json and journalctl -u lab-hardening-check'
+echo 'Application image updates, source-specific UFW rules and app health remain with the creator.'
+LAB_HARDENING_GUEST
+)
+# ── End shared hardening block ────────────────────────────────────────────────
+# END LAB HARDENING v1.2.0
+
+# ── Final verification after shared hardening ──────────────────────────────────
+INSTALL_STAGE="final verification"
+UFW_RULES_AFTER=$(pct exec "$CT_ID" -- bash -s <<'UFW_SNAPSHOT_AFTER'
+set -euo pipefail
+sha256sum /etc/ufw/{before,after,user}{,6}.rules
+iptables -w 5 -S
+ip6tables -w 5 -S
+UFW_SNAPSHOT_AFTER
+)
+[[ $UFW_RULES_BEFORE == "$UFW_RULES_AFTER" ]] || {
+  echo "ERROR: Persistent/effective UFW rules changed during hardening; CT preserved." >&2
+  false
+}
+unset UFW_RULES_BEFORE UFW_RULES_AFTER
+pct exec "$CT_ID" -- /usr/local/bin/searxng-maint.sh check --initial
+pct exec "$CT_ID" -- /usr/local/sbin/lab-hardening-check
+EFFECTIVE_GUEST_TIMEZONE=$(pct exec "$CT_ID" -- /usr/local/sbin/lab-timezone check /var/lib/lab-hardening/policy.json)
+[[ $EFFECTIVE_GUEST_TIMEZONE == "$APP_TZ" ]] || {
+  echo 'ERROR: SearXNG TZ differs from the final effective guest timezone; CT preserved.' >&2
+  false
+}
+echo "  Final app checks and persistent/effective IPv4/IPv6 UFW preservation passed."
+
 # ── Proxmox UI description ────────────────────────────────────────────────────
 SX_DESC_LINK="http://${CT_IP}:${APP_PORT}/"
 SX_DESC_LABEL="SearXNG (local)"
@@ -1568,12 +3152,14 @@ cat <<OPERATIONS
   WEB/ADMIN     http://$CT_IP:$APP_PORT/
   ALLOWED FROM  $FIREWALL_ACCESS_LABEL
   FIREWALL      UFW inside the CT, IPv4 and IPv6; no PVE firewall dependency
+  TIMEZONE      $EFFECTIVE_GUEST_TIMEZONE ($TIMEZONE_ACTION; guest and SearXNG verified)
   AUTO-UPDATE   $AUTO_UPDATE | daily $UPDATE_TIME ($APP_TZ)
   IMAGES        exact local IDs, Pull=never; old images retained for review
 
   RUN ON THE PROXMOX HOST
     pct enter $CT_ID
     pct exec $CT_ID -- /usr/local/bin/searxng-maint.sh version
+    pct exec $CT_ID -- /usr/local/sbin/lab-hardening-check
 
   RUN INSIDE THE CT
     /usr/local/bin/searxng-maint.sh check
@@ -1585,14 +3171,16 @@ cat <<OPERATIONS
     Test the web endpoint from your intended client/proxy.
     If you restricted sources, also test from outside the allowed list.
     Installer rule checks do not prove the full network path.
-    Add/delete UFW rules directly; do not restart ufw.service while apps run.
+    Planned source-policy changes must keep UFW and /opt/searxng/ufw-policy.json consistent.
+    The startup guard checks that policy. Avoid restarting ufw.service while apps run.
 
-  RECOVERY
+  NORMAL MAINTENANCE
     Verify a matching PBS/PVE checkpoint before updates; --yes only skips prompts.
     If FUSE is enabled, use stop-mode PBS. Back up external bind mounts separately.
     For persistent components, failed updates retain the target after it may start.
     The helper changes one component at a time; earlier successes remain applied.
-    Creators build new CTs. Existing CTs require a reviewed control-file migration.
+    Failed installations are preserved for diagnosis; use a new unused ID and hostname.
+    Hardening WARN may report a reviewed restart; no automatic CT restart is performed.
 
 OPERATIONS
 
@@ -1602,7 +3190,7 @@ echo "    CT: $CT_ID | IP: ${CT_IP} | Web UI: http://${CT_IP}:${APP_PORT}/"
 if [[ -n "$APP_FQDN" ]]; then
   echo "    Public:  https://${APP_FQDN}/"
 fi
-echo "    Image:   ${APP_IMAGE}"
+echo "    Image:   ${APP_IMAGE} (${APP_IMAGE_ID})"
 echo "    Valkey:  ${VALKEY_IMAGE} (127.0.0.1:6379, limiter backend, no persistence)"
 echo "    Mode:    $([ "$PUBLIC_INSTANCE" -eq 1 ] && echo "public (limiter + link_token bot detection)" || echo "local (limiter, no link_token)")"
 echo "    Quadlet: ${QUADLET_FILE}"
@@ -1615,7 +3203,7 @@ echo ""
 echo "    pct exec $CT_ID -- systemctl status searxng.service"
 echo "    pct exec $CT_ID -- journalctl -u searxng.service --no-pager -n 50"
 echo "    pct exec $CT_ID -- /usr/local/bin/searxng-maint.sh update <tag>         # latest, or pin e.g. 2026.9.1-248e37991"
-echo "    pct exec $CT_ID -- /usr/local/bin/searxng-maint.sh update-valkey <tag>  # latest, or pin e.g. 9.0.6"
+echo "    pct exec $CT_ID -- /usr/local/bin/searxng-maint.sh update-valkey <tag>  # pinned full version, e.g. 9.0.6"
 echo "    pct exec $CT_ID -- /usr/local/bin/searxng-maint.sh auto-update          # re-pull current tags now (if AUTO_UPDATE=1)"
 echo "    pct exec $CT_ID -- /usr/local/bin/searxng-maint.sh version"
 echo "    Backup/restore: use PBS or PVE snapshots"
