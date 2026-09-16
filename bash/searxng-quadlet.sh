@@ -2,13 +2,12 @@
 set -Eeo pipefail
 umask 022
 export LC_ALL=C
-# Hardening integration: 2026-09-15. Fresh Proxmox CT creator.
-# Input: searxng-quadlet(2).sh; original script name: searxng-quadlet.sh.
-# Common block v1.2.0, SHA-256:
+# Common-contract integration: 2026-09-16; contract 1.0.0.
+# Fresh Proxmox Debian 13 unprivileged LXC creator; standalone and inline.
+# Canonical hardening v1.2.0 is embedded unchanged (50,761 bytes), SHA-256:
 # c1255455c38d2e3d95f25491664912513db437dfa20da8d6e62730eb951276b4
-# User-authorized timezone port from native Debian v1.0.3; LXC scope retained.
-# SearXNG startup: explicit image-derived non-root UID/GID and GRANIAN_HOST.
-# Matching source/fixture checks completed; a fresh live LXC test remains required.
+# SearXNG keeps its supplied release policy and image-derived startup contract.
+# Static/isolated validation is documented separately; live acceptance is required.
 
 # ── Config ────────────────────────────────────────────────────────────────────
 CT_ID=""                             # empty = auto-assign via pvesh; set e.g. CT_ID=120 to pin
@@ -22,9 +21,12 @@ CONTAINER_STORAGE="local-lvm"
 
 # SearXNG / Podman + Quadlet
 APP_PORT=8080                        # SearXNG binds this port on the CT interface (Network=host)
+# BEGIN COMMON TIMEZONE INPUTS
+# COMMON TIMEZONE INPUTS
 SERVER_TIMEZONE="${SERVER_TIMEZONE-Europe/Berlin}"
-PRESERVE_EXISTING_TIMEZONE="${PRESERVE_EXISTING_TIMEZONE-0}" # 0=set; 1=keep guest zone
-APP_TZ=""                           # derived from the guest timezone plan; do not set directly
+PRESERVE_EXISTING_TIMEZONE="${PRESERVE_EXISTING_TIMEZONE-0}"
+APP_TZ=""
+# END COMMON TIMEZONE INPUTS
 APP_FQDN=""                          # e.g. search.example.com ; blank = local IP mode
                                      # set → base_url=https://FQDN/ and public_instance: true (link_token bot detection)
 INSTANCE_NAME="SearXNG"              # shown in the web UI title and results page
@@ -58,7 +60,7 @@ OUTGOING_MAX_TIMEOUT=10.0            # hard ceiling for upstream request timeout
 #   (latest or pinned) daily at UPDATE_TIME and restarts only the services
 #   whose image ID changed; recovery depends on persistent-state compatibility.
 # AUTO_UPDATE=0 (default): timer installed but disabled; manual updates via
-#   searxng-maint.sh update <tag> / update-valkey <tag> / auto-update
+#   searxng-maint.sh update <tag> / update-valkey <tag> (auto-update honors AUTO_UPDATE)
 AUTO_UPDATE=0
 UPDATE_TIME="03:00"                  # local CT time (APP_TZ), HH:MM; timer runs daily
 
@@ -127,6 +129,11 @@ PUBLIC_INSTANCE=0
 #   /etc/ufw/user.rules, /etc/ufw/user6.rules         (configured source allows)
 #   /etc/containers/systemd/searxng.container         (Quadlet unit — source of truth)
 #   /etc/containers/systemd/searxng-valkey.container  (Quadlet unit — limiter backend)
+#   /etc/containers/{storage,containers}.conf       (Podman storage/logging)
+#   /etc/locale.gen, /etc/default/locale             (en_US.UTF-8)
+#   /root/.bashrc                                    (terminal setting)
+#   /etc/motd, /etc/update-motd.d/*                  (fresh-CT MOTD before hardening)
+#   /run/lock/searxng-{creator,maint}.lock            (host/guest locks)
 #   /opt/searxng/.env                                 (runtime state — read by maint script)
 #   /opt/searxng/config/settings.yml                  (SearXNG configuration, contains secret_key)
 #   /opt/searxng/config/limiter.toml                  (bot detection / trusted proxies)
@@ -152,6 +159,49 @@ PUBLIC_INSTANCE=0
 #   /etc/systemd/system/postfix*.{service,socket,path} (masks when Postfix removed)
 #   /var/lib/lab-hardening/{policy.json,status.json,last-index-refresh,check.lock}
 #   /var/backups/lab-hardening/<run>/                 (shared config backups/dry-run log)
+
+# BEGIN COMMON CREATOR TRAPS
+# COMMON CREATOR TRAPS
+INSTALL_STAGE="configuration"
+CREATED=0
+trap 'rc=$? err_line=$LINENO;
+  trap - ERR INT TERM HUP
+  if (( BASH_SUBSHELL > 0 )); then exit "$rc"; fi
+  printf "  ERROR: stage=%s rc=%s line=%s\n" "$INSTALL_STAGE" "$rc" "$err_line" >&2
+  printf "  Command text and arguments are omitted. External data is never removed by cleanup.\n" >&2
+  if [[ $rc != 129 && $rc != 130 && $rc != 143 && ${CLEANUP_ON_FAIL:-0} == 1 && ${CREATED:-0} == 1 ]]; then
+    if pct stop "$CT_ID" >/dev/null 2>&1; then
+      pct destroy "$CT_ID" >/dev/null 2>&1 || printf "  CT cleanup failed; inspect the preserved state.\n" >&2
+    else
+      printf "  CT stop failed; no destruction attempted.\n" >&2
+    fi
+  else
+    printf "  CT state is preserved for inspection.\n" >&2
+  fi
+  exit "$rc"
+' ERR
+trap 'rc=130; err_line=$LINENO;
+  trap - ERR INT TERM HUP
+  if (( BASH_SUBSHELL > 0 )); then exit "$rc"; fi
+  printf "  Interrupted: stage=%s rc=%s line=%s\n" "$INSTALL_STAGE" "$rc" "$err_line" >&2
+  printf "  CT and external data are preserved for inspection.\n" >&2
+  exit "$rc"
+' INT
+trap 'rc=143; err_line=$LINENO;
+  trap - ERR INT TERM HUP
+  if (( BASH_SUBSHELL > 0 )); then exit "$rc"; fi
+  printf "  Interrupted: stage=%s rc=%s line=%s\n" "$INSTALL_STAGE" "$rc" "$err_line" >&2
+  printf "  CT and external data are preserved for inspection.\n" >&2
+  exit "$rc"
+' TERM
+trap 'rc=129; err_line=$LINENO;
+  trap - ERR INT TERM HUP
+  if (( BASH_SUBSHELL > 0 )); then exit "$rc"; fi
+  printf "  Interrupted: stage=%s rc=%s line=%s\n" "$INSTALL_STAGE" "$rc" "$err_line" >&2
+  printf "  CT and external data are preserved for inspection.\n" >&2
+  exit "$rc"
+' HUP
+# END COMMON CREATOR TRAPS
 
 # ── Config validation ─────────────────────────────────────────────────────────
 [[ $HARDENING_PROFILE == lxc ]] || { echo "ERROR: This creator requires HARDENING_PROFILE=lxc." >&2; exit 1; }
@@ -208,19 +258,23 @@ fi
   exit 1
 }
 [[ "$UPDATE_TIME" =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]] || { echo "  ERROR: UPDATE_TIME must be HH:MM (24h), e.g. 03:00." >&2; exit 1; }
-# Syntax only on Proxmox; availability and effective zone are checked in the guest.
+# BEGIN COMMON TIMEZONE VALIDATION
+# COMMON TIMEZONE VALIDATION
 [[ $PRESERVE_EXISTING_TIMEZONE =~ ^[01]$ ]] || {
-  echo '  ERROR: PRESERVE_EXISTING_TIMEZONE must be exactly 0 or 1.' >&2; exit 1;
+  echo 'ERROR: PRESERVE_EXISTING_TIMEZONE must be exactly 0 or 1.' >&2
+  exit 1
 }
 TIMEZONE_ACTION=preserved
 TIMEZONE_LABEL='preserve existing guest timezone'
 if [[ $PRESERVE_EXISTING_TIMEZONE == 0 ]]; then
   [[ $SERVER_TIMEZONE =~ ^[A-Za-z0-9_+-]+(/[A-Za-z0-9_+-]+)*$ ]] || {
-    echo '  ERROR: SERVER_TIMEZONE must be a nonempty IANA timezone name.' >&2; exit 1;
+    echo 'ERROR: SERVER_TIMEZONE must be a nonempty IANA timezone name.' >&2
+    exit 1
   }
   TIMEZONE_ACTION=set
   TIMEZONE_LABEL=$SERVER_TIMEZONE
 fi
+# END COMMON TIMEZONE VALIDATION
 if [[ -n "$APP_FQDN" ]]; then
   [[ "$APP_FQDN" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)+$ ]] \
     || { echo "  ERROR: APP_FQDN is not a valid hostname: $APP_FQDN" >&2; exit 1; }
@@ -267,37 +321,11 @@ for wait_var in INITIAL_WAIT_SECONDS UPDATE_WAIT_SECONDS; do
 done
 [[ $UPDATE_TIME =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]] || { echo "ERROR: Invalid UPDATE_TIME." >&2; exit 1; }
 
-# ── Trap cleanup ──────────────────────────────────────────────────────────────
-INSTALL_STAGE="preflight"
-trap 'rc=$? err_line=$LINENO err_op=${BASH_COMMAND%%[[:space:]]*};
-  trap - ERR
-  # The parent reports command-substitution failures and owns CT cleanup.
-  if (( BASH_SUBSHELL > 0 )); then exit "$rc"; fi
-  echo "  ERROR: stage=$INSTALL_STAGE rc=$rc line=$err_line operation=$err_op" >&2
-  echo "  See the original diagnostic above; command arguments and heredocs are omitted." >&2
-  if [[ "${CLEANUP_ON_FAIL:-0}" -eq 1 && "${CREATED:-0}" -eq 1 ]]; then
-    echo "  Cleanup: stopping/destroying CT ${CT_ID} ..." >&2
-    pct stop "${CT_ID}" >/dev/null 2>&1 || true
-    pct destroy "${CT_ID}" >/dev/null 2>&1 || true
-  fi
-  exit "$rc"
-' ERR
-
-trap 'rc=130;
-  trap - ERR INT TERM HUP
-  echo "  Interrupted: stage=$INSTALL_STAGE rc=$rc line=$LINENO" >&2
-  if [[ "${CLEANUP_ON_FAIL:-0}" -eq 1 && "${CREATED:-0}" -eq 1 ]]; then
-    echo "  Cleanup: stopping/destroying CT ${CT_ID} ..." >&2
-    pct stop "${CT_ID}" >/dev/null 2>&1 || true
-    pct destroy "${CT_ID}" >/dev/null 2>&1 || true
-  fi
-  exit "$rc"
-' INT TERM HUP
-
 # ── Preflight — root & commands ───────────────────────────────────────────────
+INSTALL_STAGE="preflight"
 [[ "$(id -u)" -eq 0 ]] || { echo "  ERROR: Run as root on the Proxmox host." >&2; exit 1; }
 
-for cmd in pveversion pvesh pveam pct pvesm qm curl python3 ip awk grep sed sort paste seq readlink cp chmod dpkg head tr flock mktemp mv rm tail bash stat timeout; do
+for cmd in pveversion pvesh pveam pct pvesm qm curl python3 ip awk grep sed sort paste seq readlink cp chmod dpkg head tr flock mktemp mv rm tail bash stat timeout cat cut sleep; do
   command -v "$cmd" >/dev/null 2>&1 || { echo "  ERROR: Missing required command: $cmd" >&2; exit 1; }
 done
 
@@ -336,7 +364,12 @@ if [[ -n "$CT_ID" ]]; then
   fi
 else
   CT_ID="$(pvesh get /cluster/nextid)"
-  [[ -n "$CT_ID" ]] || { echo "  ERROR: Could not obtain next CT ID." >&2; exit 1; }
+  [[ $CT_ID =~ ^[1-9][0-9]{2,8}$ ]] && (( CT_ID <= 999999999 )) \
+    || { echo "  ERROR: Could not obtain a valid unused CT ID." >&2; exit 1; }
+  if pct status "$CT_ID" >/dev/null 2>&1 || qm status "$CT_ID" >/dev/null 2>&1; then
+    echo "  ERROR: Assigned CT ID is already in use." >&2
+    exit 1
+  fi
 fi
 
 # Creator scripts are not idempotent: a re-run would create a second CT with the
@@ -348,6 +381,22 @@ if [[ -n "$EXISTING_CT" ]]; then
   echo "  Preserve that CT. For a fresh installation, select a new unused CT_ID and HN." >&2
   exit 1
 fi
+
+# ── Preflight — environment ───────────────────────────────────────────────────
+pvesm status | awk -v s="$TEMPLATE_STORAGE" '$1==s{f=1} END{exit(!f)}' \
+  || { echo "  ERROR: Template storage not found: $TEMPLATE_STORAGE" >&2; exit 1; }
+pvesh get /storage/"$TEMPLATE_STORAGE" --output-format json 2>/dev/null \
+  | python3 -c "import sys,json; d=json.load(sys.stdin); assert 'vztmpl' in d.get('content','')" 2>/dev/null \
+  || { echo "  ERROR: Template storage '$TEMPLATE_STORAGE' does not support vztmpl content." >&2; exit 1; }
+
+pvesm status | awk -v s="$CONTAINER_STORAGE" '$1==s{f=1} END{exit(!f)}' \
+  || { echo "  ERROR: Container storage not found: $CONTAINER_STORAGE" >&2; exit 1; }
+pvesh get /storage/"$CONTAINER_STORAGE" --output-format json 2>/dev/null \
+  | python3 -c "import sys,json; d=json.load(sys.stdin); assert 'rootdir' in d.get('content','')" 2>/dev/null \
+  || { echo "  ERROR: Container storage '$CONTAINER_STORAGE' does not support rootdir content." >&2; exit 1; }
+
+ip link show "$BRIDGE" >/dev/null 2>&1 \
+  || { echo "  ERROR: Bridge not found: $BRIDGE" >&2; exit 1; }
 
 # ── Discover available resources ──────────────────────────────────────────────
 AVAIL_TMPL_STORES="$(pvesh get /storage --output-format json 2>/dev/null \
@@ -389,7 +438,8 @@ cat <<EOF2
   Podman storage:    $([ "$PODMAN_FUSE_OVERLAY" -eq 1 ] && echo "fuse-overlayfs (fuse=1)" || echo "native overlay (no FUSE)")
   Tags:              $TAGS
   Auto-update:       $([ "$AUTO_UPDATE" -eq 1 ] && echo "enabled — daily at ${UPDATE_TIME} (re-pull $APP_TAG / $VALKEY_TAG)" || echo "disabled ($APP_TAG / $VALKEY_TAG, manual)")
-  Cleanup on fail:   $CLEANUP_ON_FAIL (default: preserve failed CT; always disarmed before app start)
+  Cleanup on fail:   $CLEANUP_ON_FAIL (opt-in: only ordinary early failure; disarmed before app start)
+  Interruptions:     INT/TERM/HUP and exit 129/130/143 always preserve CT and external data
   Hardening:         v1.2.0 | SSH keep=$HARDENING_KEEP_SSH | Postfix remove=$HARDENING_REMOVE_POSTFIX
   Listener policy:   TCP=$HARDENING_TCP_PORTS (auto=app port); UDP=$HARDENING_UDP_PORTS
   ────────────────────────────────────────
@@ -402,7 +452,10 @@ EOF2
 SCRIPT_SELF="$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")"
 
 response=""
-read -r -p "  Continue with these settings? [y/N]: " response <&8 || response=""
+read -r -p "  Continue with these settings? [y/N]: " response <&8 || {
+  echo 'ERROR: Confirmation input interrupted.' >&2
+  exit 1
+}
 case "$response" in
   [yY][eE][sS]|[yY]) ;;
   *)
@@ -486,23 +539,30 @@ FIREWALL_ACCESS_LABEL="${FIREWALL_ACCESS_LABEL:-${UFW_ALLOWED_SOURCES[*]}}"
 echo "  UFW TCP $APP_PORT allowed sources: $FIREWALL_ACCESS_LABEL"
 
 # All prompts that can select app ports/sources have now completed.
-[[ $HARDENING_TCP_PORTS != auto ]] || HARDENING_TCP_PORTS="$APP_PORT"
-
-# ── Preflight — environment ───────────────────────────────────────────────────
-pvesm status | awk -v s="$TEMPLATE_STORAGE" '$1==s{f=1} END{exit(!f)}' \
-  || { echo "  ERROR: Template storage not found: $TEMPLATE_STORAGE" >&2; exit 1; }
-pvesh get /storage/"$TEMPLATE_STORAGE" --output-format json 2>/dev/null \
-  | python3 -c "import sys,json; d=json.load(sys.stdin); assert 'vztmpl' in d.get('content','')" 2>/dev/null \
-  || { echo "  ERROR: Template storage '$TEMPLATE_STORAGE' does not support vztmpl content." >&2; exit 1; }
-
-pvesm status | awk -v s="$CONTAINER_STORAGE" '$1==s{f=1} END{exit(!f)}' \
-  || { echo "  ERROR: Container storage not found: $CONTAINER_STORAGE" >&2; exit 1; }
-pvesh get /storage/"$CONTAINER_STORAGE" --output-format json 2>/dev/null \
-  | python3 -c "import sys,json; d=json.load(sys.stdin); assert 'rootdir' in d.get('content','')" 2>/dev/null \
-  || { echo "  ERROR: Container storage '$CONTAINER_STORAGE' does not support rootdir content." >&2; exit 1; }
-
-ip link show "$BRIDGE" >/dev/null 2>&1 \
-  || { echo "  ERROR: Bridge not found: $BRIDGE" >&2; exit 1; }
+FINALIZED_APP_TCP_PORTS=$APP_PORT
+# BEGIN COMMON TCP RESOLUTION
+# COMMON TCP RESOLUTION
+[[ $HARDENING_TCP_PORTS != auto ]] || HARDENING_TCP_PORTS=$FINALIZED_APP_TCP_PORTS
+# END COMMON TCP RESOLUTION
+# Explicit and empty inventories are preserved; validate the final TCP result.
+read -r -a policy_ports <<< "$HARDENING_TCP_PORTS"
+[[ $HARDENING_TCP_PORTS != *$'\n'* && $HARDENING_TCP_PORTS != *$'\r'* ]] || exit 1
+for policy_port in "${policy_ports[@]}"; do
+  [[ $policy_port =~ ^[1-9][0-9]{0,4}$ ]] && (( policy_port <= 65535 )) \
+    || { echo 'ERROR: Invalid finalized TCP listener inventory.' >&2; exit 1; }
+done
+# Validate actual proxy networks before creating the CT; access rules stay separate.
+python3 - "$TRUSTED_PROXIES" <<'TRUST_VALIDATE'
+import ipaddress, sys
+try:
+    for value in sys.argv[1].split(','):
+        if value.strip():
+            network = ipaddress.ip_network(value.strip(), strict=True)
+            if network.network_address.is_multicast:
+                raise ValueError('multicast proxy')
+except ValueError:
+    raise SystemExit('ERROR: TRUSTED_PROXIES requires valid network CIDRs without host bits.')
+TRUST_VALIDATE
 
 # ── Root password ─────────────────────────────────────────────────────────────
 PASSWORD=""
@@ -620,6 +680,10 @@ INSTALL_STAGE="guest timezone validation"
 pct exec "$CT_ID" -- bash -s <<'TIMEZONE_BOOTSTRAP'
 set -euo pipefail
 install -d -m 0755 /usr/local/sbin
+[[ ! -L /usr/local/sbin/lab-timezone && ( ! -e /usr/local/sbin/lab-timezone || -f /usr/local/sbin/lab-timezone ) ]] || {
+  echo 'ERROR: Refusing a symlink/nonregular timezone helper destination.' >&2
+  exit 1
+}
 cat > /usr/local/sbin/lab-timezone <<'TIMEZONE_BOOTSTRAP_HELPER'
 #!/usr/bin/python3
 """LXC timezone policy, adapted from debian-hardening.sh v1.0.3.
@@ -786,12 +850,16 @@ if __name__ == '__main__':
         print('ERROR: LXC timezone: ' + str(exc), file=sys.stderr)
         raise SystemExit(1)
 TIMEZONE_BOOTSTRAP_HELPER
+chown root:root /usr/local/sbin/lab-timezone
 chmod 0755 /usr/local/sbin/lab-timezone
 TIMEZONE_BOOTSTRAP
+# BEGIN COMMON EARLY TIMEZONE PLAN
+# COMMON EARLY TIMEZONE PLAN
+INSTALL_STAGE="guest timezone validation"
 TIMEZONE_PLAN=$(pct exec "$CT_ID" -- /usr/local/sbin/lab-timezone plan "$PRESERVE_EXISTING_TIMEZONE" "$SERVER_TIMEZONE")
 APP_TZ=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["effective"])' "$TIMEZONE_PLAN")
-unset TIMEZONE_PLAN
-echo "  Guest timezone plan: $APP_TZ ($TIMEZONE_ACTION during shared hardening)."
+printf '  Guest timezone plan: %s (%s during shared hardening).\n' "$APP_TZ" "$TIMEZONE_ACTION"
+# END COMMON EARLY TIMEZONE PLAN
 
 # ── UFW inside the CT ─────────────────────────────────────────────────────────
 # Fresh CT only. Network=host uses this CT's INPUT chain.
@@ -851,20 +919,151 @@ for tool in /usr/sbin/iptables /usr/sbin/ip6tables; do
     rules=$("$tool" -w 5 -S "$chain")
     grep -qx -- "-P $chain DROP" <<< "$rules"
   done
-  "$tool" -w 5 -C INPUT -j "$prefix-before-input"
+  "$tool" -w 5 -S OUTPUT | grep -qx -- '-P OUTPUT ACCEPT'
+  for chain in INPUT FORWARD OUTPUT; do
+    suffix=${chain,,}
+    "$tool" -w 5 -C "$chain" -j "$prefix-before-$suffix"
+  done
   "$tool" -w 5 -S "$prefix-user-input" >/dev/null
 done
 # Check the selected source allows on every boot and maintenance verification.
 python3 - <<'UFW_CHECK_POLICY'
-import ipaddress, json, pathlib, subprocess
-policy = json.loads(pathlib.Path('/opt/searxng/ufw-policy.json').read_text())
-if type(policy['port']) is not int or not 1024 <= policy['port'] <= 65535 or not policy['sources']:
-    raise SystemExit('ERROR: Invalid SearXNG UFW policy.')
-for source in policy['sources']:
-    network = ipaddress.ip_network(source, strict=True)
-    tool, prefix = ('/usr/sbin/iptables', 'ufw') if network.version == 4 else ('/usr/sbin/ip6tables', 'ufw6')
-    subprocess.run([tool, '-w', '5', '-C', prefix + '-user-input', '-s', source,
-                    '-p', 'tcp', '-m', 'tcp', '--dport', str(policy['port']), '-j', 'ACCEPT'], check=True)
+import ipaddress
+import json
+from pathlib import Path
+import re
+import shlex
+import subprocess
+
+def require(ok, message):
+    if not ok:
+        raise SystemExit('ERROR: SearXNG UFW: ' + message)
+
+def capture(args):
+    result = subprocess.run(args, text=True, capture_output=True, timeout=20)
+    require(result.returncode == 0, 'cannot inspect selected rule/table')
+    return result.stdout
+
+def option(words, *names):
+    found = [words[i + 1] for i, word in enumerate(words[:-1]) if word in names]
+    require(len(found) <= 1, 'ambiguous rule option; review custom filtering')
+    return found[0] if found else None
+
+def port_matches(spec, port):
+    if spec is None:
+        return True
+    for item in spec.split(','):
+        bounds = item.split(':')
+        require(len(bounds) <= 2 and all(x.isdecimal() for x in bounds),
+                'unrecognized TCP port expression; review custom filtering')
+        low, high = int(bounds[0]), int(bounds[-1])
+        if low <= port <= high:
+            return True
+    return False
+
+def persistent_with_policy_chain(persistent, effective, prefix):
+    # ufw-init creates this chain; before/after/user.rules only reference it.
+    # The persistent DEFAULT_INPUT_POLICY=DROP is checked by the caller.
+    # Require the entire live chain to be exactly DROP, never trust its name.
+    chain = prefix + '-skip-to-policy-input'
+    rules = [shlex.split(line) for line in effective.splitlines()
+             if line.startswith('-A ' + chain + ' ')]
+    require(rules == [['-A', chain, '-j', 'DROP']],
+            'generated input policy chain is missing or is not an unconditional DROP')
+    for line in persistent.splitlines():
+        words = shlex.split(line, comments=True)
+        require(not words or not (words[0] == ':' + chain or
+                (words[0] in ('-A', '-N', '-F', '-I', '-R', '-X') and
+                 len(words) > 1 and words[1] == chain)),
+                'persistent rules redefine the generated input policy chain')
+    # In-memory audit model only: no firewall file/table is written or changed.
+    return persistent + '\n:' + chain + ' - [0:0]\n-A ' + chain + ' -j DROP\n'
+
+def audit(text, roots, allowed, port, family):
+    chains = {}
+    for line in text.splitlines():
+        if line.startswith('-N '):
+            chains.setdefault(shlex.split(line)[1], [])
+        elif line.startswith(':'):
+            chains.setdefault(line.split()[0][1:], [])
+        if not line.startswith('-A '):
+            continue
+        words = shlex.split(line)
+        chains.setdefault(words[1], []).append(words[2:])
+    pending, visited = list(roots), set()
+    while pending:
+        chain = pending.pop()
+        if chain in visited:
+            continue
+        visited.add(chain)
+        for words in chains.get(chain, []):
+            # Conservative policy proof for new TCP connections to this app.
+            # Unsupported/negated paths fail closed instead of assuming isolation.
+            negated = '!' in words
+            proto = option(words, '-p', '--protocol')
+            if not negated and proto in ('udp', '17', 'icmp', '1', 'ipv6-icmp', 'icmpv6', '58'):
+                continue
+            if not negated and option(words, '-i', '--in-interface') == 'lo':
+                continue
+            states = option(words, '--ctstate', '--state')
+            if not negated and states and set(states.split(',')) <= {'RELATED', 'ESTABLISHED'}:
+                continue
+            ports = option(words, '--dport', '--destination-port', '--dports', '--destination-ports')
+            if not negated and not port_matches(ports, port):
+                continue
+            target = option(words, '-j', '--jump', '-g', '--goto')
+            if target in ('DROP', 'REJECT', 'RETURN', 'LOG', 'NFLOG', None):
+                continue
+            if target in chains:
+                pending.append(target)
+                continue
+            require(target == 'ACCEPT', 'unrecognized reachable input target; review custom filtering')
+            require(not negated, 'negated TCP access rule requires review')
+            source = option(words, '-s', '--source') or ('0.0.0.0/0' if family == 4 else '::/0')
+            network = ipaddress.ip_network(source, strict=False)
+            require(any(network.subnet_of(entry) for entry in allowed),
+                    'a persistent/effective rule permits broader app access than the selected sources')
+
+try:
+    policy = json.loads(Path('/opt/searxng/ufw-policy.json').read_text())
+    require(type(policy['port']) is int and 1024 <= policy['port'] <= 65535 and policy['sources'],
+            'invalid app port/source policy')
+    networks = [ipaddress.ip_network(value, strict=True) for value in policy['sources']]
+    defaults = Path('/etc/default/ufw').read_text()
+    for key, expected in {'DEFAULT_INPUT_POLICY': 'DROP', 'DEFAULT_OUTPUT_POLICY': 'ACCEPT',
+                          'DEFAULT_FORWARD_POLICY': 'DROP'}.items():
+        values = re.findall(r'^' + key + r'=["\']?([A-Z]+)["\']?\s*$', defaults, re.M)
+        require(values == [expected], 'persistent default policy differs: ' + key)
+    for family, tool, prefix, suffix in ((4, '/usr/sbin/iptables', 'ufw', ''),
+                                        (6, '/usr/sbin/ip6tables', 'ufw6', '6')):
+        allowed = [network for network in networks if network.version == family]
+        effective = capture([tool, '-w', '5', '-S'])
+        persistent = '\n'.join(Path('/etc/ufw/' + stem + suffix + '.rules').read_text()
+                               for stem in ('before', 'after', 'user'))
+        persistent = persistent_with_policy_chain(persistent, effective, prefix)
+        for source in allowed:
+            # The exact selected allow must exist both now and after a reload.
+            capture([tool, '-w', '5', '-C', prefix + '-user-input', '-s', str(source),
+                     '-p', 'tcp', '-m', 'tcp', '--dport', str(policy['port']), '-j', 'ACCEPT'])
+            present = False
+            for line in persistent.splitlines():
+                if not line.startswith('-A ' + prefix + '-user-input '):
+                    continue
+                words = shlex.split(line)[2:]
+                rule_source = option(words, '-s', '--source') or ('0.0.0.0/0' if family == 4 else '::/0')
+                if ('!' not in words and option(words, '-p', '--protocol') == 'tcp'
+                        and option(words, '--dport', '--destination-port') == str(policy['port'])
+                        and option(words, '-j', '--jump') == 'ACCEPT'
+                        and ipaddress.ip_network(rule_source, strict=False) == source):
+                    present = True
+            require(present, 'selected source allow is missing from persistent rules')
+        audit(effective, ['INPUT'], allowed, policy['port'], family)
+        audit(persistent, [prefix + '-' + leaf + '-input'
+                           for leaf in ('before', 'after', 'user', 'reject', 'track')],
+              allowed, policy['port'], family)
+except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as exc:
+    # Do not print command arguments or rule/config contents on parsing failure.
+    raise SystemExit('ERROR: SearXNG UFW inspection could not complete: ' + type(exc).__name__)
 UFW_CHECK_POLICY
 UFWCHECK
 pct push "$CT_ID" "$tmp" /usr/local/sbin/searxng-ufw-check --perms 0755
@@ -909,7 +1108,7 @@ GRAPH_DRIVER="$(pct exec "$CT_ID" -- podman info --format '{{.Store.GraphDriverN
 echo "  Podman: cgroup ${CGROUPS_VERSION}, storage driver ${GRAPH_DRIVER}$([ "$PODMAN_FUSE_OVERLAY" -eq 1 ] && echo " (fuse-overlayfs)" || echo " (native)")"
 
 # ── Pull images ───────────────────────────────────────────────────────────────
-INSTALL_STAGE="image pull and compatibility"
+INSTALL_STAGE="image compatibility"
 echo "  Pulling SearXNG image: ${APP_IMAGE} ..."
 pct exec "$CT_ID" -- bash -lc "
   set -euo pipefail
@@ -1095,6 +1294,7 @@ APP_GID=${APP_OWNER##*:}
 echo "  SearXNG image initializer and Granian options verified; service UID:GID=$APP_OWNER"
 
 # ── Prepare persistent paths ──────────────────────────────────────────────────
+INSTALL_STAGE="application configuration"
 # SearXNG persistent state (all of it):
 #   /opt/searxng/config/   settings.yml, limiter.toml  (→ /etc/searxng)
 #   /opt/searxng/cache/    faviconcache.db, other persistent cache (→ /var/cache/searxng)
@@ -1333,6 +1533,7 @@ APP_PORT=${APP_PORT}
 APP_TZ=${APP_TZ}
 APP_FQDN=${APP_FQDN}
 PUBLIC_INSTANCE=${PUBLIC_INSTANCE}
+TRUSTED_PROXIES=${TRUSTED_PROXIES}
 AUTO_UPDATE=${AUTO_UPDATE}
 PODMAN_FUSE_OVERLAY=${PODMAN_FUSE_OVERLAY}
 INITIAL_WAIT_SECONDS=${INITIAL_WAIT_SECONDS}
@@ -1368,7 +1569,6 @@ SWITCHED=0
 START_ATTEMPTED=0
 APP_STOPPED=0
 COMPONENT=""
-DB_TYPE_BEFORE=""
 declare -A STATE=()
 
 die() { printf '  ERROR: %s\n' "$*" >&2; exit 1; }
@@ -1383,6 +1583,9 @@ read_state() {
     STATE[$key]=$value
   done < "$ENV_FILE"
   # State is parsed as data. Never source an editable .env as root.
+  [[ ${STATE[APP_TZ]:-} =~ ^[A-Za-z0-9_+-]+(/[A-Za-z0-9_+-]+)*$ ]] || die "Invalid APP_TZ."
+  [[ ${STATE[UPDATE_TIME]:-} =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]] || die "Invalid UPDATE_TIME."
+  [[ ${STATE[PUBLIC_INSTANCE]:-} =~ ^[01]$ ]] || die "Invalid PUBLIC_INSTANCE."
   for key in APP_PORT INITIAL_WAIT_SECONDS UPDATE_WAIT_SECONDS PODMAN_FUSE_OVERLAY AUTO_UPDATE; do
     [[ ${STATE[$key]:-} =~ ^(0|[1-9][0-9]{0,5})$ ]] || die "Invalid $key."
   done
@@ -1475,10 +1678,7 @@ wait_service() {
             "http://127.0.0.1:${STATE[APP_PORT]}/healthz") || code=""
           [[ $code == $'OK\n200' || $code == $'OK\n\n200' ]] && value=1
           ;;
-        postgres)
-          timeout 5 podman exec "$container" pg_isready -q -h 127.0.0.1 -U postgres -d postgres && value=1
-          ;;
-        valkey|redis)
+        valkey)
           code=$(timeout 5 podman exec "$container" "$kind-cli" -h 127.0.0.1 ping 2>/dev/null) || code=""
           [[ $code == PONG ]] && value=1
           ;;
@@ -1512,20 +1712,8 @@ validate_candidate() {
   [[ $old_user == "$new_user" ]] || die "Image USER changed; review ownership before updating."
 
 }
-pre_update_checks() {
-python3 - "$APP_DIR/config/settings.yml" "$APP_DIR/config/limiter.toml" <<'CONFIG_CHECK'
-import sys, yaml, tomllib
-with open(sys.argv[1]) as f:
-    config = yaml.safe_load(f)
-if not isinstance(config, dict) or not isinstance(config.get("server"), dict):
-    raise SystemExit("Invalid SearXNG settings mapping")
-with open(sys.argv[2], "rb") as f:
-    tomllib.load(f)
-CONFIG_CHECK
-  :
-}
 runtime_checks() {
-python3 - "${STATE[APP_PORT]}" "${STATE[APP_TZ]}" <<'RUNTIME_CHECK'
+python3 - "${STATE[APP_PORT]}" "${STATE[APP_TZ]}" "${BOOTSTRAP_ALLOWED:-0}" "${STATE[APP_FQDN]}" "${STATE[PUBLIC_INSTANCE]}" "${STATE[TRUSTED_PROXIES]}" <<'RUNTIME_CHECK'
 import hashlib
 import ipaddress
 import json
@@ -1534,26 +1722,71 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+import tomllib
+import yaml
+
+class VerificationError(Exception):
+    pass
 
 def capture(args):
     result = subprocess.run(args, text=True, capture_output=True, timeout=20)
     if result.returncode:
-        raise RuntimeError('Inspection failed: ' + args[0] + ' (rc=' + str(result.returncode) + ')')
+        raise VerificationError('Inspection failed: ' + args[0] + ' (rc=' + str(result.returncode) + ')')
     return result.stdout.strip()
 
 def require(ok, label):
     if not ok:
-        raise ValueError(label)
+        raise VerificationError(label)
 
 try:
     port = int(sys.argv[1])
     firewall = json.loads(Path('/opt/searxng/ufw-policy.json').read_text())
     require(firewall['port'] == port, 'Application and firewall ports disagree')
-    # Early readiness precedes hardening; later checks verify the guest's final zone.
+    # Only the creator's explicit initial invocation may precede common hardening.
     timezone_policy = Path('/var/lib/lab-hardening/policy.json')
     if timezone_policy.exists():
+        policy = json.loads(timezone_policy.read_text())
+        require(policy.get('version') == '1.2.0', 'Unexpected common hardening policy version')
         actual_timezone = capture(['/usr/local/sbin/lab-timezone', 'check', str(timezone_policy)])
         require(actual_timezone == sys.argv[2], 'SearXNG TZ differs from the effective guest timezone')
+    else:
+        require(sys.argv[3] == '1', 'Common hardening policy is missing; installation is incomplete')
+    settings = yaml.safe_load(Path('/opt/searxng/config/settings.yml').read_text())
+    server = settings['server']
+    require(server.get('port') == port and server.get('bind_address') == '0.0.0.0',
+            'SearXNG settings listener contract differs')
+    require(server.get('limiter') is True and server.get('public_instance') is (sys.argv[5] == '1'),
+            'SearXNG limiter/public-instance policy differs')
+    expected_url = 'https://' + sys.argv[4] + '/' if sys.argv[4] else False
+    require(server.get('base_url') == expected_url, 'SearXNG base URL differs')
+    require(isinstance(server.get('secret_key'), str) and len(server['secret_key']) >= 32,
+            'SearXNG secret is missing or malformed')
+    require(settings.get('valkey', {}).get('url') == 'valkey://127.0.0.1:6379/0',
+            'SearXNG Valkey endpoint differs')
+    limiter = tomllib.loads(Path('/opt/searxng/config/limiter.toml').read_text())
+    expected_proxies = {str(ipaddress.ip_network(x.strip(), strict=True))
+                        for x in sys.argv[6].split(',') if x.strip()}
+    actual_proxies = {str(ipaddress.ip_network(x, strict=True))
+                      for x in limiter['botdetection']['trusted_proxies']}
+    require(actual_proxies == expected_proxies and (not sys.argv[4] or bool(actual_proxies)),
+            'Trusted-proxy policy differs from deployed state')
+    # Inspect only the current service invocation; historical recovered errors
+    # must not make observational maintenance fail forever.
+    invocation = capture(['systemctl', 'show', 'searxng.service', '-p', 'InvocationID', '--value'])
+    require(re.fullmatch(r'[a-f0-9]{32}', invocation), 'Missing SearXNG invocation identity')
+    journal = capture(['journalctl', '_SYSTEMD_INVOCATION_ID=' + invocation,
+                       '--no-pager', '-o', 'cat'])
+    require(not re.search(r'limiter requires (a )?valkey|searx\.valkeydb.*(error|refused)', journal, re.I),
+            'Current SearXNG invocation reports a limiter/Valkey failure')
+    # Volatile cache recovery is valid only while RDB/AOF stay disabled.
+    for key, expected in {'bind': '127.0.0.1', 'port': '6379', 'protected-mode': 'yes',
+                          'save': '', 'appendonly': 'no', 'maxmemory': str(128 * 1024 * 1024),
+                          'maxmemory-policy': 'allkeys-lru'}.items():
+        result = capture(['podman', 'exec', 'searxng-valkey', 'valkey-cli', '--raw',
+                          '-h', '127.0.0.1', 'CONFIG', 'GET', key]).splitlines()
+        require(result == ([key, expected] if expected else [key]),
+                'Valkey runtime configuration differs: ' + key)
+
     processes = {}
     for name, user, mounts, files in (
         ('searxng', 'searxng',
@@ -1613,10 +1846,17 @@ try:
                 require((info.st_uid, info.st_gid) == (uid, gid), 'SearXNG ownership mismatch: ' + path)
             require(Path('/opt/searxng/config/settings.yml').stat().st_mode & 0o007 == 0,
                     'SearXNG settings/secret readable by other users')
+            require(data['Config'].get('Entrypoint') == ['/usr/local/searxng/entrypoint.sh'],
+                    'SearXNG runtime entrypoint changed')
             environment = dict(item.split('=', 1) for item in data['Config']['Env'] if '=' in item)
             for key, expected in {'SEARXNG_PORT': str(port), 'GRANIAN_HOST': '0.0.0.0',
                                   'FORCE_OWNERSHIP': 'false', 'TZ': sys.argv[2]}.items():
                 require(environment.get(key) == expected, 'SearXNG environment mismatch: ' + key)
+            actual_tz = capture(['podman', 'exec', name, '/usr/local/searxng/.venv/bin/python', '-c',
+                                 "import os,time; from datetime import datetime; from zoneinfo import ZoneInfo; "
+                                 "assert datetime.now().astimezone().utcoffset() == datetime.now(ZoneInfo(os.environ['TZ'])).utcoffset(); "
+                                 "print(os.environ['TZ'])"])
+            require(actual_tz == sys.argv[2], 'SearXNG runtime timezone delivery/use mismatch')
         print('  Runtime identity: ' + name + ' UID:GID=' + str(uid) + ':' + str(gid)
               + '; mounts and configuration delivery verified.')
 
@@ -1640,14 +1880,52 @@ try:
     require(seen == {port, 6379}, 'Required SearXNG/Valkey listener missing')
     print('  TCP listener owners verified: SearXNG 0.0.0.0:' + str(port) + '; Valkey loopback:6379.')
 except Exception as exc:
-    print('ERROR: SearXNG runtime verification: ' + str(exc), file=sys.stderr)
+    detail = str(exc) if isinstance(exc, VerificationError) else type(exc).__name__
+    print('ERROR: SearXNG runtime verification: ' + detail, file=sys.stderr)
     raise SystemExit(1)
 RUNTIME_CHECK
 }
 
-post_update_checks() {
+# All three entry paths use this verifier under the same maintenance lock.
+# Subshell locals keep verifier component selection out of update/recovery state.
+verify_application() (
+  trap - EXIT
+  local initial=${1:-0} budget actual component container
+  local -A restarts_before=()
+  BOOTSTRAP_ALLOWED=0
+  if [[ $initial == 1 && ${SEARXNG_CREATOR_BOOTSTRAP:-0} == 1 ]]; then
+    BOOTSTRAP_ALLOWED=1
+  fi
+  /usr/local/sbin/searxng-ufw-check
+  budget=${STATE[UPDATE_WAIT_SECONDS]}
+  [[ $initial != 1 ]] || budget=${STATE[INITIAL_WAIT_SECONDS]}
+  for container in searxng-valkey searxng; do
+    restarts_before[$container]=$(systemctl show "$container.service" -p NRestarts --value)
+    [[ ${restarts_before[$container]} =~ ^[0-9]+$ ]] || die "Missing restart inventory."
+    [[ $initial != 1 || ${restarts_before[$container]} == 0 ]] || die "Unexpected initial restart."
+  done
+  for component in VALKEY APP; do
+    select_component "$component"
+    load_unit
+    [[ $(unit_value 'Network=' "$UNIT") == host ]] || die "Expected host networking."
+    [[ ${STATE[${component}_TAG]:-} == "$OLD_TAG" &&
+       ${STATE[${component}_IMAGE]:-} == "$OLD_IMAGE" &&
+       ${STATE[${component}_IMAGE_ID]:-} == "$OLD_ID" &&
+       ${STATE[${component}_IMAGE_REPO]:-} == "$REPO" ]] || die "State/Quadlet metadata mismatch."
+    if [[ $initial == 1 ]]; then
+      [[ $(systemctl show "$SERVICE" -p NRestarts --value) == 0 ]] || die "$SERVICE restarted during initial startup."
+    fi
+    wait_service "$CONTAINER" "$KIND" "$budget" || die "$SERVICE failed readiness or restarted."
+    actual=$(podman inspect --format '{{.Image}}' "$CONTAINER")
+    [[ $(image_id "$actual") == "$OLD_ID" ]] || die "Running/configured image mismatch: $SERVICE"
+  done
   runtime_checks
-}
+  for container in searxng-valkey searxng; do
+    [[ $(systemctl show "$container.service" -p NRestarts --value) == "${restarts_before[$container]}" ]] \
+      || die "Service restarted during application verification."
+  done
+  printf '  Readiness, stable restart counts, image IDs, mounts, ownership, sockets, timezone and UFW checks passed.\n'
+)
 finish() {
   local rc=$? restored=1
   trap - EXIT ERR INT TERM HUP
@@ -1672,7 +1950,7 @@ finish() {
       printf '  Target %s image retained: persistent state may already have changed.\n' "$COMPONENT" >&2
       printf '  No automatic image/database downgrade. Inspect journalctl -u %s -u %s.\n' "$SERVICE" "$MAIN_SERVICE" >&2
       printf '  Recover matching PBS/PVE state if needed. A readiness timeout does not stop a migration.\n' >&2
-      (( APP_STOPPED == 0 )) || printf '  After the backend is healthy: systemctl start %s\n' "$MAIN_SERVICE" >&2
+      (( APP_STOPPED == 0 )) || printf '  Dependent application remains stopped; inspect backend readiness.\n' >&2
     fi
   elif (( rc != 0 && APP_STOPPED )); then
     systemctl start "$MAIN_SERVICE" || restored=0
@@ -1689,7 +1967,7 @@ trap 'exit 143' TERM
 trap 'exit 129' HUP
 
 update_component() {
-  local requested=${2:-} actual new_id target old_variant new_variant
+  local requested=${2:-} actual new_id target
   select_component "$1"
   load_unit
   SWITCHED=0; START_ATTEMPTED=0; APP_STOPPED=0
@@ -1700,7 +1978,7 @@ update_component() {
     [[ $(printf '%s\n%s\n' "$OLD_TAG" "$target" | sort -V | head -n 1) == "$OLD_TAG" ]] \
       || die "Persistent-component downgrade requires matching data recovery."
   fi
-  /usr/local/sbin/searxng-ufw-check || die "Restore active UFW filtering before maintenance."
+  /usr/local/sbin/searxng-ufw-check || die "UFW verification failed; inspect the selected access policy before maintenance."
   actual=$(podman inspect --format '{{.Image}}' "$CONTAINER") || die "Cannot inspect running image."
   [[ $(image_id "$actual") == "$OLD_ID" ]] || die "Running/configured image mismatch; inspect the service."
   wait_service "$CONTAINER" "$KIND" 30 || die "$SERVICE is unhealthy before update."
@@ -1715,7 +1993,8 @@ update_component() {
     read_state
     printf '  Reconciled metadata from the authoritative Quadlet.\n'
   fi
-  pre_update_checks
+  # Full baseline before any candidate sees production state.
+  verify_application 0
   if (( YES == 0 )); then
     [[ -t 8 ]] || die "Interactive terminal or --yes is required."
     printf '  Verify a matching PBS/PVE recovery checkpoint on the host before updating.\n'
@@ -1730,6 +2009,7 @@ update_component() {
   podman pull "$REPO:$target"
   new_id=$(image_id "$REPO:$target") || die "Cannot resolve target image."
   if [[ $new_id == "$OLD_ID" && $target == "$OLD_TAG" ]]; then
+    verify_application 0
     printf '  %s unchanged; no restart.\n' "$COMPONENT"
     return 0
   fi
@@ -1759,7 +2039,8 @@ update_component() {
   fi
   actual=$(podman inspect --format '{{.Image}}' "$CONTAINER")
   [[ $(image_id "$actual") == "$new_id" ]] || die "Running image differs from target."
-  post_update_checks
+  read_state
+  verify_application 0
   SWITCHED=0; START_ATTEMPTED=0; APP_STOPPED=0
   rm -rf -- "$WORK"; WORK=""
   # Retain the prior image for inspection/recovery. No broad image prune.
@@ -1802,25 +2083,14 @@ case $cmd in
     done
     ;;
   check)
-    (( $# <= 2 )) && [[ ${2:-} == "" || ${2:-} == --initial ]] || die "Usage: $0 check [--initial]"
-    /usr/local/sbin/searxng-ufw-check
-    budget=${STATE[UPDATE_WAIT_SECONDS]}
-    [[ ${2:-} != --initial ]] || budget=${STATE[INITIAL_WAIT_SECONDS]}
-    for component in VALKEY APP; do
-      select_component "$component"
-      load_unit
-      if [[ ${2:-} == --initial ]]; then
-        [[ $(systemctl show "$SERVICE" -p NRestarts --value) == 0 ]] || die "$SERVICE restarted during initial startup."
-      fi
-      wait_service "$CONTAINER" "$KIND" "$budget" || die "$SERVICE failed readiness or restarted."
-      actual=$(podman inspect --format '{{.Image}}' "$CONTAINER")
-      [[ $(image_id "$actual") == "$OLD_ID" ]] || die "Running/configured image mismatch: $SERVICE"
-    done
-    runtime_checks
-    printf '  Readiness, stable restart counts, image IDs, mounts, ownership, sockets and UFW checks passed.\n'
+    [[ $# == 1 || ( $# == 2 && ${2:-} == --initial ) ]] || die "Usage: $0 check [--initial]"
+    (( YES == 0 )) || die "check accepts only --initial."
+    initial=0
+    [[ ${2:-} != --initial ]] || initial=1
+    verify_application "$initial"
     ;;
   version)
-    (( $# == 1 )) || die "version takes no argument."
+    (( $# == 1 && YES == 0 )) || die "version takes no argument."
     for component in VALKEY APP; do
       select_component "$component"; load_unit
       printf '  %s\n    tag: %s\n    configured ID: %s\n    running ID: ' "$CONTAINER" "$OLD_TAG" "$OLD_ID"
@@ -1828,11 +2098,12 @@ case $cmd in
     done
     ;;
   --help|-h|'')
+    (( $# <= 1 && YES == 0 )) || die "help takes no arguments."
     printf 'Usage: %s update [tag] [--yes] | update-valkey [tag] [--yes] | auto-update | check [--initial] | version\n' "$0"
     printf '  Exact image IDs; one component per operation; PBS/PVE handles data recovery.\n'
     printf '  Fresh-creator helper: do not replace an older deployed helper without migrating its control files.\n'
     ;;
-  *) die "Unknown command: $cmd" ;;
+  *) die "Unknown maintenance command." ;;
 esac
 MAINT
 pct push "$CT_ID" "$tmp" /usr/local/bin/searxng-maint.sh --perms 0755
@@ -1864,87 +2135,9 @@ pct exec "$CT_ID" -- systemctl start searxng.service
 # ── Early application readiness ───────────────────────────────────────────────
 INSTALL_STAGE="early application verification"
 sleep 30
-pct exec "$CT_ID" -- /usr/local/bin/searxng-maint.sh check --initial
-VERIFY_FAIL=0
-
-for svc in "$VALKEY_QUADLET_SERVICE" "$QUADLET_SERVICE"; do
-  if pct exec "$CT_ID" -- systemctl is-active --quiet "$svc" 2>/dev/null; then
-    echo "  Quadlet service is active: ${svc}"
-  else
-    echo "  ERROR: ${svc} is not active" >&2
-    echo "  Check: pct exec $CT_ID -- systemctl status ${svc}" >&2
-    echo "  Check: pct exec $CT_ID -- journalctl -u ${svc} --no-pager -n 50" >&2
-    VERIFY_FAIL=1
-  fi
-done
-
-RUNNING=0
-for i in $(seq 1 60); do
-  RUNNING="$(pct exec "$CT_ID" -- sh -lc \
-    'podman ps --filter name=^searxng$ --filter name=^searxng-valkey$ --format "{{.Names}}" 2>/dev/null | wc -l' \
-    2>/dev/null || echo 0)"
-  [[ "$RUNNING" -ge 2 ]] && break
-  sleep 2
-done
-pct exec "$CT_ID" -- bash -lc 'podman ps' || true
-
-if [[ "$RUNNING" -lt 2 ]]; then
-  echo "  ERROR: Expected 2 containers running (searxng, searxng-valkey), found $RUNNING" >&2
-  VERIFY_FAIL=1
-else
-  echo "  Container count OK ($RUNNING running)"
-fi
-
-VK_PONG="$(pct exec "$CT_ID" -- sh -lc 'podman exec searxng-valkey valkey-cli -h 127.0.0.1 ping 2>/dev/null' 2>/dev/null || true)"
-if [[ "$VK_PONG" == "PONG" ]]; then
-  echo "  Valkey responds on 127.0.0.1:6379 (PONG)"
-else
-  echo "  ERROR: Valkey did not answer PING on 127.0.0.1:6379" >&2
-  echo "  Check: pct exec $CT_ID -- journalctl -u searxng-valkey.service --no-pager -n 50" >&2
-  VERIFY_FAIL=1
-fi
-
-# /healthz is exempt from the limiter, so this probe is valid from inside the CT.
-SX_HEALTHY=0
-for i in $(seq 1 90); do
-  HTTP_RESPONSE=$(pct exec "$CT_ID" -- curl -sS -w '\n%{http_code}' --connect-timeout 2 --max-time 3 "http://127.0.0.1:${APP_PORT}/healthz") || HTTP_RESPONSE=""
-  HTTP_CODE=${HTTP_RESPONSE##*$'\n'}
-  case "$HTTP_RESPONSE" in
-    $'OK\n200'|$'OK\n\n200')
-      SX_HEALTHY=1
-      break
-      ;;
-  esac
-  sleep 2
-done
-
-if [[ "$SX_HEALTHY" -eq 1 ]]; then
-  echo "  SearXNG health check passed (HTTP $HTTP_CODE)"
-else
-  echo "  ERROR: SearXNG /healthz did not return HTTP 200 with body OK on port ${APP_PORT}" >&2
-  echo "  Check: pct exec $CT_ID -- systemctl status searxng.service" >&2
-  echo "  Check: pct exec $CT_ID -- journalctl -u searxng.service --no-pager -n 80" >&2
-  VERIFY_FAIL=1
-fi
-
-# In local mode SearXNG silently disables the limiter if Valkey is unreachable
-# (only public_instance makes it fatal). Valkey is deployed on purpose, so a
-# limiter/Valkey error in the startup log is a real failure here.
-if pct exec "$CT_ID" -- sh -lc 'journalctl -u searxng.service --no-pager -o cat 2>/dev/null | grep -qiE "limiter requires (a )?valkey|searx\.valkeydb.*(error|refused)"' 2>/dev/null; then
-  echo "  ERROR: SearXNG logged a limiter/Valkey connection error — rate limiting is not active" >&2
-  echo "  Check: pct exec $CT_ID -- journalctl -u searxng.service --no-pager -n 80" >&2
-  VERIFY_FAIL=1
-else
-  echo "  No limiter/Valkey connection errors detected in the startup log."
-fi
-
-
-if (( VERIFY_FAIL == 1 )); then
-  echo "" >&2
-  echo "  FATAL: Core verification failed — CT $CT_ID is preserved but the install is incomplete." >&2
-  echo "  Keep this CT for read-only diagnosis. Use a corrected creator with a new unused CT_ID and HN." >&2
-  exit 1
-fi
+# This one early call explicitly permits an absent common policy, only with --initial.
+# No persistent bootstrap flag is written; final/manual/update checks require policy.
+pct exec "$CT_ID" -- env SEARXNG_CREATOR_BOOTSTRAP=1 /usr/local/bin/searxng-maint.sh check --initial
 
 # ── Auto-update timer (policy-driven) ─────────────────────────────────────────
 pct exec "$CT_ID" -- bash -s -- "$UPDATE_TIME" <<'TIMER_INSTALL'
@@ -1971,13 +2164,11 @@ WantedBy=timers.target
 EOF2
 systemctl daemon-reload
 TIMER_INSTALL
-if [[ $AUTO_UPDATE == 1 ]]; then
-  pct exec "$CT_ID" -- systemctl enable --now searxng-update.timer
-else
-  pct exec "$CT_ID" -- systemctl disable --now searxng-update.timer
-fi
+# Installed definitions stay disabled/inactive until all final gates pass.
+pct exec "$CT_ID" -- systemctl disable --now searxng-update.timer
 
 # ── Extra packages ────────────────────────────────────────────────────────────
+INSTALL_STAGE="package cleanup and MOTD"
 if [[ "${#EXTRA_PACKAGES[@]}" -gt 0 ]]; then
   pct exec "$CT_ID" -- bash -lc "
     set -euo pipefail
@@ -1996,76 +2187,94 @@ pct exec "$CT_ID" -- bash -lc '
 '
 
 # ── MOTD (dynamic drop-ins) ───────────────────────────────────────────────────
-pct exec "$CT_ID" -- bash -lc "
-  set -euo pipefail
-  > /etc/motd
-  chmod -x /etc/update-motd.d/* 2>/dev/null || true
-  rm -f /etc/update-motd.d/*
-
-  cat > /etc/update-motd.d/00-header <<'MOTD'
+pct exec "$CT_ID" -- bash -s <<'MOTD_INSTALL'
+set -euo pipefail
+install -d -m 0755 /etc/update-motd.d
+> /etc/motd
+rm -f /etc/update-motd.d/*
+cat > /etc/update-motd.d/00-header <<'MOTD_HEADER'
 #!/bin/sh
-printf '\\n  SearXNG (Podman/Quadlet)\\n'
-printf '  ────────────────────────────────────\\n'
-MOTD
-
-  cat > /etc/update-motd.d/10-sysinfo <<'MOTD'
+printf '\n  SearXNG (Podman/Quadlet)\n'
+printf '  ────────────────────────────────────\n'
+MOTD_HEADER
+# BEGIN COMMON MOTD SYSINFO
+cat > /etc/update-motd.d/10-sysinfo <<'MOTD_SYSINFO'
 #!/bin/sh
-ip=\$(ip -4 -o addr show scope global 2>/dev/null | awk '{print \$4}' | cut -d/ -f1 | head -n1)
-printf '  Hostname:  %s\\n' \"\$(hostname)\"
-printf '  IP:        %s\\n' \"\${ip:-n/a}\"
-printf '  Uptime:    %s\\n' \"\$(uptime -p 2>/dev/null || uptime)\"
-printf '  Disk:      %s\\n' \"\$(df -h / | awk 'NR==2{printf \"%s/%s (%s used)\", \$3, \$2, \$5}')\"
-MOTD
-
-  cat > /etc/update-motd.d/30-app <<'MOTD'
+ip=$(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -n1)
+printf '  Hostname:  %s\n' "$(hostname)"
+printf '  IP:        %s\n' "${ip:-n/a}"
+printf '  Uptime:    %s\n' "$(uptime -p 2>/dev/null || uptime)"
+printf '  Disk:      %s\n' "$(df -h / | awk 'NR==2{printf "%s/%s (%s used)", $3, $2, $5}')"
+MOTD_SYSINFO
+# END COMMON MOTD SYSINFO
+cat > /etc/update-motd.d/30-app <<'MOTD_APP'
 #!/bin/sh
-running=\$(podman ps --filter name=^searxng$ --filter name=^searxng-valkey$ --format '{{.Names}}' 2>/dev/null | wc -l)
-svc_status=\$(systemctl is-active searxng.service 2>/dev/null); svc_status=\${svc_status:-unknown}
-vk_status=\$(systemctl is-active searxng-valkey.service 2>/dev/null); vk_status=\${vk_status:-unknown}
-ip=\$(ip -4 -o addr show scope global 2>/dev/null | awk '{print \$4}' | cut -d/ -f1 | head -n1)
-image=\$(awk -F= '/^APP_IMAGE=/{print \$2}' /opt/searxng/.env 2>/dev/null | tail -n1)
-vk_image=\$(awk -F= '/^VALKEY_IMAGE=/{print \$2}' /opt/searxng/.env 2>/dev/null | tail -n1)
-auto=\$(awk -F= '/^AUTO_UPDATE=/{print \$2}' /opt/searxng/.env 2>/dev/null | tail -n1)
-public=\$(awk -F= '/^PUBLIC_INSTANCE=/{print \$2}' /opt/searxng/.env 2>/dev/null | tail -n1)
-fqdn=\$(awk -F= '/^APP_FQDN=/{print \$2}' /opt/searxng/.env 2>/dev/null | tail -n1)
-port=\$(awk -F= '/^APP_PORT=/{print \$2}' /opt/searxng/.env 2>/dev/null | tail -n1)
-port=\${port:-8080}
-printf '  Containers: searxng + searxng-valkey (%s running)\\n' \"\$running\"
-printf '  Services:   searxng.service (%s) | searxng-valkey.service (%s)\\n' \"\$svc_status\" \"\$vk_status\"
-printf '  Image:      %s\\n' \"\${image:-n/a}\"
-printf '  Valkey:     %s (127.0.0.1:6379, no persistence)\\n' \"\${vk_image:-n/a}\"
-printf '  Mode:       %s\\n' \"\$([ \"\$public\" = '1' ] && echo 'public (limiter + link_token)' || echo 'local (limiter)')\"
-printf '  Policy:     %s\\n' \"\$([ \"\$auto\" = '1' ] && echo 'auto-update daily (re-pull current tags)' || echo 'manual updates only')\"
-printf '  Config:     /opt/searxng/config/settings.yml  limiter.toml\\n'
-printf '  Cache:      /opt/searxng/cache\\n'
-printf '  Logs:       journalctl -u searxng.service -f\\n'
-printf '  Maintain:   /usr/local/bin/searxng-maint.sh [update|update-valkey|auto-update|version]\\n'
-printf '  Updates:    systemctl status searxng-update.timer\\n'
-if [ -n \"\$fqdn\" ]; then
-  printf '  Web UI:     https://%s/\\n' \"\$fqdn\"
-fi
-printf '  Web UI:     http://%s:%s/\\n' \"\${ip:-n/a}\" \"\$port\"
-MOTD
-
-  cat > /etc/update-motd.d/99-footer <<'MOTD'
+svc=$(systemctl is-active searxng.service 2>/dev/null); svc=${svc:-unknown}
+vk=$(systemctl is-active searxng-valkey.service 2>/dev/null); vk=${vk:-unknown}
+ip=$(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -n1)
+port=$(awk -F= '$1=="APP_PORT"{print $2}' /opt/searxng/.env 2>/dev/null)
+fqdn=$(awk -F= '$1=="APP_FQDN"{print $2}' /opt/searxng/.env 2>/dev/null)
+auto=$(awk -F= '$1=="AUTO_UPDATE"{print $2}' /opt/searxng/.env 2>/dev/null)
+schedule=$(awk -F= '$1=="UPDATE_TIME"{print $2}' /opt/searxng/.env 2>/dev/null)
+zone=$(awk -F= '$1=="APP_TZ"{print $2}' /opt/searxng/.env 2>/dev/null)
+printf '  Services:   SearXNG %s | Valkey %s\n' "$svc" "$vk"
+printf '  Web UI:     http://%s:%s/\n' "${ip:-n/a}" "${port:-n/a}"
+[ -z "$fqdn" ] || printf '  Public URL: https://%s/\n' "$fqdn"
+printf '  Backend:    Valkey 127.0.0.1:6379 (no persistence)\n'
+printf '  Images:     /etc/containers/systemd/searxng{,-valkey}.container\n'
+printf '  Config:     /opt/searxng/config/settings.yml (secret), limiter.toml\n'
+printf '  State:      /opt/searxng/.env | Cache: /opt/searxng/cache\n'
+printf '  Updates:    AUTO_UPDATE=%s | daily %s (%s)\n' "${auto:-n/a}" "${schedule:-n/a}" "${zone:-n/a}"
+printf '  Check:      /usr/local/bin/searxng-maint.sh check\n'
+printf '  Version:    /usr/local/bin/searxng-maint.sh version\n'
+printf '  Logs:       journalctl -u searxng.service -u searxng-valkey.service\n'
+MOTD_APP
+# BEGIN COMMON MOTD FOOTER
+cat > /etc/update-motd.d/99-footer <<'MOTD_FOOTER'
 #!/bin/sh
-printf '  ────────────────────────────────────\\n\\n'
-MOTD
+printf '  ────────────────────────────────────\n\n'
+MOTD_FOOTER
+# END COMMON MOTD FOOTER
+chmod 0755 /etc/update-motd.d/{00-header,10-sysinfo,30-app,99-footer}
+MOTD_INSTALL
 
-  chmod +x /etc/update-motd.d/*
-"
-
+# BEGIN COMMON TERMINAL WRAPPER
+# COMMON TERMINAL WRAPPER
 pct exec "$CT_ID" -- bash -lc '
   set -euo pipefail
   touch /root/.bashrc
   grep -q "^export TERM=" /root/.bashrc 2>/dev/null || echo "export TERM=xterm-256color" >> /root/.bashrc
 '
+# END COMMON TERMINAL WRAPPER
 
-# ── Shared hardening caller boundary ─────────────────────────────────────────
+# BEGIN COMMON TIMEZONE PLAN RECHECK
+# COMMON TIMEZONE PLAN RECHECK
+TIMEZONE_PLAN_LATE=$(pct exec "$CT_ID" -- /usr/local/sbin/lab-timezone plan "$PRESERVE_EXISTING_TIMEZONE" "$SERVER_TIMEZONE")
+[[ $TIMEZONE_PLAN == "$TIMEZONE_PLAN_LATE" ]] || {
+  echo 'ERROR: Guest timezone changed since early planning; CT preserved.' >&2
+  false
+}
+unset TIMEZONE_PLAN_LATE
+# END COMMON TIMEZONE PLAN RECHECK
+
+# BEGIN COMMON HARDENING CALLER
+# COMMON HARDENING CALLER
 INSTALL_STAGE="shared hardening"
 CLEANUP_ON_FAIL=0
-# Verified Proxmox-only caller: a host login marker is not a guest SSH session.
-# The standalone block's real guest-SSH guard remains intact.
+[[ $EUID == 0 && -d /etc/pve ]] || {
+  echo 'ERROR: Shared hardening caller must be the verified Proxmox host.' >&2
+  false
+}
+command -v pveversion >/dev/null
+command -v pct >/dev/null
+pveversion >/dev/null
+[[ $CT_ID =~ ^[1-9][0-9]+$ ]] || {
+  echo 'ERROR: Invalid selected CT_ID.' >&2
+  false
+}
+pct status "$CT_ID" | grep -qx 'status: running'
+pct config "$CT_ID" | grep -qx 'unprivileged: 1'
+# A verified host login marker is not a guest SSH session.
 unset SSH_CONNECTION
 UFW_RULES_BEFORE=$(pct exec "$CT_ID" -- bash -s <<'UFW_SNAPSHOT_BEFORE'
 set -euo pipefail
@@ -2074,8 +2283,9 @@ iptables -w 5 -S
 ip6tables -w 5 -S
 UFW_SNAPSHOT_BEFORE
 )
+# END COMMON HARDENING CALLER
 
-# BEGIN LAB HARDENING v1.2.0 (byte-for-byte timezone-adapted standalone)
+# BEGIN LAB HARDENING v1.2.0 (byte-for-byte canonical standalone)
 #!/usr/bin/env bash
 # ── Shared Debian 13 LXC hardening block ───────────────────────────────────────
 # Version: 1.2.0 (2026-09-15; user-authorized LXC timezone adaptation)
@@ -3104,7 +3314,8 @@ LAB_HARDENING_GUEST
 # ── End shared hardening block ────────────────────────────────────────────────
 # END LAB HARDENING v1.2.0
 
-# ── Final verification after shared hardening ──────────────────────────────────
+# BEGIN COMMON UFW PRESERVATION CHECK
+# COMMON UFW PRESERVATION CHECK
 INSTALL_STAGE="final verification"
 UFW_RULES_AFTER=$(pct exec "$CT_ID" -- bash -s <<'UFW_SNAPSHOT_AFTER'
 set -euo pipefail
@@ -3114,18 +3325,68 @@ ip6tables -w 5 -S
 UFW_SNAPSHOT_AFTER
 )
 [[ $UFW_RULES_BEFORE == "$UFW_RULES_AFTER" ]] || {
-  echo "ERROR: Persistent/effective UFW rules changed during hardening; CT preserved." >&2
+  echo 'ERROR: Persistent/effective UFW rules changed during hardening; CT preserved.' >&2
   false
 }
 unset UFW_RULES_BEFORE UFW_RULES_AFTER
+# END COMMON UFW PRESERVATION CHECK
 pct exec "$CT_ID" -- /usr/local/bin/searxng-maint.sh check --initial
 pct exec "$CT_ID" -- /usr/local/sbin/lab-hardening-check
+# BEGIN COMMON FINAL TIMEZONE CHECK
+# COMMON FINAL TIMEZONE CHECK
 EFFECTIVE_GUEST_TIMEZONE=$(pct exec "$CT_ID" -- /usr/local/sbin/lab-timezone check /var/lib/lab-hardening/policy.json)
 [[ $EFFECTIVE_GUEST_TIMEZONE == "$APP_TZ" ]] || {
-  echo 'ERROR: SearXNG TZ differs from the final effective guest timezone; CT preserved.' >&2
+  echo 'ERROR: Planned application timezone differs from the final guest timezone; CT preserved.' >&2
   false
 }
-echo "  Final app checks and persistent/effective IPv4/IPv6 UFW preservation passed."
+unset TIMEZONE_PLAN
+# END COMMON FINAL TIMEZONE CHECK
+HARDENING_RESULT=$(pct exec "$CT_ID" -- python3 -c 'import json; p=json.load(open("/var/lib/lab-hardening/status.json")); assert p["status"] in ("OK", "WARN"); print(p["status"])')
+echo "  Final application checks and persistent/effective IPv4/IPv6 UFW preservation passed."
+
+# ── Activate the image timer only after all final verification gates ──────────
+INSTALL_STAGE="timer and protection"
+pct exec "$CT_ID" -- bash -s -- "$AUTO_UPDATE" "$UPDATE_TIME" "$APP_TZ" <<'TIMER_FINAL'
+set -euo pipefail
+policy=$1 schedule=$2 zone=$3
+[[ $(/usr/local/sbin/lab-timezone check /var/lib/lab-hardening/policy.json) == "$zone" ]]
+systemctl daemon-reload
+if [[ $policy == 1 ]]; then
+  systemctl enable --now searxng-update.timer
+else
+  systemctl disable --now searxng-update.timer
+fi
+python3 - "$policy" "$schedule" <<'TIMER_VERIFY'
+from pathlib import Path
+import re, subprocess, sys
+
+def require(ok, message):
+    if not ok:
+        raise SystemExit('ERROR: Image timer: ' + message)
+
+text = Path('/etc/systemd/system/searxng-update.timer').read_text()
+calendar = '*-*-* ' + sys.argv[2] + ':00'
+require(re.findall(r'^OnCalendar=(.*)$', text, re.M) == [calendar], 'installed calendar differs')
+require(re.findall(r'^Persistent=(.*)$', text, re.M) == ['true'], 'persistence differs')
+result = subprocess.run(['systemctl', 'show', 'searxng-update.timer',
+                         '-p', 'TimersCalendar', '-p', 'NextElapseUSecRealtime',
+                         '-p', 'UnitFileState', '-p', 'ActiveState', '-p', 'Persistent',
+                         '-p', 'Unit'], text=True, capture_output=True, timeout=20)
+require(result.returncode == 0, 'cannot inspect effective timer')
+data = dict(line.split('=', 1) for line in result.stdout.splitlines() if '=' in line)
+effective = re.findall(r'OnCalendar=(.*?)\s*;', data.get('TimersCalendar', ''))
+require(effective == [calendar], 'effective calendar differs')
+require(data.get('Persistent') == 'yes', 'effective persistence differs')
+require(data.get('Unit') == 'searxng-update.service', 'wrong target service')
+enabled = sys.argv[1] == '1'
+require(data.get('UnitFileState') == ('enabled' if enabled else 'disabled'), 'enabled state differs')
+require(data.get('ActiveState') == ('active' if enabled else 'inactive'), 'active state differs')
+next_run = data.get('NextElapseUSecRealtime', '')
+require(not enabled or next_run not in ('', 'n/a', '0'), 'enabled timer has no next elapse')
+print('  Image timer: ' + ('enabled/active' if enabled else 'disabled/inactive')
+      + '; daily ' + sys.argv[2] + '; next: ' + (next_run or 'n/a'))
+TIMER_VERIFY
+TIMER_FINAL
 
 # ── Proxmox UI description ────────────────────────────────────────────────────
 SX_DESC_LINK="http://${CT_IP}:${APP_PORT}/"
@@ -3141,85 +3402,86 @@ Created by searxng-quadlet.sh</details>"
 pct set "$CT_ID" --description "$SX_DESC"
 
 # ── Protect container ─────────────────────────────────────────────────────────
+# BEGIN COMMON PROTECTION
 pct set "$CT_ID" --protection 1
+# END COMMON PROTECTION
+pct config "$CT_ID" | grep -qx 'protection: 1'
 
+# ── Summary ───────────────────────────────────────────────────────────────────
+INSTALL_STAGE="summary"
+CT_ADDRESSES=$(pct exec "$CT_ID" -- ip -o addr show scope global | awk '{print $4}' | paste -sd ' ')
+SSH_LABEL='removed; service/socket masked'
+[[ $HARDENING_KEEP_SSH == 0 ]] || SSH_LABEL='preserved; UFW access is a separate policy'
+IMAGE_TIMER_LABEL='disabled/inactive'
+[[ $AUTO_UPDATE == 0 ]] || IMAGE_TIMER_LABEL='enabled/active'
+cat <<SUMMARY
 
-cat <<OPERATIONS
+  SEARXNG — VERIFIED INSTALLATION
 
-  SEARXNG — OPERATIONS
+  CONTAINER
+    $HN | CT $CT_ID | $CT_ADDRESSES
+    Debian 13 | unprivileged | protection enabled
+    Root password set; console via pct enter; no autologin configured.
+    SSH: $SSH_LABEL
 
-  CONTAINER     $HN | CT $CT_ID | $CT_IP
-  WEB/ADMIN     http://$CT_IP:$APP_PORT/
-  ALLOWED FROM  $FIREWALL_ACCESS_LABEL
-  FIREWALL      UFW inside the CT, IPv4 and IPv6; no PVE firewall dependency
-  TIMEZONE      $EFFECTIVE_GUEST_TIMEZONE ($TIMEZONE_ACTION; guest and SearXNG verified)
-  AUTO-UPDATE   $AUTO_UPDATE | daily $UPDATE_TIME ($APP_TZ)
-  IMAGES        exact local IDs, Pull=never; old images retained for review
+  ACCESS
+    Local: http://$CT_IP:$APP_PORT/
+    Public FQDN: ${APP_FQDN:-(not configured)}
+    TCP $APP_PORT allowed sources: $FIREWALL_ACCESS_LABEL
+    Trusted proxies: ${TRUSTED_PROXIES:-(none; connecting IP identifies clients)}
+    Valkey: 127.0.0.1:6379 only; volatile limiter counters.
 
-  RUN ON THE PROXMOX HOST
+  FIREWALL
+    UFW inside CT, IPv4/IPv6; no Proxmox firewall dependency.
+    Six rule files and both complete effective filter tables preserved across hardening.
+    Listener inventory (does not grant access):
+      TCP: ${HARDENING_TCP_PORTS:-(inventory-only)}
+      UDP: ${HARDENING_UDP_PORTS:-(inventory-only)}
+
+  TIMEZONE
+    $EFFECTIVE_GUEST_TIMEZONE ($TIMEZONE_ACTION); guest policy and SearXNG TZ/use verified.
+
+  RUNTIME AND FILES
+    SearXNG: $APP_IMAGE
+      $APP_IMAGE_ID
+    Valkey:  $VALKEY_IMAGE
+      $VALKEY_IMAGE_ID
+    Quadlets: /etc/containers/systemd/searxng{,-valkey}.container
+    Config: /opt/searxng/config/settings.yml (contains secret_key), limiter.toml
+    Cache: /opt/searxng/cache | Valkey config: /opt/searxng/valkey.conf
+    State: /opt/searxng/.env | Access policy: /opt/searxng/ufw-policy.json
+
+  UPDATES AND RECOVERY
+    Image timer: $IMAGE_TIMER_LABEL; daily $UPDATE_TIME ($EFFECTIVE_GUEST_TIMEZONE, local/DST).
+    Common checker: enabled; after boot and hourly.
+    Persistent config/cache are in the CT root disk; no external app bind storage is configured.
+    No PBS backup or PVE snapshot was created or verified by this creator.
+    Verify matching recovery coverage before updates; --yes only skips confirmation.
+    SearXNG target images are retained after attempted starts; image rollback cannot undo data changes.
+SUMMARY
+if [[ $PODMAN_FUSE_OVERLAY == 1 ]]; then
+  echo '    FUSE is enabled: use stop-mode PBS; validate backup/restore for this CT.'
+fi
+cat <<SUMMARY
+
+  RUN ON PROXMOX
     pct enter $CT_ID
+    pct exec $CT_ID -- /usr/local/bin/searxng-maint.sh check
     pct exec $CT_ID -- /usr/local/bin/searxng-maint.sh version
     pct exec $CT_ID -- /usr/local/sbin/lab-hardening-check
 
   RUN INSIDE THE CT
     /usr/local/bin/searxng-maint.sh check
+    /usr/local/bin/searxng-maint.sh version
     /usr/local/bin/searxng-maint.sh update $APP_TAG
+    /usr/local/bin/searxng-maint.sh update-valkey $VALKEY_TAG
+    /usr/local/sbin/lab-hardening-check
     ufw status verbose
-    journalctl -u searxng.service --no-pager -n 80
+    journalctl -u searxng.service -u searxng-valkey.service --no-pager -n 80
 
-  ACCESS CHECK
-    Test the web endpoint from your intended client/proxy.
-    If you restricted sources, also test from outside the allowed list.
-    Installer rule checks do not prove the full network path.
-    Planned source-policy changes must keep UFW and /opt/searxng/ufw-policy.json consistent.
-    The startup guard checks that policy. Avoid restarting ufw.service while apps run.
-
-  NORMAL MAINTENANCE
-    Verify a matching PBS/PVE checkpoint before updates; --yes only skips prompts.
-    If FUSE is enabled, use stop-mode PBS. Back up external bind mounts separately.
-    For persistent components, failed updates retain the target after it may start.
-    The helper changes one component at a time; earlier successes remain applied.
-    Failed installations are preserved for diagnosis; use a new unused ID and hostname.
-    Hardening WARN may report a reviewed restart; no automatic CT restart is performed.
-
-OPERATIONS
-
-# ── Summary ───────────────────────────────────────────────────────────────────
-echo ""
-echo "    CT: $CT_ID | IP: ${CT_IP} | Web UI: http://${CT_IP}:${APP_PORT}/"
-if [[ -n "$APP_FQDN" ]]; then
-  echo "    Public:  https://${APP_FQDN}/"
-fi
-echo "    Image:   ${APP_IMAGE} (${APP_IMAGE_ID})"
-echo "    Valkey:  ${VALKEY_IMAGE} (127.0.0.1:6379, limiter backend, no persistence)"
-echo "    Mode:    $([ "$PUBLIC_INSTANCE" -eq 1 ] && echo "public (limiter + link_token bot detection)" || echo "local (limiter, no link_token)")"
-echo "    Quadlet: ${QUADLET_FILE}"
-echo "             ${VALKEY_QUADLET_FILE}"
-echo "    Config:  ${APP_DIR}/config/settings.yml  (contains secret_key)"
-echo "             ${APP_DIR}/config/limiter.toml  (trusted_proxies: ${TRUSTED_PROXIES:-none})"
-echo "    Cache:   ${APP_DIR}/cache"
-echo "    Policy:  $([ "$AUTO_UPDATE" -eq 1 ] && echo "auto-update daily at ${UPDATE_TIME} (re-pull ${APP_TAG} / ${VALKEY_TAG})" || echo "manual updates only (${APP_TAG} / ${VALKEY_TAG})")"
-echo ""
-echo "    pct exec $CT_ID -- systemctl status searxng.service"
-echo "    pct exec $CT_ID -- journalctl -u searxng.service --no-pager -n 50"
-echo "    pct exec $CT_ID -- /usr/local/bin/searxng-maint.sh update <tag>         # latest, or pin e.g. 2026.9.1-248e37991"
-echo "    pct exec $CT_ID -- /usr/local/bin/searxng-maint.sh update-valkey <tag>  # pinned full version, e.g. 9.0.6"
-echo "    pct exec $CT_ID -- /usr/local/bin/searxng-maint.sh auto-update          # re-pull current tags now (if AUTO_UPDATE=1)"
-echo "    pct exec $CT_ID -- /usr/local/bin/searxng-maint.sh version"
-echo "    Backup/restore: use PBS or PVE snapshots"
-echo ""
-echo "    NPM reverse proxy: http | ${CT_IP}:${APP_PORT} (no websockets needed)"
-echo "    Port ${APP_PORT} listens on all CT interfaces (Network=host) — access follows the UFW source choice shown above."
-echo "    Health probe (limiter-exempt): curl -sI http://${CT_IP}:${APP_PORT}/healthz"
-echo "    JSON API is enabled (search.formats: json) — e.g. http://${CT_IP}:${APP_PORT}/search?q=test&format=json"
-if [[ "$PUBLIC_INSTANCE" -eq 0 ]]; then
-  echo "    Set APP_FQDN + TRUSTED_PROXIES=<npm-ct-ip>/32 to enable public_instance (link_token bot detection) when exposing this instance."
-fi
-echo "    Log line 'X-Forwarded-For nor X-Real-IP header is set' is logged once per worker for direct (non-proxied) requests — harmless."
-echo "    Valkey logs a vm.overcommit_memory warning at start — harmless here (no RDB/AOF persistence); host sysctl is not touched."
-if [[ "$PODMAN_FUSE_OVERLAY" -eq 1 ]]; then
-  echo "    Backups: fuse=1 + fuse-overlayfs can deadlock under snapshot-mode vzdump/PBS (freezer)."
-  echo "             Use stop-mode backups for this CT, or test PODMAN_FUSE_OVERLAY=0."
-fi
-echo "    To change settings: edit ${APP_DIR}/config/settings.yml then systemctl restart searxng.service"
-echo ""
+  VERIFICATION
+    Application: passed | Common hardening: $HARDENING_RESULT
+    Any WARN above requires review; no automatic restart/reboot was performed.
+    Still required: intended-client/proxy and denied-source tests, DHCP renewal,
+    reviewed reboot persistence and backup/restore acceptance.
+SUMMARY
