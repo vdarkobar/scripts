@@ -2,7 +2,7 @@
 set -Eeo pipefail
 umask 022
 export LC_ALL=C
-# Safety revision: 2026-09-12. Fresh Proxmox CT creator; maintenance runs inside the CT.
+# Baseline revision: 2026-09-16; contract 1.0.0 / hardening 1.2.0. Fresh Proxmox CT creator; maintenance runs inside the CT.
 
 # ── Config ────────────────────────────────────────────────────────────────────
 CT_ID=""                             # empty = auto-assign via pvesh; set e.g. CT_ID=120 to pin
@@ -16,7 +16,6 @@ CONTAINER_STORAGE="local-lvm"
 
 # Flatnotes / Podman + Quadlet
 APP_PORT=8080
-APP_TZ="Europe/Berlin"
 APP_FQDN=""                          # e.g. notes.example.com ; blank = local IP mode
 FLATNOTES_AUTH_TYPE="password"       # password | none | read_only | totp
 FLATNOTES_SESSION_EXPIRY_DAYS=1      # days before login token expires (upstream default 30)
@@ -27,6 +26,12 @@ TAGS="flatnotes;podman;quadlet;lxc"
 APP_IMAGE_REPO="docker.io/dullage/flatnotes"
 APP_TAG="v5.5.5"                     # pinned default; do not default to :latest
 DEBIAN_VERSION=13
+
+# COMMON TIMEZONE INPUTS
+SERVER_TIMEZONE="${SERVER_TIMEZONE-Europe/Berlin}"
+PRESERVE_EXISTING_TIMEZONE="${PRESERVE_EXISTING_TIMEZONE-0}"
+APP_TZ=""
+# END COMMON TIMEZONE INPUTS
 
 # Auto-update policy
 # AUTO_UPDATE=0 (default): timer installed but disabled; manual updates via
@@ -50,7 +55,7 @@ EXTRA_PACKAGES=(
 )
 
 # Behavior
-CLEANUP_ON_FAIL=1
+CLEANUP_ON_FAIL="${CLEANUP_ON_FAIL-0}"
 
 
 # Service verification and in-CT firewall
@@ -64,21 +69,20 @@ UPDATE_TIME="03:00"                  # daily at CT local time
 SCRIPT_URL="https://raw.githubusercontent.com/vdarkobar/scripts/main/bash/flatnotes-quadlet.sh"
 SCRIPT_LOCAL="/root/flatnotes-quadlet.sh"
 
-# Shared Debian 13 LXC hardening (v1.1.1)
-HARDENING_PROFILE="lxc"              # Debian 13 service LXC; no routing/forwarding
-HARDENING_RP_FILTER=1                # strict; 2=loose for reviewed asymmetric paths
-HARDENING_KEEP_SSH=0                 # 0=remove SSH server; 1=preserve it
-HARDENING_REMOVE_POSTFIX=1           # 1=remove Postfix; 0=preserve intentional mail service
-HARDENING_JOURNAL_DAYS=14
-HARDENING_JOURNAL_MAX_MB=256
-HARDENING_JOURNAL_RUNTIME_MB=64
-HARDENING_UPDATE_MAX_AGE_HOURS=72
+# Shared Debian 13 LXC hardening (v1.2.0)
+HARDENING_PROFILE="${HARDENING_PROFILE-lxc}"              # Debian 13 service LXC; no routing/forwarding
+HARDENING_RP_FILTER="${HARDENING_RP_FILTER-1}"                # strict; 2=loose for reviewed asymmetric paths
+HARDENING_KEEP_SSH="${HARDENING_KEEP_SSH-0}"                 # 0=remove SSH; 1=preserve, without adding UFW access
+HARDENING_REMOVE_POSTFIX="${HARDENING_REMOVE_POSTFIX-1}"           # 1=remove Postfix; 0=preserve intentional mail service
+HARDENING_JOURNAL_DAYS="${HARDENING_JOURNAL_DAYS-14}"
+HARDENING_JOURNAL_MAX_MB="${HARDENING_JOURNAL_MAX_MB-256}"
+HARDENING_JOURNAL_RUNTIME_MB="${HARDENING_JOURNAL_RUNTIME_MB-64}"
+HARDENING_UPDATE_MAX_AGE_HOURS="${HARDENING_UPDATE_MAX_AGE_HOURS-72}"
 # External listener checks only: these do not add UFW rules or prove app health.
-# APP_PORT is prepended to TCP after all prompts. List any additional external
-# TCP ports here (including the actual SSH port if preserving an SSH listener).
-# Exclude loopback backends. Empty protocol lists in the common block inventory only.
-HARDENING_TCP_PORTS=""
-HARDENING_UDP_PORTS="68 546"         # DHCPv4/DHCPv6 clients; listener check only
+# TCP auto resolves to the finalized APP_PORT. Explicit lists are complete;
+# empty is inventory-only. These settings never grant firewall access.
+HARDENING_TCP_PORTS="${HARDENING_TCP_PORTS-auto}"
+HARDENING_UDP_PORTS="${HARDENING_UDP_PORTS-68 546}"  # DHCP clients; inventory only
 # The template DHCP client may bind UDP 546 even with Proxmox ip6=manual.
 # Preserving SSH/Postfix does not install them or grant firewall access.
 
@@ -117,6 +121,59 @@ QUADLET_SERVICE="flatnotes.service"
 #   /var/lib/lab-hardening/{policy.json,status.json,last-index-refresh,check.lock}
 #   /var/backups/lab-hardening/<run>/            (configuration backups and dry-run log)
 
+#   /usr/local/sbin/flatnotes-check                 (complete observational app verifier)
+#   /opt/flatnotes/access.json                      (source policy and six UFW file hashes)
+#   /opt/flatnotes/timezone-plan.json                (retained non-secret initial plan)
+#   /usr/local/sbin/lab-timezone, /usr/local/sbin/lab-postfix-check
+#   /etc/localtime, existing /etc/timezone           (canonical timezone policy only)
+#   /etc/containers/{storage,containers}.conf
+#   /etc/locale.gen, /etc/default/locale, /root/.bashrc, /etc/motd
+#   /run/lock/flatnotes-{creator,maint}.lock          (host / guest respectively)
+#   /run/flatnotes-update.*/                        (temporary/retained control copies)
+#   /etc/systemd/system/postfix*                    (scoped masks from common block)
+
+# COMMON CREATOR TRAPS
+INSTALL_STAGE="configuration"
+CREATED=0
+trap 'rc=$? err_line=$LINENO;
+  trap - ERR INT TERM HUP
+  if (( BASH_SUBSHELL > 0 )); then exit "$rc"; fi
+  printf "  ERROR: stage=%s rc=%s line=%s\n" "$INSTALL_STAGE" "$rc" "$err_line" >&2
+  printf "  Command text and arguments are omitted. External data is never removed by cleanup.\n" >&2
+  if [[ $rc != 129 && $rc != 130 && $rc != 143 && ${CLEANUP_ON_FAIL:-0} == 1 && ${CREATED:-0} == 1 ]]; then
+    if pct stop "$CT_ID" >/dev/null 2>&1; then
+      pct destroy "$CT_ID" >/dev/null 2>&1 || printf "  CT cleanup failed; inspect the preserved state.\n" >&2
+    else
+      printf "  CT stop failed; no destruction attempted.\n" >&2
+    fi
+  else
+    printf "  CT state is preserved for inspection.\n" >&2
+  fi
+  exit "$rc"
+' ERR
+trap 'rc=130; err_line=$LINENO;
+  trap - ERR INT TERM HUP
+  if (( BASH_SUBSHELL > 0 )); then exit "$rc"; fi
+  printf "  Interrupted: stage=%s rc=%s line=%s\n" "$INSTALL_STAGE" "$rc" "$err_line" >&2
+  printf "  CT and external data are preserved for inspection.\n" >&2
+  exit "$rc"
+' INT
+trap 'rc=143; err_line=$LINENO;
+  trap - ERR INT TERM HUP
+  if (( BASH_SUBSHELL > 0 )); then exit "$rc"; fi
+  printf "  Interrupted: stage=%s rc=%s line=%s\n" "$INSTALL_STAGE" "$rc" "$err_line" >&2
+  printf "  CT and external data are preserved for inspection.\n" >&2
+  exit "$rc"
+' TERM
+trap 'rc=129; err_line=$LINENO;
+  trap - ERR INT TERM HUP
+  if (( BASH_SUBSHELL > 0 )); then exit "$rc"; fi
+  printf "  Interrupted: stage=%s rc=%s line=%s\n" "$INSTALL_STAGE" "$rc" "$err_line" >&2
+  printf "  CT and external data are preserved for inspection.\n" >&2
+  exit "$rc"
+' HUP
+# END COMMON CREATOR TRAPS
+
 # ── Config validation ─────────────────────────────────────────────────────────
 [[ "$HN" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$ ]] || { echo "  ERROR: HN is not a valid hostname: $HN" >&2; exit 1; }
 [[ "$CPU" =~ ^(0|[1-9][0-9]*)$ ]] && (( CPU >= 1 )) || { echo "  ERROR: CPU must be a positive integer." >&2; exit 1; }
@@ -139,8 +196,23 @@ QUADLET_SERVICE="flatnotes.service"
   echo "  ERROR: APP_TAG must be a pinned version like v5.5.4 — ':latest' and floating tags are not permitted." >&2
   exit 1
 }
-[[ -e "/usr/share/zoneinfo/${APP_TZ}" ]] || { echo "  ERROR: APP_TZ not found in /usr/share/zoneinfo: $APP_TZ" >&2; exit 1; }
-[[ "$APP_TZ" =~ ^[A-Za-z0-9._+-]+(/[A-Za-z0-9._+-]+)+$ ]] || { echo "  ERROR: APP_TZ contains invalid characters." >&2; exit 1; }
+# COMMON TIMEZONE VALIDATION
+[[ $PRESERVE_EXISTING_TIMEZONE =~ ^[01]$ ]] || {
+  echo 'ERROR: PRESERVE_EXISTING_TIMEZONE must be exactly 0 or 1.' >&2
+  exit 1
+}
+TIMEZONE_ACTION=preserved
+TIMEZONE_LABEL='preserve existing guest timezone'
+if [[ $PRESERVE_EXISTING_TIMEZONE == 0 ]]; then
+  [[ $SERVER_TIMEZONE =~ ^[A-Za-z0-9_+-]+(/[A-Za-z0-9_+-]+)*$ ]] || {
+    echo 'ERROR: SERVER_TIMEZONE must be a nonempty IANA timezone name.' >&2
+    exit 1
+  }
+  TIMEZONE_ACTION=set
+  TIMEZONE_LABEL=$SERVER_TIMEZONE
+fi
+# END COMMON TIMEZONE VALIDATION
+
 if [[ -n "$APP_FQDN" ]]; then
   [[ "$APP_FQDN" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)+$ ]] \
     || { echo "  ERROR: APP_FQDN is not a valid hostname: $APP_FQDN" >&2; exit 1; }
@@ -148,7 +220,7 @@ fi
 [[ "$FLATNOTES_AUTH_TYPE" =~ ^(password|none|read_only|totp)$ ]] || {
   echo "  ERROR: FLATNOTES_AUTH_TYPE must be password, none, read_only, or totp." >&2; exit 1;
 }
-[[ "$FLATNOTES_SESSION_EXPIRY_DAYS" =~ ^(0|[1-9][0-9]*)$ ]] && (( FLATNOTES_SESSION_EXPIRY_DAYS >= 1 )) \
+[[ "$FLATNOTES_SESSION_EXPIRY_DAYS" =~ ^(0|[1-9][0-9]*)$ ]] && (( FLATNOTES_SESSION_EXPIRY_DAYS >= 1 && FLATNOTES_SESSION_EXPIRY_DAYS <= 999999 )) \
   || { echo "  ERROR: FLATNOTES_SESSION_EXPIRY_DAYS must be an integer >= 1 (0 would expire tokens immediately)." >&2; exit 1; }
 [[ -z "$FLATNOTES_PATH_PREFIX" || "$FLATNOTES_PATH_PREFIX" =~ ^(/[A-Za-z0-9._~-]+)+$ ]] || {
   echo "  ERROR: FLATNOTES_PATH_PREFIX must be empty or start with / and have no trailing slash (e.g. /flatnotes)." >&2; exit 1;
@@ -165,37 +237,41 @@ for wait_var in INITIAL_WAIT_SECONDS UPDATE_WAIT_SECONDS; do
 done
 [[ $UPDATE_TIME =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]] || { echo "ERROR: Invalid UPDATE_TIME." >&2; exit 1; }
 
-# ── Trap cleanup ──────────────────────────────────────────────────────────────
-trap 'rc=$?;
-  trap - ERR
-  echo "  ERROR: failed (rc=$rc) near line ${LINENO:-?}" >&2
-  printf "  Command (abbreviated): %.240s\n" "$BASH_COMMAND" >&2
-  if [[ "${CLEANUP_ON_FAIL:-0}" -eq 1 && "${CREATED:-0}" -eq 1 ]]; then
-    echo "  Cleanup: stopping/destroying CT ${CT_ID} ..." >&2
-    pct stop "${CT_ID}" >/dev/null 2>&1 || true
-    pct destroy "${CT_ID}" >/dev/null 2>&1 || true
-  fi
-  exit "$rc"
-' ERR
-
-trap 'rc=130;
-  trap - ERR INT TERM HUP
-  echo "  Interrupted (rc=$rc)" >&2
-  printf "  Command (abbreviated): %.240s\n" "$BASH_COMMAND" >&2
-  if [[ "${CLEANUP_ON_FAIL:-0}" -eq 1 && "${CREATED:-0}" -eq 1 ]]; then
-    echo "  Cleanup: stopping/destroying CT ${CT_ID} ..." >&2
-    pct stop "${CT_ID}" >/dev/null 2>&1 || true
-    pct destroy "${CT_ID}" >/dev/null 2>&1 || true
-  fi
-  exit "$rc"
-' INT TERM HUP
+# Validate common policy before CT creation; preserve explicitly empty inventories.
+[[ $HARDENING_PROFILE == lxc && $HARDENING_RP_FILTER =~ ^[12]$ &&
+   $HARDENING_KEEP_SSH =~ ^[01]$ && $HARDENING_REMOVE_POSTFIX =~ ^[01]$ ]] || {
+  echo 'ERROR: Invalid service-LXC hardening policy.' >&2; exit 1;
+}
+for key in HARDENING_JOURNAL_DAYS HARDENING_JOURNAL_MAX_MB HARDENING_JOURNAL_RUNTIME_MB HARDENING_UPDATE_MAX_AGE_HOURS; do
+  [[ ${!key} =~ ^[1-9][0-9]{0,3}$ ]] || { echo 'ERROR: Hardening numeric policy must be 1..9999.' >&2; exit 1; }
+done
+for key in HARDENING_TCP_PORTS HARDENING_UDP_PORTS; do
+  value=${!key}
+  [[ $key != HARDENING_TCP_PORTS || $value != auto ]] || continue
+  [[ $value =~ ^[0-9\ ]*$ ]] || { echo 'ERROR: Listener inventories require one line of decimal ports.' >&2; exit 1; }
+  for port in $value; do
+    [[ $port =~ ^[1-9][0-9]{0,4}$ ]] && (( port <= 65535 )) || {
+      echo 'ERROR: Listener ports must be 1..65535, without leading zeroes.' >&2; exit 1;
+    }
+  done
+done
+if [[ $HARDENING_KEEP_SSH == 1 || $HARDENING_REMOVE_POSTFIX == 0 ]]; then
+  [[ $HARDENING_TCP_PORTS != auto ]] || {
+    echo 'ERROR: Preserved SSH/mail needs an explicit complete TCP inventory or explicit empty inventory-only mode.' >&2
+    exit 1
+  }
+fi
 
 # ── Preflight — root & commands ───────────────────────────────────────────────
+INSTALL_STAGE="preflight"
 [[ "$(id -u)" -eq 0 ]] || { echo "  ERROR: Run as root on the Proxmox host." >&2; exit 1; }
 
-for cmd in pvesh pveam pct pvesm qm curl python3 ip awk grep sed sort paste seq readlink cp chmod dpkg head tr flock mktemp mv rm tail bash stat timeout; do
+for cmd in pveversion sha256sum cut date env pvesh pveam pct pvesm qm curl python3 ip awk grep sed sort paste seq readlink cp chmod dpkg head tr flock mktemp mv rm tail bash stat timeout; do
   command -v "$cmd" >/dev/null 2>&1 || { echo "  ERROR: Missing required command: $cmd" >&2; exit 1; }
 done
+
+[[ -d /etc/pve ]] || { echo 'ERROR: This creator requires the Proxmox host.' >&2; exit 1; }
+pveversion >/dev/null
 
 # pveam lists templates for more than one CPU architecture. Selecting only by
 # Debian version can pick an ARM64 rootfs on an AMD64 host (or vice versa),
@@ -231,13 +307,17 @@ else
   [[ -n "$CT_ID" ]] || { echo "  ERROR: Could not obtain next CT ID." >&2; exit 1; }
 fi
 
+[[ $CT_ID =~ ^[1-9][0-9]{2,8}$ ]] && (( CT_ID >= 100 && CT_ID <= 999999999 )) || {
+  echo 'ERROR: Invalid selected CT_ID.' >&2; exit 1;
+}
+
 # Creator scripts are not idempotent: a re-run would create a second CT with the
 # same hostname. Refuse if one already exists on this node (e.g. a preserved
-# failed install) — destroy it first or change HN.
+# failed install). Preserve it and refuse reuse.
 EXISTING_CT="$(pct list 2>/dev/null | awk -v h="$HN" 'NR>1 && $NF==h {print $1}' | head -n1)"
 if [[ -n "$EXISTING_CT" ]]; then
   echo "  ERROR: A CT with hostname '${HN}' already exists on this node (CT ${EXISTING_CT})." >&2
-  echo "  Fresh creator: use the existing CT maintenance helper, or review the retained CT before removing it." >&2
+  echo "  Fresh creator: use the existing CT maintenance helper, or inspect the retained CT; it will not be reused." >&2
   exit 1
 fi
 
@@ -268,13 +348,14 @@ cat <<EOF2
   Auth type:         $FLATNOTES_AUTH_TYPE
   Session expiry:    ${FLATNOTES_SESSION_EXPIRY_DAYS} days
   Path prefix:       ${FLATNOTES_PATH_PREFIX:-(none)}
-  Timezone:          $APP_TZ
+  Timezone plan:     $TIMEZONE_LABEL
   FQDN:              $([ -n "$APP_FQDN" ] && echo "$APP_FQDN" || echo "(no public FQDN)")
   Listens on:        0.0.0.0:${APP_PORT} inside the CT (Network=host) — access follows the UFW source choice below
   Podman storage:    $([ "$PODMAN_FUSE_OVERLAY" -eq 1 ] && echo "fuse-overlayfs (fuse=1)" || echo "native overlay (no FUSE)")
   Tags:              $TAGS
   Auto-update:       $([ "$AUTO_UPDATE" -eq 1 ] && echo "enabled (re-pull pinned $APP_TAG)" || echo "disabled (pinned $APP_TAG, manual)")
-  Cleanup on fail:   $CLEANUP_ON_FAIL (disarmed before first persistent start)
+  Cleanup on fail:   $CLEANUP_ON_FAIL (ordinary early failures only; disarmed before first persistent start)
+  Interruptions:     CT and external data are always preserved
   ────────────────────────────────────────
   To change defaults, press Enter and
   edit the Config section at the top of
@@ -284,14 +365,14 @@ EOF2
 
 if [[ "$FLATNOTES_AUTH_TYPE" == "none" || "$FLATNOTES_AUTH_TYPE" == "read_only" ]]; then
   echo "  WARNING: FLATNOTES_AUTH_TYPE=${FLATNOTES_AUTH_TYPE} — no login required. Port ${APP_PORT} is open to"
-  echo "  every host that can reach the CT. Restrict UFW_ALLOWED_SOURCES to the intended clients or NPM IPs."
+  echo "  the sources selected below. Restrict UFW_ALLOWED_SOURCES to intended clients or NPM IPs."
   echo ""
 fi
 
 SCRIPT_SELF="$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")"
 
 response=""
-read -r -p "  Continue with these settings? [y/N]: " response <&8 || response=""
+read -r -p "  Continue with these settings? [y/N]: " response <&8 || { echo "ERROR: Confirmation interrupted." >&2; exit 1; }
 case "$response" in
   [yY][eE][sS]|[yY]) ;;
   *)
@@ -395,7 +476,7 @@ PASSWORD=""
 while true; do
   read -r -s -p "  Set root password: " PW1 <&8; echo
   if [[ -z "$PW1" ]]; then echo "  Password cannot be blank."; continue; fi
-  if [[ "$PW1" == *" "* ]]; then echo "  Password cannot contain spaces."; continue; fi
+  if [[ "$PW1" =~ [[:space:][:cntrl:]] ]]; then echo "  Password cannot contain whitespace/control characters."; continue; fi
   if [[ ${#PW1} -lt 8 ]]; then echo "  Password must be at least 8 characters."; continue; fi
   read -r -s -p "  Verify root password: " PW2 <&8; echo
   if [[ "$PW1" == "$PW2" ]]; then PASSWORD="$PW1"; break; fi
@@ -419,7 +500,7 @@ if [[ "$FLATNOTES_AUTH_TYPE" == "password" || "$FLATNOTES_AUTH_TYPE" == "totp" ]
   while true; do
     read -r -p "  Flatnotes username: " FLATNOTES_USERNAME <&8
     [[ -z "$FLATNOTES_USERNAME" ]] && { echo "  Username cannot be empty."; continue; }
-    [[ "$FLATNOTES_USERNAME" =~ [[:space:]] ]] && { echo "  Username cannot contain spaces."; continue; }
+    [[ "$FLATNOTES_USERNAME" =~ [[:space:][:cntrl:]] ]] && { echo "  Username cannot contain spaces."; continue; }
     [[ "$FLATNOTES_USERNAME" =~ [\"\'$\`\\#] ]] && { echo '  Username cannot contain quotes, $, backtick, backslash or #'; continue; }
     break
   done
@@ -458,8 +539,20 @@ if [[ "$FLATNOTES_AUTH_TYPE" == "totp" ]]; then
   echo ""
 fi
 
-# Finalize the listener policy after all prompts, using this run's application port.
-HARDENING_TCP_PORTS="${APP_PORT}${HARDENING_TCP_PORTS:+ $HARDENING_TCP_PORTS}"
+# Finalized application listener inventory; firewall source policy is independent.
+FINALIZED_APP_TCP_PORTS=$APP_PORT
+# COMMON TCP RESOLUTION
+[[ $HARDENING_TCP_PORTS != auto ]] || HARDENING_TCP_PORTS=$FINALIZED_APP_TCP_PORTS
+# END COMMON TCP RESOLUTION
+
+for key in HARDENING_TCP_PORTS HARDENING_UDP_PORTS; do
+  [[ ${!key} =~ ^[0-9\ ]*$ ]] || { echo 'ERROR: Invalid finalized listener inventory.' >&2; exit 1; }
+  for port in ${!key}; do
+    [[ $port =~ ^[1-9][0-9]{0,4}$ ]] && (( port <= 65535 )) || {
+      echo 'ERROR: Invalid finalized listener port.' >&2; exit 1;
+    }
+  done
+done
 
 # ── Template discovery & download ─────────────────────────────────────────────
 pveam update
@@ -482,6 +575,7 @@ else
 fi
 
 # ── Create LXC ────────────────────────────────────────────────────────────────
+INSTALL_STAGE="create LXC"
 # Root password is set after start via chpasswd on stdin, keeping it out of
 # the host process list (pct create -password exposes it in ps).
 CT_FEATURES="nesting=1,keyctl=1"
@@ -521,6 +615,7 @@ printf 'root:%s\n' "$PASSWORD" | pct exec "$CT_ID" -- chpasswd
 unset PASSWORD PW1 PW2
 
 # ── OS update ─────────────────────────────────────────────────────────────────
+INSTALL_STAGE="OS bootstrap"
 pct exec "$CT_ID" -- bash -lc '
   set -euo pipefail
   export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l
@@ -540,15 +635,210 @@ pct exec "$CT_ID" -- bash -lc "
   set -euo pipefail
   export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l
   apt-get update -qq
-  apt-get install -y locales curl ca-certificates iproute2 python3 ufw iptables util-linux podman tar gzip ${PODMAN_FUSE_PKG}
+  apt-get install -y locales tzdata curl ca-certificates iproute2 python3 ufw iptables util-linux podman tar gzip ${PODMAN_FUSE_PKG}
   sed -i 's/^# *en_US.UTF-8/en_US.UTF-8/' /etc/locale.gen
   locale-gen
   update-locale LANG=en_US.UTF-8
-  ln -sf /usr/share/zoneinfo/${APP_TZ} /etc/localtime
-  echo '${APP_TZ}' > /etc/timezone
 "
 
+# ── Guest timezone planning (read-only until the late common block) ────────────
+INSTALL_STAGE="guest timezone validation"
+pct exec "$CT_ID" -- bash -s <<'EARLY_TIMEZONE_BOOTSTRAP'
+set -euo pipefail
+target=/usr/local/sbin/lab-timezone
+[[ ! -L $target && ( ! -e $target || -f $target ) ]] || {
+  echo 'ERROR: Unsafe timezone helper destination.' >&2; exit 1;
+}
+install -d -m 0755 /usr/local/sbin
+tmp=$(mktemp /usr/local/sbin/.lab-timezone.XXXXXX)
+trap 'rm -f -- "$tmp"' EXIT
+cat > "$tmp" <<'EARLY_TIMEZONE_HELPER'
+#!/usr/bin/python3
+"""LXC timezone policy, adapted from debian-hardening.sh v1.0.3.
+
+Only apply writes timezone files; plan/check are read-only. No timedated,
+clock, RTC, NTP, SSH, or access-recovery operations are performed.
+"""
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+from zoneinfo import ZoneInfo
+
+ZONES = Path('/usr/share/zoneinfo')
+LOCALTIME = Path('/etc/localtime')
+TIMEZONE = Path('/etc/timezone')
+
+
+def guest_guard():
+    if os.geteuid() != 0 or shutil.which('pveversion') or Path('/etc/pve').exists():
+        raise ValueError('Timezone operations require root inside the selected Debian 13 LXC.')
+    release = dict(line.split('=', 1) for line in Path('/etc/os-release').read_text().splitlines()
+                   if '=' in line and not line.startswith('#'))
+    if release.get('ID', '').strip('"') != 'debian' or release.get('VERSION_ID', '').strip('"') != '13':
+        raise ValueError('Timezone policy requires Debian 13.')
+    result = subprocess.run(['systemd-detect-virt', '--container'], text=True,
+                            capture_output=True, timeout=10)
+    if result.returncode or result.stdout.strip() != 'lxc':
+        raise ValueError('Timezone policy refuses environments other than LXC.')
+
+
+def zone_path(name):
+    # Same name grammar as the native source; validate against guest tzdata.
+    if not re.fullmatch(r'[A-Za-z0-9_+-]+(?:/[A-Za-z0-9_+-]+)*', name):
+        raise ValueError('Invalid SERVER_TIMEZONE; use an installed IANA timezone name.')
+    if name.split('/')[0] in ('posix', 'right', 'localtime', 'posixrules'):
+        raise ValueError('SERVER_TIMEZONE must identify an IANA zone, not a special tzdata tree.')
+    path = ZONES / name
+    try:
+        path.resolve(strict=True).relative_to(ZONES.resolve(strict=True))
+        with path.open('rb') as stream:
+            ZoneInfo.from_file(stream, key=name)
+    except (OSError, ValueError) as exc:
+        raise ValueError('Timezone is unavailable or invalid in this guest: ' + name) from exc
+    return path
+
+
+def effective_timezone():
+    if not LOCALTIME.exists() and not LOCALTIME.is_symlink():
+        zone_path('UTC')
+        return 'UTC'  # localtime(5): absent /etc/localtime means UTC.
+    if LOCALTIME.is_symlink():
+        # Keep the selected alias, rather than resolving US/Eastern to another name.
+        link = Path(os.path.normpath(LOCALTIME.parent / os.readlink(LOCALTIME)))
+        try:
+            name = str(link.relative_to(ZONES))
+        except ValueError as exc:
+            raise ValueError('/etc/localtime does not link into the guest zoneinfo tree.') from exc
+        zone_path(name)
+        return name
+    if LOCALTIME.is_file() and TIMEZONE.is_file() and not TIMEZONE.is_symlink():
+        name = TIMEZONE.read_text().strip()
+        if LOCALTIME.read_bytes() == zone_path(name).read_bytes():
+            return name
+    raise ValueError('Cannot identify the guest timezone from /etc/localtime and /etc/timezone.')
+
+
+def fingerprint(path):
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return {'kind': 'absent'}
+    if stat.S_ISLNK(info.st_mode):
+        return {'kind': 'symlink', 'target': os.readlink(path)}
+    if stat.S_ISREG(info.st_mode):
+        return {'kind': 'file', 'sha256': hashlib.sha256(path.read_bytes()).hexdigest()}
+    raise ValueError('Unsupported timezone file type: ' + str(path))
+
+
+def fingerprints():
+    return {str(path): fingerprint(path) for path in (LOCALTIME, TIMEZONE)}
+
+
+def plan(preserve, requested):
+    if preserve not in ('0', '1'):
+        raise ValueError('PRESERVE_EXISTING_TIMEZONE must be exactly 0 or 1.')
+    if preserve == '0':
+        zone_path(requested)
+        if TIMEZONE.is_symlink() or (TIMEZONE.exists() and not TIMEZONE.is_file()):
+            raise ValueError('Refusing to replace a non-regular /etc/timezone.')
+    before = effective_timezone()
+    return {'preserve': preserve == '1', 'requested': None if preserve == '1' else requested,
+            'before': before, 'effective': before if preserve == '1' else requested,
+            'files_before': fingerprints()}
+
+
+def verify(setting):
+    actual = effective_timezone()
+    if actual != setting['effective']:
+        raise ValueError('Guest timezone drift: expected ' + setting['effective'] + ', found ' + actual)
+    expected_files = setting.get('files', setting['files_before'])
+    if fingerprints() != expected_files:
+        raise ValueError('Guest timezone files changed; review /etc/localtime and /etc/timezone.')
+    return actual
+
+
+def apply(setting, backup):
+    if fingerprints() != setting['files_before'] or effective_timezone() != setting['before']:
+        raise ValueError('Guest timezone changed after validation; refusing to overwrite it.')
+    if not setting['preserve']:
+        target = zone_path(setting['requested'])
+        saved = Path(backup) / 'timezone'
+        saved.mkdir(mode=0o700, parents=True, exist_ok=False)
+        (saved / 'before.json').write_text(json.dumps(setting, indent=2) + '\n')
+        for path in (LOCALTIME, TIMEZONE):
+            if path.exists() or path.is_symlink():
+                shutil.copy2(path, saved / path.name, follow_symlinks=False)
+        # Atomic per-file replacement; no automatic undo of a later failure.
+        if setting['before'] != setting['requested']:
+            with tempfile.TemporaryDirectory(prefix='.lab-timezone-', dir=LOCALTIME.parent) as tmp:
+                replacement = Path(tmp) / 'localtime'
+                replacement.symlink_to(target)
+                os.replace(replacement, LOCALTIME)
+        # Debian uses /etc/localtime. Keep an existing legacy file consistent;
+        # do not introduce /etc/timezone when the template does not maintain it.
+        desired = setting['requested'] + '\n'
+        if TIMEZONE.exists() and TIMEZONE.read_text() != desired:
+            with tempfile.TemporaryDirectory(prefix='.lab-timezone-', dir=TIMEZONE.parent) as tmp:
+                replacement = Path(tmp) / 'timezone'
+                replacement.write_text(desired)
+                replacement.chmod(0o644)
+                os.replace(replacement, TIMEZONE)
+    final = {**setting, 'files': fingerprints()}
+    if setting['preserve'] and final['files'] != setting['files_before']:
+        raise ValueError('Preserve mode detected a timezone-file change.')
+    verify(final)
+    return final
+
+
+def main():
+    guest_guard()
+    if len(sys.argv) == 4 and sys.argv[1] == 'plan':
+        print(json.dumps(plan(sys.argv[2], sys.argv[3])))
+    elif len(sys.argv) == 4 and sys.argv[1] == 'apply':
+        setting = json.loads(Path(sys.argv[2]).read_text())
+        print(json.dumps(apply(setting, sys.argv[3])))
+    elif len(sys.argv) == 3 and sys.argv[1] == 'check':
+        policy = json.loads(Path(sys.argv[2]).read_text())
+        print(verify(policy['timezone']))
+    else:
+        raise ValueError('Invalid timezone helper arguments.')
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except Exception as exc:
+        print('ERROR: LXC timezone: ' + str(exc), file=sys.stderr)
+        raise SystemExit(1)
+EARLY_TIMEZONE_HELPER
+chown root:root "$tmp"
+chmod 0755 "$tmp"
+mv -fT "$tmp" "$target"
+EARLY_TIMEZONE_BOOTSTRAP
+# COMMON EARLY TIMEZONE PLAN
+INSTALL_STAGE="guest timezone validation"
+TIMEZONE_PLAN=$(pct exec "$CT_ID" -- /usr/local/sbin/lab-timezone plan "$PRESERVE_EXISTING_TIMEZONE" "$SERVER_TIMEZONE")
+APP_TZ=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["effective"])' "$TIMEZONE_PLAN")
+printf '  Guest timezone plan: %s (%s during shared hardening).\n' "$APP_TZ" "$TIMEZONE_ACTION"
+# END COMMON EARLY TIMEZONE PLAN
+
+printf '%s\n' "$TIMEZONE_PLAN" | pct exec "$CT_ID" -- bash -c '
+  set -euo pipefail
+  install -d -m 0755 /opt/flatnotes
+  umask 077
+  cat > /opt/flatnotes/timezone-plan.json
+  chmod 0600 /opt/flatnotes/timezone-plan.json
+'
+
 # ── UFW inside the CT ─────────────────────────────────────────────────────────
+INSTALL_STAGE="UFW setup"
 # Fresh CT only. Network=host uses this CT's INPUT chain.
 pct exec "$CT_ID" -- bash -s -- "$APP_PORT" "${UFW_ALLOWED_SOURCES[@]}" <<'UFWSETUP'
 set -euo pipefail
@@ -575,32 +865,192 @@ for source in "$@"; do
   if [[ $source == *:* ]]; then tool=ip6tables; prefix=ufw6; fi
   "$tool" -w 5 -C "$prefix-user-input" -s "$source" -p tcp -m tcp --dport "$port" -j ACCEPT
 done
+python3 - "$port" "$@" <<'ACCESS_POLICY'
+import hashlib, ipaddress, json, pathlib, sys
+policy = {'port': int(sys.argv[1]), 'sources': sorted(set(str(ipaddress.ip_network(s, strict=True)) for s in sys.argv[2:])),
+          'rules_sha256': {str(p): hashlib.sha256(p.read_bytes()).hexdigest()
+                           for base in ('before', 'after', 'user') for suffix in ('', '6')
+                           for p in [pathlib.Path('/etc/ufw') / (base + suffix + '.rules')]}}
+p = pathlib.Path('/opt/flatnotes/access.json')
+p.write_text(json.dumps(policy, indent=2) + '\n')
+p.chmod(0o644)
+ACCESS_POLICY
 UFWSETUP
 
 tmp=$(mktemp)
 cat > "$tmp" <<'UFWCHECK'
-#!/usr/bin/env bash
-set -euo pipefail
-export LC_ALL=C
-# Startup guard: active filtering and default-deny in both address families.
-# Installation verifies specific allow rules; test access from client hosts too.
-grep -qx 'ENABLED=yes' /etc/ufw/ufw.conf
-grep -qx 'IPV6=yes' /etc/default/ufw
-status=$(/usr/sbin/ufw status)
-grep -qx 'Status: active' <<< "$status"
-for tool in /usr/sbin/iptables /usr/sbin/ip6tables; do
-  prefix=ufw
-  [[ ${tool##*/} != ip6tables ]] || prefix=ufw6
-  for chain in INPUT FORWARD; do
-    rules=$("$tool" -w 5 -S "$chain")
-    grep -qx -- "-P $chain DROP" <<< "$rules"
-  done
-  "$tool" -w 5 -C INPUT -j "$prefix-before-input"
-  "$tool" -w 5 -S "$prefix-user-input" >/dev/null
-done
+#!/usr/bin/python3
+"""Read-only Flatnotes access guard. Never changes a firewall rule."""
+import hashlib
+import ipaddress
+import json
+import os
+from pathlib import Path
+import shlex
+import subprocess
+import sys
+
+def require(ok, message):
+    if not ok:
+        raise ValueError(message)
+
+def run(args):
+    p = subprocess.run(args, capture_output=True, text=True, timeout=30)
+    require(p.returncode == 0, 'firewall command failed; inspect UFW state')
+    return p.stdout
+
+def value(tokens, flag, default=None):
+    return tokens[tokens.index(flag) + 1] if flag in tokens else default
+
+def port_matches(spec, port):
+    for item in spec.split(','):
+        bounds = item.split(':')
+        require(len(bounds) <= 2 and all(not x or x.isdecimal() for x in bounds),
+                'unsupported TCP port expression')
+        low = int(bounds[0] or 0)
+        high = int(bounds[-1] or 65535)
+        if low <= port <= high:
+            return True
+    return False
+
+def inspect_input(text, version, port, sources):
+    """Conservative graph walk for NEW external TCP to this port.
+
+    Prove no potentially reachable ACCEPT exceeds the chosen sources. Drops
+    are not used to excuse a later broad ACCEPT. Unknown relevant matches or
+    targets fail closed; protocol/port/state exclusions are evaluated first.
+    This is a scoped policy check, not a general netfilter interpreter.
+    """
+    chains = {}
+    policies = {}
+    for line in text.splitlines():
+        t = shlex.split(line)
+        require(len(t) >= 2 and t[0] in ('-P', '-N', '-A'), 'unrecognized filter table')
+        chains.setdefault(t[1], [])
+        if t[0] == '-P':
+            policies[t[1]] = t[2]
+        elif t[0] == '-A':
+            chains[t[1]].append(t[2:])
+    require(policies.get('INPUT') == policies.get('FORWARD') == 'DROP',
+            'effective INPUT/FORWARD policy must be DROP')
+    require(policies.get('OUTPUT') == 'ACCEPT', 'effective OUTPUT policy must be ACCEPT')
+    allowed = list(ipaddress.collapse_addresses(n for n in sources if n.version == version))
+    universe = ipaddress.ip_network('0.0.0.0/0' if version == 4 else '::/0')
+    prefix = 'ufw' if version == 4 else 'ufw6'
+    for hook in ('before', 'after', 'reject', 'track'):
+        require(['-j', prefix + '-' + hook + '-input'] in chains['INPUT'],
+                'required UFW INPUT hook missing')
+    require(prefix + '-user-input' in chains, 'UFW user input chain missing')
+
+    def walk(chain, inherited, parents):
+        require(chain not in parents and len(parents) < 32, 'cyclic/overdeep input chain')
+        require(chain in chains, 'unknown reachable TCP input target; review custom filtering')
+        for t in chains[chain]:
+            # Skip only proven irrelevant rules, before inspecting their targets.
+            # This preserves UFW DHCP, ICMPv6 and protocol-41 handling.
+            proto = value(t, '-p', 'all')
+            if '-p' in t and (t.index('-p') == 0 or t[t.index('-p') - 1] != '!'):
+                if proto not in ('all', '0', 'tcp', '6'):
+                    continue
+            if value(t, '-i') == 'lo' and '!' not in t:
+                continue
+            states = value(t, '--ctstate', value(t, '--state'))
+            if states and '!' not in t and 'NEW' not in states.split(','):
+                continue
+            dport = value(t, '--dport', value(t, '--dports'))
+            if dport and '!' not in t and not port_matches(dport, port):
+                continue
+            require('!' not in t and '-g' not in t, 'unsupported relevant negation/goto')
+            dst_type = value(t, '--dst-type')
+            if dst_type and dst_type in ('BROADCAST', 'MULTICAST'):
+                continue
+            source = ipaddress.ip_network(value(t, '-s', str(universe)), strict=False)
+            require(source.version == version, 'source address family mismatch')
+            if not source.overlaps(inherited):
+                continue
+            effective = source if source.subnet_of(inherited) else inherited
+            target = value(t, '-j')
+            if target in ('LOG', 'NFLOG'):
+                continue  # non-terminating observation only
+            if target in ('DROP', 'REJECT'):
+                continue  # never relied on to authorize a broad later rule
+            # Known match forms; unfamiliar potentially relevant filtering fails.
+            arity = {'-s': 1, '-d': 1, '-p': 1, '-i': 1, '-j': 1, '-m': 1,
+                     '--dport': 1, '--dports': 1, '--sport': 1, '--sports': 1,
+                     '--ctstate': 1, '--state': 1, '--dst-type': 1, '--comment': 1,
+                     '--tcp-flags': 2, '--syn': 0}
+            i = 0
+            while i < len(t):
+                token = t[i]
+                require(token in arity and i + arity[token] < len(t),
+                        'unsupported relevant input match')
+                if token == '-m':
+                    require(t[i + 1] in ('tcp', 'multiport', 'conntrack', 'state', 'addrtype', 'comment'),
+                            'unsupported relevant input match module')
+                if token == '--dst-type':
+                    require(t[i + 1] == 'LOCAL', 'unsupported relevant destination type')
+                i += arity[token] + 1
+            if target == 'ACCEPT':
+                require(any(effective.subnet_of(n) for n in allowed),
+                        'broader TCP access than the selected source policy')
+            elif target == 'RETURN':
+                if t == ['-j', 'RETURN'] or t == ['-m', 'addrtype', '--dst-type', 'LOCAL', '-j', 'RETURN']:
+                    break
+            elif target is not None:
+                walk(target, effective, parents + [chain])
+            else:
+                require(False, 'missing reachable input target')
+    walk('INPUT', universe, [])
+
+def main():
+    require(os.geteuid() == 0 and len(sys.argv) == 1, 'run as root without arguments')
+    os.environ['LC_ALL'] = 'C'
+    os.environ['PATH'] = '/usr/sbin:/usr/bin:/sbin:/bin'
+    path = Path('/opt/flatnotes/access.json')
+    require(not path.is_symlink() and path.is_file(), 'missing regular access policy')
+    st = path.stat()
+    require(st.st_uid == 0 and not st.st_mode & 0o022, 'unsafe access policy ownership/mode')
+    policy = json.loads(path.read_text())
+    port = policy['port']
+    require(type(port) is int and 1024 <= port <= 65535, 'invalid access port')
+    sources = [ipaddress.ip_network(s, strict=True) for s in policy['sources']]
+    require(bool(sources), 'empty access policy')
+    expected_files = {f'/etc/ufw/{base}{suffix}.rules'
+                      for base in ('before', 'after', 'user') for suffix in ('', '6')}
+    require(set(policy['rules_sha256']) == expected_files, 'incomplete persistent UFW baseline')
+    for filename, digest in policy['rules_sha256'].items():
+        require(hashlib.sha256(Path(filename).read_bytes()).hexdigest() == digest,
+                'persistent UFW file changed; review the selected access policy')
+    require('ENABLED=yes' in Path('/etc/ufw/ufw.conf').read_text().splitlines(), 'UFW is not persistent')
+    defaults = Path('/etc/default/ufw').read_text().splitlines()
+    for setting in ('IPV6=yes', 'DEFAULT_INPUT_POLICY="DROP"',
+                    'DEFAULT_OUTPUT_POLICY="ACCEPT"', 'DEFAULT_FORWARD_POLICY="DROP"'):
+        require(setting in defaults, 'UFW defaults differ from the service policy')
+    require('Status: active' in run(['ufw', 'status']).splitlines(), 'UFW is inactive')
+    for action in ('is-enabled', 'is-active'):
+        run(['systemctl', action, '--quiet', 'ufw.service'])
+    for version, tool, prefix in ((4, 'iptables', 'ufw'), (6, 'ip6tables', 'ufw6')):
+        table = run([tool, '-w', '5', '-S'])
+        inspect_input(table, version, port, sources)
+        for source in sources:
+            if source.version == version:
+                run([tool, '-w', '5', '-C', prefix + '-user-input', '-s', str(source),
+                     '-p', 'tcp', '-m', 'tcp', '--dport', str(port), '-j', 'ACCEPT'])
+
+if __name__ == '__main__':
+    try:
+        main()
+    except ValueError as exc:
+        print('ERROR: Flatnotes UFW: ' + str(exc), file=sys.stderr)
+        raise SystemExit(1)
+    except Exception:
+        # Do not expose subprocess arguments or policy/configuration contents.
+        print('ERROR: Flatnotes UFW verification failed; inspect source policy, rules and service state.', file=sys.stderr)
+        raise SystemExit(1)
 UFWCHECK
 pct push "$CT_ID" "$tmp" /usr/local/sbin/flatnotes-ufw-check --perms 0755
 rm -f -- "$tmp"
+
 pct exec "$CT_ID" -- /usr/local/sbin/flatnotes-ufw-check
 
 # ── Podman configuration ──────────────────────────────────────────────────────
@@ -641,6 +1091,7 @@ GRAPH_DRIVER="$(pct exec "$CT_ID" -- podman info --format '{{.Store.GraphDriverN
 echo "  Podman: cgroup ${CGROUPS_VERSION}, storage driver ${GRAPH_DRIVER}$([ "$PODMAN_FUSE_OVERLAY" -eq 1 ] && echo " (fuse-overlayfs)" || echo " (native)")"
 
 # ── Pull image ────────────────────────────────────────────────────────────────
+INSTALL_STAGE="image compatibility"
 echo "  Pulling Flatnotes image: ${APP_IMAGE} ..."
 pct exec "$CT_ID" -- bash -lc "
   set -euo pipefail
@@ -657,6 +1108,12 @@ for component in APP; do
   printf -v "${component}_IMAGE_ID" 'sha256:%s' "$resolved"
 done
 
+# Disposable compatibility probe: default entrypoint is preserved for production.
+pct exec "$CT_ID" -- timeout 60 podman run --rm --pull=never --network none --read-only \
+  --user 1000:1000 --entrypoint /bin/sh "$APP_IMAGE_ID" -ec \
+  'test "$(id -u):$(id -g)" = 1000:1000; python3 -c "import os,time,json"'
+
+INSTALL_STAGE="application configuration"
 # ── Prepare persistent paths ──────────────────────────────────────────────────
 # Flatnotes persistent state (all of it):
 #   /opt/flatnotes/data/            notes (*.md), attachments, .flatnotes/ search index
@@ -743,7 +1200,7 @@ EOF2
   cat > '${APP_ENV_FILE}'
   chmod 0600 '${APP_ENV_FILE}'
 "
-unset SECRET_KEY FLATNOTES_TOTP_KEY FN_PW1 FN_PW2
+unset SECRET_KEY FLATNOTES_TOTP_KEY FN_PW1 FN_PW2 FLATNOTES_PASSWORD
 
 # ── Runtime state file ────────────────────────────────────────────────────────
 # .env is not read by Quadlet or systemd. It is the maint script's source of
@@ -760,6 +1217,7 @@ APP_PORT=${APP_PORT}
 APP_TZ=${APP_TZ}
 APP_FQDN=${APP_FQDN}
 FLATNOTES_AUTH_TYPE=${FLATNOTES_AUTH_TYPE}
+FLATNOTES_SESSION_EXPIRY_DAYS=${FLATNOTES_SESSION_EXPIRY_DAYS}
 FLATNOTES_PATH_PREFIX=${FLATNOTES_PATH_PREFIX}
 AUTO_UPDATE=${AUTO_UPDATE}
 PODMAN_FUSE_OVERLAY=${PODMAN_FUSE_OVERLAY}
@@ -770,13 +1228,251 @@ EOF2
   chmod 0600 '${APP_DIR}/.env'
 "
 
-# ── Maintenance script ────────────────────────────────────────────────────────
-# One component per update; immutable IDs, atomic control files and explicit
-# recovery policy. The helper never archives or restores application data.
-tmp="$(mktemp)"
+# ── Reusable application verification and maintenance ───────────────────────
+tmp=$(mktemp)
+cat > "$tmp" <<'APP_CHECK'
+#!/usr/bin/python3
+"""Complete observational Flatnotes verifier; maintenance owns the shared lock."""
+import datetime
+import hashlib
+import ipaddress
+import json
+import os
+from pathlib import Path
+import re
+import stat
+import subprocess
+import sys
+import time
+from zoneinfo import ZoneInfo
+
+def require(ok, message):
+    if not ok:
+        raise ValueError(message)
+
+def run(args, timeout=30):
+    p = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+    require(p.returncode == 0, 'required runtime command failed (arguments omitted)')
+    return p.stdout.strip()
+
+def regular(path, mode=None):
+    p = Path(path)
+    info = p.lstat()
+    require(stat.S_ISREG(info.st_mode) and info.st_uid == 0 and info.st_gid == 0,
+            'control file must be a regular root-owned file')
+    require(not info.st_mode & 0o022, 'control file is writable by another account')
+    if mode is not None:
+        require(stat.S_IMODE(info.st_mode) == mode, 'control file permissions differ')
+    return p
+
+def data_file(path):
+    values = {}
+    for line in regular(path, 0o600).read_text().splitlines():
+        if not line or line.startswith('#'):
+            continue
+        key, sep, value = line.partition('=')
+        require(sep and re.fullmatch(r'[A-Z][A-Z0-9_]*', key) and key not in values,
+                'malformed or duplicate state/configuration key')
+        values[key] = value
+    return values
+
+def one(lines, prefix):
+    values = [line[len(prefix):] for line in lines if line.startswith(prefix)]
+    require(len(values) == 1, 'missing or duplicate Quadlet setting')
+    return values[0]
+
+def service_value(name):
+    return run(['systemctl', 'show', 'flatnotes.service', '-p', name, '--value'])
+
+def main():
+    require(os.geteuid() == 0, 'run as root in the Flatnotes CT')
+    require(sys.argv[1:] in ([], ['--initial']), 'usage: flatnotes-check [--initial]')
+    initial = sys.argv[1:] == ['--initial']
+    bootstrap = os.environ.get('FLATNOTES_INSTALL_BOOTSTRAP', '')
+    require(bootstrap in ('', '1') and (not bootstrap or initial), 'invalid bootstrap context')
+    os.environ['LC_ALL'] = 'C'
+    os.environ['PATH'] = '/usr/sbin:/usr/bin:/sbin:/bin'
+    state = data_file('/opt/flatnotes/.env')
+    for key, low, high in (('APP_PORT', 1024, 65535), ('INITIAL_WAIT_SECONDS', 30, 86400),
+                           ('UPDATE_WAIT_SECONDS', 30, 86400), ('FLATNOTES_SESSION_EXPIRY_DAYS', 1, 999999)):
+        require(re.fullmatch(r'[1-9][0-9]{0,5}', state.get(key, '')) and
+                low <= int(state[key]) <= high, 'invalid numeric application policy')
+    require(state.get('AUTO_UPDATE') in ('0', '1') and state.get('PODMAN_FUSE_OVERLAY') in ('0', '1'),
+            'invalid update/storage policy')
+    require(re.fullmatch(r'([01][0-9]|2[0-3]):[0-5][0-9]', state.get('UPDATE_TIME', '')), 'invalid update time')
+    require(re.fullmatch(r'v[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9._-]+)?', state.get('APP_TAG', '')),
+            'invalid pinned image tag')
+    require(re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._/-]*[A-Za-z0-9]', state.get('APP_IMAGE_REPO', '')),
+            'invalid image repository')
+    require(state.get('APP_IMAGE') == state['APP_IMAGE_REPO'] + ':' + state['APP_TAG'] and
+            re.fullmatch(r'sha256:[a-f0-9]{64}', state.get('APP_IMAGE_ID', '')), 'inconsistent image state')
+    prefix = state.get('FLATNOTES_PATH_PREFIX', '')
+    require(not prefix or re.fullmatch(r'(/[A-Za-z0-9._~-]+)+', prefix), 'invalid path prefix')
+    require(state.get('FLATNOTES_AUTH_TYPE') in ('password', 'none', 'read_only', 'totp'), 'invalid auth policy')
+    zone = state.get('APP_TZ', '')
+    require(re.fullmatch(r'[A-Za-z0-9_+-]+(/[A-Za-z0-9_+-]+)*', zone), 'invalid application timezone')
+    ZoneInfo(zone)
+    access = json.loads(regular('/opt/flatnotes/access.json').read_text())
+    require(access['port'] == int(state['APP_PORT']), 'access/application port mismatch')
+    run(['/usr/local/sbin/flatnotes-ufw-check'])
+
+    policy_path = Path('/var/lib/lab-hardening/policy.json')
+    if bootstrap:
+        require(not policy_path.exists(), 'bootstrap exception is only for the first installation check')
+        plan = json.loads(regular('/opt/flatnotes/timezone-plan.json', 0o600).read_text())
+        require(plan['effective'] == zone, 'planned application timezone mismatch')
+        current = json.loads(run(['/usr/local/sbin/lab-timezone', 'plan',
+                                  '1' if plan['preserve'] else '0', plan['requested'] or '']))
+        require(current == plan, 'guest timezone plan changed before startup verification')
+    else:
+        policy = json.loads(regular(policy_path).read_text())
+        require(policy.get('version') == '1.2.0' and policy.get('profile') == 'lxc',
+                'missing or mismatched final hardening policy')
+        require(policy['timezone']['effective'] == zone, 'application/hardening timezone mismatch')
+        require(run(['/usr/local/sbin/lab-timezone', 'check', str(policy_path)]) == zone,
+                'final guest timezone differs from application')
+        for path, expected in policy['files'].items():
+            require(hashlib.sha256(Path(path).read_bytes()).hexdigest() == expected,
+                    'managed hardening file changed')
+
+    lines = regular('/etc/containers/systemd/flatnotes.container', 0o644).read_text().splitlines()
+    for key, expected in {'Image=': state['APP_IMAGE_ID'], 'Pull=': 'never', 'Network=': 'host',
+                          'ContainerName=': 'flatnotes', '# LabTag=': state['APP_TAG'],
+                          '# LabImage=': state['APP_IMAGE'],
+                          'EnvironmentFile=': '/opt/flatnotes/flatnotes.env',
+                          'Volume=': '/opt/flatnotes/data:/data', 'StopTimeout=': '50',
+                          'TimeoutStopSec=': '60',
+                          'ExecStartPre=': '/usr/local/sbin/flatnotes-ufw-check'}.items():
+        require(one(lines, key) == expected, 'Quadlet runtime contract differs')
+    require(not any(line.startswith(('Exec=', 'Entrypoint=', 'User=', 'PublishPort=')) for line in lines),
+            'unexpected Flatnotes entrypoint/user/network override')
+    require(service_value('LoadState') == 'loaded', 'Flatnotes service is not loaded')
+    generated = run(['systemctl', 'cat', 'flatnotes.service'])
+    require('/usr/local/sbin/flatnotes-ufw-check' in generated and state['APP_IMAGE_ID'] in generated,
+            'loaded unit does not reflect the configured image/firewall guard')
+
+    budget = int(state['INITIAL_WAIT_SECONDS' if initial else 'UPDATE_WAIT_SECONDS'])
+    started = time.monotonic()
+    stable_since = None
+    restarts = service_value('NRestarts')
+    require(restarts.isdecimal() and (not initial or restarts == '0'), 'unexpected initial restart count')
+    while time.monotonic() - started < budget:
+        active = service_value('ActiveState')
+        require(active not in ('failed', 'inactive') and service_value('NRestarts') == restarts,
+                'Flatnotes failed, stopped or restarted during observation')
+        p = subprocess.run(['curl', '--silent', '--output', '/dev/null', '--write-out', '%{http_code}',
+                            '--connect-timeout', '2', '--max-time', '3',
+                            'http://127.0.0.1:' + state['APP_PORT'] + prefix + '/health'],
+                           capture_output=True, text=True, timeout=5)
+        if active == 'active' and p.returncode == 0 and p.stdout == '200':
+            stable_since = stable_since or time.monotonic()
+            if time.monotonic() - stable_since >= 6:
+                break
+        else:
+            stable_since = None
+        time.sleep(2)
+    else:
+        raise ValueError('Flatnotes /health did not become stably ready within the selected budget')
+
+    container = json.loads(run(['podman', 'inspect', 'flatnotes']))[0]
+    require(container['State']['Running'] and container['Name'].lstrip('/') == 'flatnotes', 'container is not running')
+    require('sha256:' + container['Image'].removeprefix('sha256:') == state['APP_IMAGE_ID'], 'running image differs')
+    image = json.loads(run(['podman', 'image', 'inspect', state['APP_IMAGE_ID']]))[0]
+    require('sha256:' + image['Id'].removeprefix('sha256:') == state['APP_IMAGE_ID'], 'local image identity differs')
+    require(container['HostConfig']['NetworkMode'] == 'host', 'container is not using host networking')
+    require((container['Config'].get('Entrypoint') or []) == (image['Config'].get('Entrypoint') or []) and
+            (container['Config'].get('Cmd') or []) == (image['Config'].get('Cmd') or []), 'image entrypoint/command was overridden')
+    mounts = [m for m in container['Mounts'] if m['Destination'] == '/data']
+    require(len(mounts) == 1 and mounts[0]['Type'] == 'bind' and
+            mounts[0]['Source'] == '/opt/flatnotes/data' and mounts[0]['RW'], 'persistent mount differs')
+    root = Path('/opt/flatnotes/data')
+    require(root.is_dir() and not root.is_symlink() and root.stat().st_uid == root.stat().st_gid == 1000,
+            'Flatnotes data ownership/path differs')
+    run(['podman', 'exec', '--user', '1000:1000', 'flatnotes', 'python3', '-c',
+         'import os; from pathlib import Path; p=Path("/data"); '
+         'assert os.getuid()==os.getgid()==1000 and os.access(p,os.R_OK|os.W_OK|os.X_OK); '
+         'q=p/".flatnotes"; assert not q.exists() or (q.is_dir() and '
+         'q.stat().st_uid==q.stat().st_gid==1000 and os.access(q,os.R_OK|os.W_OK|os.X_OK))'])
+    env = {}
+    for item in container['Config']['Env']:
+        key, _, val = item.partition('=')
+        require(key not in env, 'duplicate runtime environment key')
+        env[key] = val
+    wanted = {'TZ': zone, 'PUID': '1000', 'PGID': '1000', 'FLATNOTES_PORT': state['APP_PORT'],
+              'FLATNOTES_AUTH_TYPE': state['FLATNOTES_AUTH_TYPE'],
+              'FLATNOTES_SESSION_EXPIRY_DAYS': state['FLATNOTES_SESSION_EXPIRY_DAYS']}
+    if prefix:
+        wanted['FLATNOTES_PATH_PREFIX'] = prefix
+    else:
+        require(env.get('FLATNOTES_PATH_PREFIX', '') == '', 'unexpected runtime path prefix')
+    secrets = data_file('/opt/flatnotes/flatnotes.env')
+    expected_secret_keys = set()
+    if state['FLATNOTES_AUTH_TYPE'] in ('password', 'totp'):
+        expected_secret_keys = {'FLATNOTES_USERNAME', 'FLATNOTES_PASSWORD', 'FLATNOTES_SECRET_KEY'}
+    if state['FLATNOTES_AUTH_TYPE'] == 'totp':
+        expected_secret_keys.add('FLATNOTES_TOTP_KEY')
+    require(set(secrets) == expected_secret_keys and all(secrets.values()), 'credential file keys differ')
+    wanted.update(secrets)
+    # Captured privately; neither inspect output nor environment values are printed.
+    runtime_env = json.loads(run(['podman', 'exec', 'flatnotes', 'python3', '-c',
+                                 'import json,os; print(json.dumps(dict(os.environ)))']))
+    for key, expected in wanted.items():
+        require(env.get(key) == runtime_env.get(key) == expected, 'runtime configuration/secret delivery mismatch')
+        if key not in secrets:
+            require(one(lines, 'Environment=' + key + '=') == expected, 'Quadlet environment differs')
+    clock = json.loads(run(['podman', 'exec', '--user', '1000:1000', 'flatnotes', 'python3', '-c',
+                            'import json,time; t=time.time(); v=time.localtime(t); '
+                            'print(json.dumps([t,v.tm_gmtoff,v.tm_zone]))']))
+    expected_clock = datetime.datetime.fromtimestamp(clock[0], ZoneInfo(zone))
+    require(clock[1] == int(expected_clock.utcoffset().total_seconds()) and clock[2] == expected_clock.tzname(),
+            'application timezone use differs from the planned zone')
+
+    # ss supplies only socket-owner PIDs; no process command lines are printed.
+    pid = int(container['State']['Pid'])
+    group = Path(f'/proc/{pid}/cgroup').read_text()
+    require(group.strip(), 'container cgroup identity unavailable')
+    found = False
+    for line in run(['ss', '-H', '-ltnp']).splitlines():
+        fields = line.split()
+        require(len(fields) >= 4, 'unrecognized TCP socket inventory')
+        address, port = fields[3].rsplit(':', 1)
+        if port != state['APP_PORT']:
+            continue
+        address = address.split('%', 1)[0].strip('[]')
+        require(address in ('0.0.0.0', '*', '::'), 'application socket is not wildcard-bound')
+        owners = re.findall(r'pid=(\d+)', line)
+        require(bool(owners), 'application listener ownership unavailable')
+        for owner in owners:
+            process = Path('/proc') / owner
+            require(process.joinpath('cgroup').read_text() == group, 'listener belongs to another container/service')
+            status = process.joinpath('status').read_text()
+            for field in ('Uid', 'Gid'):
+                ids = re.search(r'^' + field + r':\s+([0-9\s]+)$', status, re.M)
+                require(ids and all(int(x) == 1000 for x in ids.group(1).split()), 'listener UID/GID differs from 1000:1000')
+        if address in ('0.0.0.0', '*'):
+            found = True
+    require(found, 'expected external IPv4 Flatnotes listener is missing')
+    require(service_value('NRestarts') == restarts and service_value('ActiveState') == 'active',
+            'service changed during final runtime inspection')
+    print('  Flatnotes: readiness, stable restarts, image, mount, UID/GID, secrets, listener, UFW and timezone verified.')
+
+if __name__ == '__main__':
+    try:
+        main()
+    except ValueError as exc:
+        print('ERROR: Flatnotes verification: ' + str(exc), file=sys.stderr)
+        raise SystemExit(1)
+    except Exception:
+        print('ERROR: Flatnotes verification could not complete; command arguments and configuration are omitted.', file=sys.stderr)
+        raise SystemExit(1)
+APP_CHECK
+pct push "$CT_ID" "$tmp" /usr/local/sbin/flatnotes-check --perms 0755
+rm -f -- "$tmp"
+
+tmp=$(mktemp)
 cat > "$tmp" <<'MAINT'
 #!/usr/bin/env bash
-set -Eeo pipefail
+set -Eeuo pipefail
 umask 077
 export LC_ALL=C
 
@@ -789,14 +1485,12 @@ LOCK=/run/lock/flatnotes-maint.lock
 GENERATOR=/usr/lib/systemd/system-generators/podman-system-generator
 # Only temporary control-file copies are made. PBS/PVE owns data recovery.
 # Atomic rename protects each file; this is not a multi-file disk transaction.
-# The Quadlet contains the authoritative tag/reference/ID. Metadata is reconciled
-# under the maintenance lock after an interruption.
+# The Quadlet and validated state must agree. No automatic state reconciliation.
+# After the candidate starts, preserve it on failure; data may have changed.
 WORK=""
 SWITCHED=0
 START_ATTEMPTED=0
-APP_STOPPED=0
 COMPONENT=""
-DB_TYPE_BEFORE=""
 declare -A STATE=()
 
 die() { printf '  ERROR: %s\n' "$*" >&2; exit 1; }
@@ -807,7 +1501,7 @@ read_state() {
     [[ $line =~ ^[[:space:]]*(#.*)?$ ]] && continue
     [[ $line =~ ^([A-Z][A-Z0-9_]*)=(.*)$ ]] || die "Malformed state line."
     key=${BASH_REMATCH[1]}; value=${BASH_REMATCH[2]}
-    [[ ! ${STATE[$key]+yes} ]] || die "Duplicate state key: $key"
+    [[ ! ${STATE[$key]+yes} ]] || die "Duplicate state key."
     STATE[$key]=$value
   done < "$ENV_FILE"
   # State is parsed as data. Never source an editable .env as root.
@@ -818,7 +1512,7 @@ read_state() {
   (( STATE[INITIAL_WAIT_SECONDS] >= 30 && STATE[INITIAL_WAIT_SECONDS] <= 86400 )) || die "Invalid initial wait."
   (( STATE[UPDATE_WAIT_SECONDS] >= 30 && STATE[UPDATE_WAIT_SECONDS] <= 86400 )) || die "Invalid update wait."
   [[ ${STATE[AUTO_UPDATE]} =~ ^[01]$ && ${STATE[PODMAN_FUSE_OVERLAY]} =~ ^[01]$ ]] || die "Invalid policy flag."
-  [[ ${STATE[FLATNOTES_PATH_PREFIX]:-} == "" || ${STATE[FLATNOTES_PATH_PREFIX]} =~ ^(/[A-Za-z0-9_-]+)+$ ]] || die "Invalid path prefix."
+  [[ ${STATE[FLATNOTES_PATH_PREFIX]:-} == "" || ${STATE[FLATNOTES_PATH_PREFIX]} =~ ^(/[A-Za-z0-9._~-]+)+$ ]] || die "Invalid path prefix."
 }
 unit_value() {
   local prefix=$1 file=$2
@@ -834,8 +1528,8 @@ image_id() {
 select_component() {
   COMPONENT=$1
   case $COMPONENT in
-    APP) CONTAINER=flatnotes; KIND=app; IMAGE_RECOVERY=1 ;;
-    *) die "Unknown component: $COMPONENT" ;;
+    APP) CONTAINER=flatnotes ;;
+    *) die "Unknown component." ;;
   esac
   SERVICE=$CONTAINER.service
   UNIT=$UNIT_DIR/$CONTAINER.container
@@ -885,142 +1579,73 @@ copy_control_file() {
     rm -f -- "$temp"; return 1
   fi
 }
-wait_service() {
-  local container=$1 kind=$2 budget=$3 started=$SECONDS state restarts first code value
-  local healthy_since=-1
-  first=$(systemctl show "$container.service" -p NRestarts --value) || return 1
-  while (( SECONDS - started < budget )); do
-    state=$(systemctl show "$container.service" -p ActiveState --value) || return 1
-    restarts=$(systemctl show "$container.service" -p NRestarts --value) || return 1
-    [[ $state != failed && $state != inactive && $restarts == "$first" ]] || return 1
-    value=0
-    if [[ $state == active ]]; then
-      case $kind in
-        app)
-          code=$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 2 --max-time 3 \
-            "http://127.0.0.1:${STATE[APP_PORT]}${STATE[FLATNOTES_PATH_PREFIX]:-}/health") || code=000
-          [[ $code =~ ^200$ ]] && value=1
-          ;;
-        postgres)
-          timeout 5 podman exec "$container" pg_isready -q -h 127.0.0.1 -U postgres -d postgres && value=1
-          ;;
-        valkey|redis)
-          code=$(timeout 5 podman exec "$container" "$kind-cli" -h 127.0.0.1 ping 2>/dev/null) || code=""
-          [[ $code == PONG ]] && value=1
-          ;;
-      esac
-    fi
-    if (( value )); then
-      (( healthy_since >= 0 )) || healthy_since=$SECONDS
-      (( SECONDS - healthy_since >= 6 )) && return 0
-    else
-      healthy_since=-1
-    fi
-    sleep 2
-  done
-  return 1
+verify_application() {
+  /usr/local/sbin/flatnotes-check "$@"
 }
 validate_candidate() {
-  local id=$1 old_user new_user actual major uid gid path version
-  # Only the image shell runs, without network or data mounts. The candidate
-  # application never gets production data during validation.
-  podman run --rm --pull=never --network none --entrypoint /bin/sh "$id" -c true
-  old_user=$(podman image inspect --format '{{.Config.User}}' "$OLD_ID")
-  new_user=$(podman image inspect --format '{{.Config.User}}' "$id")
-  [[ $old_user == "$new_user" ]] || die "Image USER changed; review ownership before updating."
-
-}
-pre_update_checks() {
-[[ $(stat -c '%u:%g' "$APP_DIR/data") == 1000:1000 ]] || die "Flatnotes data ownership must be 1000:1000; inspect it before updating."
-  :
-}
-post_update_checks() {
-
-  :
+  local candidate=$1 old_contract new_contract
+  # No production data, network or normal entrypoint during this compatibility probe.
+  timeout 60 podman run --rm --pull=never --network none --read-only --user 1000:1000 \
+    --entrypoint /bin/sh "$candidate" -ec 'test "$(id -u):$(id -g)" = 1000:1000; python3 -c "import os,time,json"'
+  old_contract=$(podman image inspect --format '{{json .Config.User}} {{json .Config.Entrypoint}} {{json .Config.Cmd}}' "$OLD_ID")
+  new_contract=$(podman image inspect --format '{{json .Config.User}} {{json .Config.Entrypoint}} {{json .Config.Cmd}}' "$candidate")
+  [[ $old_contract == "$new_contract" ]] || die "Candidate USER/entrypoint/command changed; review compatibility."
 }
 finish() {
   local rc=$? restored=1
   trap - EXIT ERR INT TERM HUP
   set +e
   if (( rc != 0 && SWITCHED )); then
-    if (( START_ATTEMPTED == 0 || IMAGE_RECOVERY == 1 )); then
+    if (( START_ATTEMPTED == 0 )); then
       copy_control_file "$WORK/old.container" "$UNIT" || restored=0
       copy_control_file "$WORK/old.env" "$ENV_FILE" || restored=0
       systemctl daemon-reload || restored=0
-      if (( restored && START_ATTEMPTED )); then
-        systemctl restart "$SERVICE" && wait_service "$CONTAINER" "$KIND" "${STATE[UPDATE_WAIT_SECONDS]}" || restored=0
-      fi
-      if (( restored && APP_STOPPED )); then
-        systemctl start "$MAIN_SERVICE" && wait_service flatnotes app "${STATE[UPDATE_WAIT_SECONDS]}" || restored=0
-      fi
-      if (( restored )); then
-        printf '  Previous control files/image restored; this does not undo application data changes.\n' >&2
-      else
-        printf '  CRITICAL: Recovery was not confirmed. Inspect %s and %s.\n' "$UNIT" "$WORK" >&2
-      fi
+      (( restored )) && printf '  Previous control files restored before candidate startup.\n' >&2
     else
-      printf '  Target %s image retained: persistent state may already have changed.\n' "$COMPONENT" >&2
-      printf '  No automatic image/database downgrade. Inspect journalctl -u %s -u %s.\n' "$SERVICE" "$MAIN_SERVICE" >&2
-      printf '  Recover matching PBS/PVE state if needed. A readiness timeout does not stop a migration.\n' >&2
-      (( APP_STOPPED == 0 )) || printf '  After the backend is healthy: systemctl start %s\n' "$MAIN_SERVICE" >&2
+      restored=0
+      printf '  Candidate image and data retained for inspection; no automatic downgrade.\n' >&2
+      printf '  An image rollback cannot undo persistent data/index changes.\n' >&2
     fi
-  elif (( rc != 0 && APP_STOPPED )); then
-    systemctl start "$MAIN_SERVICE" || restored=0
   fi
   if [[ -n $WORK ]]; then
-    if (( restored )); then rm -rf -- "$WORK"; else printf '  Retained control-file copies: %s\n' "$WORK" >&2; fi
+    if (( restored )); then
+      rm -rf -- "$WORK"
+    else
+      printf '  Prior control files retained at %s (not a data backup).\n' "$WORK" >&2
+    fi
   fi
   exit "$rc"
 }
 trap finish EXIT
-trap 'printf "  Maintenance failed near line %s.\n" "$LINENO" >&2' ERR
+trap 'rc=$?; printf "  Maintenance failed: rc=%s line=%s; command arguments omitted.\n" "$rc" "$LINENO" >&2' ERR
 trap 'exit 130' INT
 trap 'exit 143' TERM
 trap 'exit 129' HUP
 
-update_component() {
-  local requested=${2:-} actual new_id target old_variant new_variant
-  select_component "$1"
+update_application() {
+  local target=${1:-} new_id answer
+  select_component APP
   load_unit
-  SWITCHED=0; START_ATTEMPTED=0; APP_STOPPED=0
-  target=${requested:-$OLD_TAG}
-  valid_tag "$COMPONENT" "$target" || die "Invalid target tag for $COMPONENT."
-# Semantic version downgrades of persistent components require a separate review.
-  if (( IMAGE_RECOVERY == 0 )) && [[ $target != latest && $OLD_TAG != latest ]]; then
-    [[ $(printf '%s\n%s\n' "$OLD_TAG" "$target" | sort -V | head -n 1) == "$OLD_TAG" ]] \
-      || die "Persistent-component downgrade requires matching data recovery."
-  fi
-  /usr/local/sbin/flatnotes-ufw-check || die "Restore active UFW filtering before maintenance."
-  actual=$(podman inspect --format '{{.Image}}' "$CONTAINER") || die "Cannot inspect running image."
-  [[ $(image_id "$actual") == "$OLD_ID" ]] || die "Running/configured image mismatch; inspect the service."
-  wait_service "$CONTAINER" "$KIND" 30 || die "$SERVICE is unhealthy before update."
-  if [[ $COMPONENT != APP ]]; then
-    wait_service flatnotes app 30 || die "Application is unhealthy before backend update."
-  fi
-  if [[ ${STATE[${COMPONENT}_TAG]:-} != "$OLD_TAG" ||
-        ${STATE[${COMPONENT}_IMAGE]:-} != "$OLD_IMAGE" ||
-        ${STATE[${COMPONENT}_IMAGE_ID]:-} != "$OLD_ID" ||
-        ${STATE[${COMPONENT}_IMAGE_REPO]:-} != "$REPO" ]]; then
-    write_env "$OLD_TAG" "$OLD_IMAGE" "$OLD_ID"
-    read_state
-    printf '  Reconciled metadata from the authoritative Quadlet.\n'
-  fi
-  pre_update_checks
+  target=${target:-$OLD_TAG}
+  valid_tag APP "$target" || die "Invalid target tag."
+  [[ $(printf '%s\n%s\n' "$OLD_TAG" "$target" | sort -V | head -n 1) == "$OLD_TAG" ]] \
+    || die "Downgrade requires a separate compatibility/data review."
+  verify_application
   if (( YES == 0 )); then
+    exec 8</dev/tty || die "Interactive terminal or --yes is required."
     [[ -t 8 ]] || die "Interactive terminal or --yes is required."
-    printf '  Verify a matching PBS/PVE recovery checkpoint on the host before updating.\n'
-    (( STATE[PODMAN_FUSE_OVERLAY] == 0 )) || printf '  FUSE is enabled: use stop-mode PBS; do not freeze this running CT.\n'
-    :
-    (( IMAGE_RECOVERY )) || printf '  Once the target starts, automatic image downgrade is disabled.\n'
-    read -r -p "  Update $COMPONENT $OLD_TAG -> $target? [y/N]: " answer <&8 || return 0
+    printf '  Verify a matching PBS/PVE recovery checkpoint covering /opt/flatnotes first.\n'
+    (( STATE[PODMAN_FUSE_OVERLAY] == 0 )) || printf '  FUSE is enabled: use reviewed stop-mode backups.\n'
+    printf '  No automatic image downgrade after candidate startup.\n'
+    read -r -p "  Update Flatnotes $OLD_TAG -> $target? [y/N]: " answer <&8 || die "Update prompt interrupted."
     [[ $answer =~ ^([Yy]|[Yy][Ee][Ss])$ ]] || return 0
   else
     printf '  --yes skips confirmation; no backup is created or verified.\n'
   fi
   podman pull "$REPO:$target"
-  new_id=$(image_id "$REPO:$target") || die "Cannot resolve target image."
+  new_id=$(image_id "$REPO:$target") || die "Cannot resolve candidate image."
   if [[ $new_id == "$OLD_ID" && $target == "$OLD_TAG" ]]; then
-    printf '  %s unchanged; no restart.\n' "$COMPONENT"
+    printf '  Pinned image unchanged; no restart.\n'
     return 0
   fi
   validate_candidate "$new_id"
@@ -1030,103 +1655,77 @@ update_component() {
   SWITCHED=1
   write_unit "$target" "$REPO:$target" "$new_id"
   write_env "$target" "$REPO:$target" "$new_id"
-  "$GENERATOR" --dryrun > "$WORK/generator.txt"
-  grep -Fq "$CONTAINER.service" "$WORK/generator.txt" || die "Generator omitted $SERVICE."
+  "$GENERATOR" --dryrun > "$WORK/generator.txt" 2> "$WORK/generator-errors.txt"
+  grep -Fq 'flatnotes.service' "$WORK/generator.txt" || die "Generator omitted Flatnotes."
   systemctl daemon-reload
   [[ $(systemctl show "$SERVICE" -p LoadState --value) == loaded ]] || die "Unit did not load."
   if [[ $new_id != "$OLD_ID" ]]; then
-    if [[ $COMPONENT != APP ]]; then
-      APP_STOPPED=1
-      systemctl stop "$MAIN_SERVICE"
-    fi
     START_ATTEMPTED=1
     systemctl restart "$SERVICE"
-    wait_service "$CONTAINER" "$KIND" "${STATE[UPDATE_WAIT_SECONDS]}" || die "$SERVICE failed readiness or restarted."
-    if [[ $COMPONENT != APP ]]; then
-      systemctl start "$MAIN_SERVICE"
-      wait_service flatnotes app "${STATE[UPDATE_WAIT_SECONDS]}" || die "Application did not recover after backend update."
-    fi
   fi
-  actual=$(podman inspect --format '{{.Image}}' "$CONTAINER")
-  [[ $(image_id "$actual") == "$new_id" ]] || die "Running image differs from target."
-  post_update_checks
-  SWITCHED=0; START_ATTEMPTED=0; APP_STOPPED=0
-  rm -rf -- "$WORK"; WORK=""
-  # Retain the prior image for inspection/recovery. No broad image prune.
   read_state
-  printf '  Updated %s: %s (%s).\n' "$COMPONENT" "$target" "$new_id"
+  verify_application
+  SWITCHED=0; START_ATTEMPTED=0
+  rm -rf -- "$WORK"; WORK=""
+  printf '  Updated Flatnotes: %s (%s); complete application verification passed.\n' "$target" "$new_id"
+  # Retain prior images. No pruning, data archives or application data restoration.
 }
 
-[[ $EUID == 0 ]] || die "Run as root inside the flatnotes CT."
-for command in podman systemctl curl awk sed sort head cat stat grep mktemp cp chmod mv rm flock timeout python3; do
-  command -v "$command" >/dev/null || die "Missing command: $command"
+[[ $EUID == 0 ]] || die "Run as root inside the Flatnotes CT."
+for command in podman systemctl awk sed sort head cat stat grep mktemp cp chmod mv rm flock timeout; do
+  command -v "$command" >/dev/null || die "Missing required maintenance command."
 done
-[[ -f $ENV_FILE ]] || die "Missing $ENV_FILE."
+[[ -f $ENV_FILE && ! -L $ENV_FILE && $(stat -c '%u:%g:%a' "$ENV_FILE") == 0:0:600 ]] \
+  || die "Missing or unsafe application state file."
 exec 9>"$LOCK"
 flock -n 9 || die "Another maintenance operation is running."
-YES=0
-ARGS=()
-for arg in "$@"; do
-  case $arg in --yes|-y) YES=1 ;; *) ARGS+=("$arg") ;; esac
-done
-set -- "${ARGS[@]}"
 cmd=${1:---help}
-read_state
+YES=0
 case $cmd in
+  check)
+    { (( $# == 1 )) || { (( $# == 2 )) && [[ $2 == --initial ]]; }; } \
+      || die "Usage: flatnotes-maint.sh check [--initial]"
+    if [[ ${2:-} == --initial ]]; then verify_application --initial; else verify_application; fi
+    ;;
   update)
-    (( $# <= 2 )) || die "Usage: $0 $cmd [tag] [--yes]"
-    if (( YES == 0 )); then
-      exec 8</dev/tty || die "Interactive terminal or --yes is required."
-    fi
-    case $cmd in
-      update) update_component APP "${2:-}" ;;
-    esac
+    shift
+    target=''
+    for arg in "$@"; do
+      case $arg in
+        --yes|-y) (( YES == 0 )) || die "Duplicate confirmation flag."; YES=1 ;;
+        *) [[ -z $target ]] && valid_tag APP "$arg" || die "Invalid update arguments."; target=$arg ;;
+      esac
+    done
+    read_state
+    update_application "$target"
     ;;
   auto-update)
-    (( $# == 1 )) || die "auto-update takes no tag."
+    (( $# == 1 )) || die "auto-update takes no arguments."
+    read_state
     [[ ${STATE[AUTO_UPDATE]} == 1 ]] || { printf '  Auto-update is disabled.\n'; exit 0; }
     YES=1
-    for component in APP; do
-      update_component "$component"
-    done
-    ;;
-  check)
-    (( $# <= 2 )) && [[ ${2:-} == "" || ${2:-} == --initial ]] || die "Usage: $0 check [--initial]"
-    /usr/local/sbin/flatnotes-ufw-check
-    budget=${STATE[UPDATE_WAIT_SECONDS]}
-    [[ ${2:-} != --initial ]] || budget=${STATE[INITIAL_WAIT_SECONDS]}
-    for component in APP; do
-      select_component "$component"
-      load_unit
-      if [[ ${2:-} == --initial ]]; then
-        [[ $(systemctl show "$SERVICE" -p NRestarts --value) == 0 ]] || die "$SERVICE restarted during initial startup."
-      fi
-      wait_service "$CONTAINER" "$KIND" "$budget" || die "$SERVICE failed readiness or restarted."
-      actual=$(podman inspect --format '{{.Image}}' "$CONTAINER")
-      [[ $(image_id "$actual") == "$OLD_ID" ]] || die "Running/configured image mismatch: $SERVICE"
-    done
-    printf '  Service readiness, stable restart counts, image IDs and UFW checks passed.\n'
+    update_application
     ;;
   version)
-    (( $# == 1 )) || die "version takes no argument."
-    for component in APP; do
-      select_component "$component"; load_unit
-      printf '  %s\n    tag: %s\n    configured ID: %s\n    running ID: ' "$CONTAINER" "$OLD_TAG" "$OLD_ID"
-      podman inspect --format '{{.Image}}' "$CONTAINER" || true
-    done
+    (( $# == 1 )) || die "version takes no arguments."
+    read_state; select_component APP; load_unit
+    actual=$(podman inspect --format '{{.Image}}' flatnotes)
+    actual=$(image_id "$actual") || die "Cannot resolve running image."
+    printf '  Flatnotes\n    image: %s\n    configured ID: %s\n    running ID: %s\n' "$OLD_IMAGE" "$OLD_ID" "$actual"
     ;;
-  --help|-h|'')
+  --help|-h)
+    (( $# <= 1 )) || die "Unexpected help arguments."
     printf 'Usage: %s update [tag] [--yes] | auto-update | check [--initial] | version\n' "$0"
-    printf '  Exact image IDs; one component per operation; PBS/PVE handles data recovery.\n'
-    printf '  Fresh-creator helper: do not replace an older deployed helper without migrating its control files.\n'
+    printf '  PBS/PVE owns data recovery; --yes does not create or verify a backup.\n'
     ;;
-  *) die "Unknown command: $cmd" ;;
+  *) die "Unknown maintenance command." ;;
 esac
 MAINT
 pct push "$CT_ID" "$tmp" /usr/local/bin/flatnotes-maint.sh --perms 0755
 rm -f -- "$tmp"
 
 # ── Start via Quadlet ─────────────────────────────────────────────────────────
+INSTALL_STAGE="Quadlet compatibility"
 pct exec "$CT_ID" -- bash -s -- flatnotes <<'QUADLET_VALIDATE'
 set -euo pipefail
 output=$(mktemp)
@@ -1142,94 +1741,17 @@ done
 QUADLET_VALIDATE
 pct exec "$CT_ID" -- /usr/local/sbin/flatnotes-ufw-check
 # Preserve the CT even if the first persistent start fails partway through.
+INSTALL_STAGE="application startup"
 CLEANUP_ON_FAIL=0
 pct exec "$CT_ID" -- systemctl start flatnotes.service
 
 # Destructive cleanup was disarmed before the first persistent service start.
 
 # ── Initial application verification ─────────────────────────────────────────
+INSTALL_STAGE="early application verification"
 sleep 30
-if ! pct exec "$CT_ID" -- /usr/local/bin/flatnotes-maint.sh check --initial; then
-  echo "ERROR: Initial readiness/image/firewall verification failed; CT $CT_ID is preserved." >&2
-  false
-fi
-VERIFY_FAIL=0
-
-if pct exec "$CT_ID" -- systemctl is-active --quiet "${QUADLET_SERVICE}" 2>/dev/null; then
-  echo "  Quadlet service is active: ${QUADLET_SERVICE}"
-else
-  echo "  ERROR: ${QUADLET_SERVICE} is not active" >&2
-  echo "  Check: pct exec $CT_ID -- systemctl status flatnotes.service" >&2
-  echo "  Check: pct exec $CT_ID -- journalctl -u flatnotes.service --no-pager -n 50" >&2
-  VERIFY_FAIL=1
-fi
-
-RUNNING=0
-for i in $(seq 1 60); do
-  RUNNING="$(pct exec "$CT_ID" -- sh -lc \
-    'podman ps --filter name=^flatnotes$ --format "{{.Names}}" 2>/dev/null | wc -l' \
-    2>/dev/null || echo 0)"
-  [[ "$RUNNING" -ge 1 ]] && break
-  sleep 2
-done
-pct exec "$CT_ID" -- bash -lc 'podman ps' || true
-
-if [[ "$RUNNING" -lt 1 ]]; then
-  echo "  ERROR: Expected 1 container running, found $RUNNING" >&2
-  VERIFY_FAIL=1
-else
-  echo "  Container count OK ($RUNNING running)"
-fi
-
-# Credential round-trip: prove the values the container actually received are
-# byte-identical to what was configured (guards against env-file parsing
-# surprises). Expected values are streamed over stdin, never passed as argv.
-if [[ "$RUNNING" -ge 1 && ( "$FLATNOTES_AUTH_TYPE" == "password" || "$FLATNOTES_AUTH_TYPE" == "totp" ) ]]; then
-  if printf '%s\n%s\n' "$FLATNOTES_USERNAME" "$FLATNOTES_PASSWORD" | pct exec "$CT_ID" -- bash -lc '
-    set -euo pipefail
-    IFS= read -r want_user
-    IFS= read -r want_pass
-    have_user="$(podman exec flatnotes sh -c "printf %s \"\$FLATNOTES_USERNAME\"")"
-    have_pass="$(podman exec flatnotes sh -c "printf %s \"\$FLATNOTES_PASSWORD\"")"
-    [[ "$want_user" == "$have_user" ]] || { echo "  FLATNOTES_USERNAME inside the container does not match the configured value" >&2; exit 1; }
-    [[ "$want_pass" == "$have_pass" ]] || { echo "  FLATNOTES_PASSWORD inside the container does not match the configured value" >&2; exit 1; }
-  '; then
-    echo "  Credential round-trip OK (env file parsed as written)"
-  else
-    echo "  ERROR: Credentials inside the container differ from the configured values" >&2
-    echo "  Check: pct exec $CT_ID -- cat ${APP_ENV_FILE}" >&2
-    VERIFY_FAIL=1
-  fi
-fi
-unset FLATNOTES_PASSWORD
-
-FN_HEALTHY=0
-for i in $(seq 1 90); do
-  HTTP_CODE="$(pct exec "$CT_ID" -- sh -lc "curl -s -o /dev/null -w '%{http_code}' --max-time 3 'http://127.0.0.1:${APP_PORT}${FLATNOTES_PATH_PREFIX}/health' 2>/dev/null" 2>/dev/null || echo 000)"
-  case "$HTTP_CODE" in
-    200)
-      FN_HEALTHY=1
-      break
-      ;;
-  esac
-  sleep 2
-done
-
-if [[ "$FN_HEALTHY" -eq 1 ]]; then
-  echo "  Flatnotes health check passed (HTTP $HTTP_CODE)"
-else
-  echo "  ERROR: Flatnotes /health did not return 200 on port ${APP_PORT}" >&2
-  echo "  Check: pct exec $CT_ID -- systemctl status flatnotes.service" >&2
-  echo "  Check: pct exec $CT_ID -- journalctl -u flatnotes.service --no-pager -n 80" >&2
-  VERIFY_FAIL=1
-fi
-
-if (( VERIFY_FAIL == 1 )); then
-  echo "" >&2
-  echo "  FATAL: Core verification failed — CT $CT_ID is preserved but the install is incomplete." >&2
-  echo "  Inspect the container and fix manually, or destroy and re-run." >&2
-  false
-fi
+# Explicit, first-install-only exception; final and ordinary checks require policy.json.
+pct exec "$CT_ID" -- env FLATNOTES_INSTALL_BOOTSTRAP=1 /usr/local/bin/flatnotes-maint.sh check --initial
 
 # ── Auto-update timer (policy-driven) ─────────────────────────────────────────
 pct exec "$CT_ID" -- bash -s -- "$UPDATE_TIME" <<'TIMER_INSTALL'
@@ -1256,12 +1778,10 @@ WantedBy=timers.target
 EOF2
 systemctl daemon-reload
 TIMER_INSTALL
-if [[ $AUTO_UPDATE == 1 ]]; then
-  pct exec "$CT_ID" -- systemctl enable --now flatnotes-update.timer
-else
-  pct exec "$CT_ID" -- systemctl disable --now flatnotes-update.timer
-fi
+# Keep image updates disabled through all remaining installation checks.
+pct exec "$CT_ID" -- systemctl disable --now flatnotes-update.timer
 
+INSTALL_STAGE="package cleanup and MOTD"
 # ── Extra packages ────────────────────────────────────────────────────────────
 if [[ "${#EXTRA_PACKAGES[@]}" -gt 0 ]]; then
   pct exec "$CT_ID" -- bash -lc "
@@ -1271,90 +1791,108 @@ if [[ "${#EXTRA_PACKAGES[@]}" -gt 0 ]]; then
   "
 fi
 
-# ── Cleanup packages ──────────────────────────────────────────────────────────
-pct exec "$CT_ID" -- bash -lc '
-  set -euo pipefail
-  export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l
-  apt-get purge -y man-db manpages 2>/dev/null || true
-  apt-get -y autoremove
-  apt-get -y clean
-'
+# ── Cleanup package cache ────────────────────────────────────────────────────
+pct exec "$CT_ID" -- apt-get clean
 
 # ── MOTD (dynamic drop-ins) ───────────────────────────────────────────────────
-pct exec "$CT_ID" -- bash -lc "
-  set -euo pipefail
-  > /etc/motd
-  chmod -x /etc/update-motd.d/* 2>/dev/null || true
-  rm -f /etc/update-motd.d/*
-
-  cat > /etc/update-motd.d/00-header <<'MOTD'
+pct exec "$CT_ID" -- bash -s <<'MOTD_INSTALL'
+set -euo pipefail
+mkdir -p /etc/update-motd.d
+> /etc/motd
+rm -f /etc/update-motd.d/*
+cat > /etc/update-motd.d/00-header <<'MOTD_HEADER'
 #!/bin/sh
-printf '\\n  Flatnotes (Podman/Quadlet)\\n'
-printf '  ────────────────────────────────────\\n'
-MOTD
-
-  cat > /etc/update-motd.d/10-sysinfo <<'MOTD'
+printf '\n  Flatnotes (Podman/Quadlet)\n'
+printf '  ────────────────────────────────────\n'
+MOTD_HEADER
+cat > /etc/update-motd.d/10-sysinfo <<'MOTD_SYSINFO'
 #!/bin/sh
-ip=\$(ip -4 -o addr show scope global 2>/dev/null | awk '{print \$4}' | cut -d/ -f1 | head -n1)
-printf '  Hostname:  %s\\n' \"\$(hostname)\"
-printf '  IP:        %s\\n' \"\${ip:-n/a}\"
-printf '  Uptime:    %s\\n' \"\$(uptime -p 2>/dev/null || uptime)\"
-printf '  Disk:      %s\\n' \"\$(df -h / | awk 'NR==2{printf \"%s/%s (%s used)\", \$3, \$2, \$5}')\"
-MOTD
-
-  cat > /etc/update-motd.d/30-app <<'MOTD'
+ip=$(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -n1)
+printf '  Hostname:  %s\n' "$(hostname)"
+printf '  IP:        %s\n' "${ip:-n/a}"
+printf '  Uptime:    %s\n' "$(uptime -p 2>/dev/null || uptime)"
+printf '  Disk:      %s\n' "$(df -h / | awk 'NR==2{printf "%s/%s (%s used)", $3, $2, $5}')"
+MOTD_SYSINFO
+cat > /etc/update-motd.d/30-app <<'MOTD_APP'
 #!/bin/sh
-running=\$(podman ps --filter name=^flatnotes$ --format '{{.Names}}' 2>/dev/null | wc -l)
-svc_status=\$(systemctl is-active flatnotes.service 2>/dev/null); svc_status=\${svc_status:-unknown}
-ip=\$(ip -4 -o addr show scope global 2>/dev/null | awk '{print \$4}' | cut -d/ -f1 | head -n1)
-image=\$(awk -F= '/^APP_IMAGE=/{print \$2}' /opt/flatnotes/.env 2>/dev/null | tail -n1)
-auth=\$(awk -F= '/^FLATNOTES_AUTH_TYPE=/{print \$2}' /opt/flatnotes/.env 2>/dev/null | tail -n1)
-auto=\$(awk -F= '/^AUTO_UPDATE=/{print \$2}' /opt/flatnotes/.env 2>/dev/null | tail -n1)
-fqdn=\$(awk -F= '/^APP_FQDN=/{print \$2}' /opt/flatnotes/.env 2>/dev/null | tail -n1)
-port=\$(awk -F= '/^APP_PORT=/{print \$2}' /opt/flatnotes/.env 2>/dev/null | tail -n1)
-prefix=\$(awk -F= '/^FLATNOTES_PATH_PREFIX=/{print \$2}' /opt/flatnotes/.env 2>/dev/null | tail -n1)
-port=\${port:-8080}
-printf '  Container: flatnotes (%s running)\\n' \"\$running\"
-printf '  Service:   flatnotes.service (%s)\\n' \"\$svc_status\"
-printf '  Image:     %s\\n' \"\${image:-n/a}\"
-printf '  Auth:      %s\\n' \"\${auth:-n/a}\"
-printf '  Policy:    %s\\n' \"\$([ \"\$auto\" = '1' ] && echo 'auto-update (re-pull pinned tag)' || echo 'pinned (manual)')\"
-printf '  Data:      /opt/flatnotes/data\\n'
-printf '  Creds:     /opt/flatnotes/flatnotes.env\\n'
-printf '  Logs:      journalctl -u flatnotes.service -f\\n'
-printf '  Maintain:  /usr/local/bin/flatnotes-maint.sh [update|auto-update|version]\\n'
-printf '  Updates:   systemctl status flatnotes-update.timer\\n'
-if [ -n \"\$fqdn\" ]; then
-  printf '  Web UI:    https://%s%s/\\n' \"\$fqdn\" \"\$prefix\"
-fi
-printf '  Web UI:    http://%s:%s%s/\\n' \"\${ip:-n/a}\" \"\$port\" \"\$prefix\"
-MOTD
-
-  cat > /etc/update-motd.d/99-footer <<'MOTD'
+svc=$(systemctl is-active flatnotes.service 2>/dev/null); svc=${svc:-unknown}
+ip=$(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -n1)
+port=$(sed -n 's/^APP_PORT=//p' /opt/flatnotes/.env)
+prefix=$(sed -n 's/^FLATNOTES_PATH_PREFIX=//p' /opt/flatnotes/.env)
+zone=$(sed -n 's/^APP_TZ=//p' /opt/flatnotes/.env)
+auto=$(sed -n 's/^AUTO_UPDATE=//p' /opt/flatnotes/.env)
+when=$(sed -n 's/^UPDATE_TIME=//p' /opt/flatnotes/.env)
+printf '  Service:   flatnotes.service (%s)\n' "$svc"
+printf '  Web UI:    http://%s:%s%s/\n' "${ip:-n/a}" "$port" "$prefix"
+printf '  Timezone:  %s\n' "$zone"
+printf '  Updates:   AUTO_UPDATE=%s | daily %s (%s)\n' "$auto" "$when" "$zone"
+printf '  Data:      /opt/flatnotes/data (notes, attachments, search index)\n'
+printf '  Secrets:   /opt/flatnotes/flatnotes.env (0600)\n'
+printf '  State:     /opt/flatnotes/.env; source policy: /opt/flatnotes/access.json\n'
+printf '  Quadlet:   /etc/containers/systemd/flatnotes.container\n'
+printf '  Check:     /usr/local/bin/flatnotes-maint.sh check\n'
+printf '  Version:   /usr/local/bin/flatnotes-maint.sh version\n'
+printf '  Update:    /usr/local/bin/flatnotes-maint.sh update <tag>\n'
+MOTD_APP
+cat > /etc/update-motd.d/99-footer <<'MOTD_FOOTER'
 #!/bin/sh
-printf '  ────────────────────────────────────\\n\\n'
-MOTD
+printf '  ────────────────────────────────────\n\n'
+MOTD_FOOTER
+chmod 0755 /etc/update-motd.d/{00-header,10-sysinfo,30-app,99-footer}
+MOTD_INSTALL
 
-  chmod +x /etc/update-motd.d/*
-"
-
+# COMMON TERMINAL WRAPPER
 pct exec "$CT_ID" -- bash -lc '
   set -euo pipefail
   touch /root/.bashrc
   grep -q "^export TERM=" /root/.bashrc 2>/dev/null || echo "export TERM=xterm-256color" >> /root/.bashrc
 '
+# END COMMON TERMINAL WRAPPER
 
-# ── Late hardening boundary ──────────────────────────────────────────────────
-# Cleanup remains disarmed from first persistent start through the final checks.
-# Snapshot persistent UFW rules; the common block must preserve them byte-for-byte.
-UFW_RULES_BEFORE="$(pct exec "$CT_ID" -- bash -lc '
-  set -euo pipefail
-  sha256sum /etc/ufw/{before,after,user}{,6}.rules
-')"
+# COMMON TIMEZONE PLAN RECHECK
+TIMEZONE_PLAN_LATE=$(pct exec "$CT_ID" -- /usr/local/sbin/lab-timezone plan "$PRESERVE_EXISTING_TIMEZONE" "$SERVER_TIMEZONE")
+[[ $TIMEZONE_PLAN == "$TIMEZONE_PLAN_LATE" ]] || {
+  echo 'ERROR: Guest timezone changed since early planning; CT preserved.' >&2
+  false
+}
+unset TIMEZONE_PLAN_LATE
+# END COMMON TIMEZONE PLAN RECHECK
 
+# COMMON HARDENING CALLER
+INSTALL_STAGE="shared hardening"
+CLEANUP_ON_FAIL=0
+[[ $EUID == 0 && -d /etc/pve ]] || {
+  echo 'ERROR: Shared hardening caller must be the verified Proxmox host.' >&2
+  false
+}
+command -v pveversion >/dev/null
+command -v pct >/dev/null
+pveversion >/dev/null
+[[ $CT_ID =~ ^[1-9][0-9]+$ ]] || {
+  echo 'ERROR: Invalid selected CT_ID.' >&2
+  false
+}
+pct status "$CT_ID" | grep -qx 'status: running'
+pct config "$CT_ID" | grep -qx 'unprivileged: 1'
+# A verified host login marker is not a guest SSH session.
+unset SSH_CONNECTION
+UFW_RULES_BEFORE=$(pct exec "$CT_ID" -- bash -s <<'UFW_SNAPSHOT_BEFORE'
+set -euo pipefail
+sha256sum /etc/ufw/{before,after,user}{,6}.rules
+iptables -w 5 -S
+ip6tables -w 5 -S
+UFW_SNAPSHOT_BEFORE
+)
+# END COMMON HARDENING CALLER
+
+# BEGIN CANONICAL HARDENING v1.2.0
 #!/usr/bin/env bash
 # ── Shared Debian 13 LXC hardening block ───────────────────────────────────────
-# Version: 1.1.1 (2026-09-12; scoped IPv6 listener parsing fix)
+# Version: 1.2.0 (2026-09-15; user-authorized LXC timezone adaptation)
+# Base v1.1.2 SHA-256: ae2fa917d7dfe007c5f3700ea9d8c6686867a892d4323af2eb78c847092c3774
+# Timezone policy source: debian-hardening.sh v1.0.3; native access code excluded.
+# Guest-only /etc/localtime handling replaces the native timedated dependency.
+# Timezone backups are observational; later failures have no automatic undo.
 # Paste this whole file AFTER the creator's MOTD/cleanup steps and BEFORE its
 # final verification/summary. Later MOTD code must not delete 25-lab-hardening.
 # Replace its old unattended-upgrades and sysctl sections with this block.
@@ -1378,21 +1916,26 @@ UFW_RULES_BEFORE="$(pct exec "$CT_ID" -- bash -lc '
 # UFW logging and all allow/deny rules retain the installer's existing policy.
 #
 # Managed paths:
+#   /etc/localtime; existing /etc/timezone (set mode only)
+#   /usr/local/sbin/lab-timezone (plan/check read-only; apply internal)
 #   /etc/sysctl.d/99-hardening.conf
 #   /etc/apt/apt.conf.d/99-lab-hardening
 #   /etc/needrestart/conf.d/99-lab-hardening.conf
 #   /etc/systemd/journald.conf.d/99-lab-hardening.conf
 #   /etc/systemd/system/apt-daily{,-upgrade}.service.d/90-lab-readiness.conf (LXC)
 #   /etc/systemd/system/lab-hardening-check.{service,timer}
-#   /usr/local/sbin/lab-{apt-wait-online,hardening-check}
+#   /usr/local/sbin/lab-{apt-wait-online,hardening-check,postfix-check}
 #   /etc/update-motd.d/25-lab-hardening
 #   /etc/default/ufw (IPT_SYSCTL only); SSH service/socket masks (when SSH removed)
+#   /etc/systemd/system/postfix*.{service,socket,path} masks (when Postfix removed)
 #   /var/lib/lab-hardening/{policy.json,status.json,last-index-refresh,check.lock}
 #   /var/backups/lab-hardening/<run>/ (configuration copies and dry-run log)
 # References: Debian trixie apt.conf(5), systemd-sysctl(8), ifquery(8),
 # journald.conf(5), needrestart(1); kernel.org networking/ip-sysctl.html.
 #
 # Settings may instead be assigned in the creator's top config section.
+SERVER_TIMEZONE="${SERVER_TIMEZONE-Europe/Berlin}"
+PRESERVE_EXISTING_TIMEZONE="${PRESERVE_EXISTING_TIMEZONE-0}" # 0=set; 1=keep guest zone
 HARDENING_PROFILE="${HARDENING_PROFILE:-lxc}"              # lxc; auto remains a compatible alias
 HARDENING_RP_FILTER="${HARDENING_RP_FILTER:-1}"            # 1=strict; 2=loose for asymmetric paths
 HARDENING_KEEP_SSH="${HARDENING_KEEP_SSH:-0}"              # 0=remove; 1=preserve
@@ -1429,7 +1972,7 @@ fi
   "$HARDENING_REMOVE_POSTFIX" "$HARDENING_JOURNAL_DAYS" \
   "$HARDENING_JOURNAL_MAX_MB" "$HARDENING_JOURNAL_RUNTIME_MB" \
   "$HARDENING_UPDATE_MAX_AGE_HOURS" "$HARDENING_TCP_PORTS" \
-  "$HARDENING_UDP_PORTS" <<'LAB_HARDENING_GUEST'
+  "$HARDENING_UDP_PORTS" "$PRESERVE_EXISTING_TIMEZONE" "$SERVER_TIMEZONE" <<'LAB_HARDENING_GUEST'
 set -Eeuo pipefail
 umask 022
 export LC_ALL=C DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l
@@ -1437,6 +1980,7 @@ export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 PROFILE=$1 RP_FILTER=$2 KEEP_SSH=$3 REMOVE_POSTFIX=$4
 JOURNAL_DAYS=$5 JOURNAL_MAX_MB=$6 JOURNAL_RUNTIME_MB=$7 UPDATE_MAX_AGE=$8
 TCP_PORTS=$9 UDP_PORTS=${10}
+PRESERVE_TIMEZONE=${11} REQUESTED_TIMEZONE=${12}
 [[ $EUID == 0 && -d /run/systemd/system ]] || {
   echo 'ERROR: A running systemd guest and root access are required.' >&2; exit 1;
 }
@@ -1472,7 +2016,7 @@ for port in $TCP_PORTS $UDP_PORTS; do
     echo 'ERROR: Port lists require space-separated numbers from 1 to 65535.' >&2; exit 1
   fi
 done
-for command in ufw iptables ip6tables ip ss sysctl python3 systemctl apt-get flock; do
+for command in ufw iptables ip6tables ip ss sysctl python3 systemctl apt-get flock timeout; do
   command -v "$command" >/dev/null || { echo "ERROR: Missing prerequisite: $command" >&2; exit 1; }
 done
 exec 9>/run/lock/lab-hardening-install.lock
@@ -1503,6 +2047,176 @@ install -d -m 0700 "$backup"
 hardening_exit=0
 trap 'hardening_exit=$?; rm -rf -- "$stage"; exit "$hardening_exit"' EXIT
 trap 'echo "ERROR: Hardening failed near guest line $LINENO. Guest preserved; config backups: $backup" >&2' ERR
+# Timezone policy is owned here, inside the verified LXC dispatch boundary.
+# Validate and apply before package operations; preserve mode makes no timezone writes.
+cat > "$stage/timezone.py" <<'TIMEZONE_HELPER'
+#!/usr/bin/python3
+"""LXC timezone policy, adapted from debian-hardening.sh v1.0.3.
+
+Only apply writes timezone files; plan/check are read-only. No timedated,
+clock, RTC, NTP, SSH, or access-recovery operations are performed.
+"""
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+from zoneinfo import ZoneInfo
+
+ZONES = Path('/usr/share/zoneinfo')
+LOCALTIME = Path('/etc/localtime')
+TIMEZONE = Path('/etc/timezone')
+
+
+def guest_guard():
+    if os.geteuid() != 0 or shutil.which('pveversion') or Path('/etc/pve').exists():
+        raise ValueError('Timezone operations require root inside the selected Debian 13 LXC.')
+    release = dict(line.split('=', 1) for line in Path('/etc/os-release').read_text().splitlines()
+                   if '=' in line and not line.startswith('#'))
+    if release.get('ID', '').strip('"') != 'debian' or release.get('VERSION_ID', '').strip('"') != '13':
+        raise ValueError('Timezone policy requires Debian 13.')
+    result = subprocess.run(['systemd-detect-virt', '--container'], text=True,
+                            capture_output=True, timeout=10)
+    if result.returncode or result.stdout.strip() != 'lxc':
+        raise ValueError('Timezone policy refuses environments other than LXC.')
+
+
+def zone_path(name):
+    # Same name grammar as the native source; validate against guest tzdata.
+    if not re.fullmatch(r'[A-Za-z0-9_+-]+(?:/[A-Za-z0-9_+-]+)*', name):
+        raise ValueError('Invalid SERVER_TIMEZONE; use an installed IANA timezone name.')
+    if name.split('/')[0] in ('posix', 'right', 'localtime', 'posixrules'):
+        raise ValueError('SERVER_TIMEZONE must identify an IANA zone, not a special tzdata tree.')
+    path = ZONES / name
+    try:
+        path.resolve(strict=True).relative_to(ZONES.resolve(strict=True))
+        with path.open('rb') as stream:
+            ZoneInfo.from_file(stream, key=name)
+    except (OSError, ValueError) as exc:
+        raise ValueError('Timezone is unavailable or invalid in this guest: ' + name) from exc
+    return path
+
+
+def effective_timezone():
+    if not LOCALTIME.exists() and not LOCALTIME.is_symlink():
+        zone_path('UTC')
+        return 'UTC'  # localtime(5): absent /etc/localtime means UTC.
+    if LOCALTIME.is_symlink():
+        # Keep the selected alias, rather than resolving US/Eastern to another name.
+        link = Path(os.path.normpath(LOCALTIME.parent / os.readlink(LOCALTIME)))
+        try:
+            name = str(link.relative_to(ZONES))
+        except ValueError as exc:
+            raise ValueError('/etc/localtime does not link into the guest zoneinfo tree.') from exc
+        zone_path(name)
+        return name
+    if LOCALTIME.is_file() and TIMEZONE.is_file() and not TIMEZONE.is_symlink():
+        name = TIMEZONE.read_text().strip()
+        if LOCALTIME.read_bytes() == zone_path(name).read_bytes():
+            return name
+    raise ValueError('Cannot identify the guest timezone from /etc/localtime and /etc/timezone.')
+
+
+def fingerprint(path):
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return {'kind': 'absent'}
+    if stat.S_ISLNK(info.st_mode):
+        return {'kind': 'symlink', 'target': os.readlink(path)}
+    if stat.S_ISREG(info.st_mode):
+        return {'kind': 'file', 'sha256': hashlib.sha256(path.read_bytes()).hexdigest()}
+    raise ValueError('Unsupported timezone file type: ' + str(path))
+
+
+def fingerprints():
+    return {str(path): fingerprint(path) for path in (LOCALTIME, TIMEZONE)}
+
+
+def plan(preserve, requested):
+    if preserve not in ('0', '1'):
+        raise ValueError('PRESERVE_EXISTING_TIMEZONE must be exactly 0 or 1.')
+    if preserve == '0':
+        zone_path(requested)
+        if TIMEZONE.is_symlink() or (TIMEZONE.exists() and not TIMEZONE.is_file()):
+            raise ValueError('Refusing to replace a non-regular /etc/timezone.')
+    before = effective_timezone()
+    return {'preserve': preserve == '1', 'requested': None if preserve == '1' else requested,
+            'before': before, 'effective': before if preserve == '1' else requested,
+            'files_before': fingerprints()}
+
+
+def verify(setting):
+    actual = effective_timezone()
+    if actual != setting['effective']:
+        raise ValueError('Guest timezone drift: expected ' + setting['effective'] + ', found ' + actual)
+    expected_files = setting.get('files', setting['files_before'])
+    if fingerprints() != expected_files:
+        raise ValueError('Guest timezone files changed; review /etc/localtime and /etc/timezone.')
+    return actual
+
+
+def apply(setting, backup):
+    if fingerprints() != setting['files_before'] or effective_timezone() != setting['before']:
+        raise ValueError('Guest timezone changed after validation; refusing to overwrite it.')
+    if not setting['preserve']:
+        target = zone_path(setting['requested'])
+        saved = Path(backup) / 'timezone'
+        saved.mkdir(mode=0o700, parents=True, exist_ok=False)
+        (saved / 'before.json').write_text(json.dumps(setting, indent=2) + '\n')
+        for path in (LOCALTIME, TIMEZONE):
+            if path.exists() or path.is_symlink():
+                shutil.copy2(path, saved / path.name, follow_symlinks=False)
+        # Atomic per-file replacement; no automatic undo of a later failure.
+        if setting['before'] != setting['requested']:
+            with tempfile.TemporaryDirectory(prefix='.lab-timezone-', dir=LOCALTIME.parent) as tmp:
+                replacement = Path(tmp) / 'localtime'
+                replacement.symlink_to(target)
+                os.replace(replacement, LOCALTIME)
+        # Debian uses /etc/localtime. Keep an existing legacy file consistent;
+        # do not introduce /etc/timezone when the template does not maintain it.
+        desired = setting['requested'] + '\n'
+        if TIMEZONE.exists() and TIMEZONE.read_text() != desired:
+            with tempfile.TemporaryDirectory(prefix='.lab-timezone-', dir=TIMEZONE.parent) as tmp:
+                replacement = Path(tmp) / 'timezone'
+                replacement.write_text(desired)
+                replacement.chmod(0o644)
+                os.replace(replacement, TIMEZONE)
+    final = {**setting, 'files': fingerprints()}
+    if setting['preserve'] and final['files'] != setting['files_before']:
+        raise ValueError('Preserve mode detected a timezone-file change.')
+    verify(final)
+    return final
+
+
+def main():
+    guest_guard()
+    if len(sys.argv) == 4 and sys.argv[1] == 'plan':
+        print(json.dumps(plan(sys.argv[2], sys.argv[3])))
+    elif len(sys.argv) == 4 and sys.argv[1] == 'apply':
+        setting = json.loads(Path(sys.argv[2]).read_text())
+        print(json.dumps(apply(setting, sys.argv[3])))
+    elif len(sys.argv) == 3 and sys.argv[1] == 'check':
+        policy = json.loads(Path(sys.argv[2]).read_text())
+        print(verify(policy['timezone']))
+    else:
+        raise ValueError('Invalid timezone helper arguments.')
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except Exception as exc:
+        print('ERROR: LXC timezone: ' + str(exc), file=sys.stderr)
+        raise SystemExit(1)
+TIMEZONE_HELPER
+python3 "$stage/timezone.py" plan "$PRESERVE_TIMEZONE" "$REQUESTED_TIMEZONE" > "$stage/timezone-plan.json"
+python3 "$stage/timezone.py" apply "$stage/timezone-plan.json" "$backup" > "$stage/timezone-policy.json"
 install -d -m 0755 /var/lib/lab-hardening
 if [[ $(systemctl show lab-hardening-check.timer -p LoadState --value) == loaded ]]; then
   systemctl stop lab-hardening-check.timer
@@ -1519,6 +2233,7 @@ apt-get -o DPkg::Lock::Timeout=120 install -y --no-install-recommends \
 mkdir -p "$stage/etc/apt/apt.conf.d" "$stage/etc/needrestart/conf.d" \
   "$stage/etc/systemd/journald.conf.d" "$stage/etc/sysctl.d" \
   "$stage/etc/systemd/system" "$stage/usr/local/sbin" "$stage/etc/update-motd.d"
+install -m 0755 "$stage/timezone.py" "$stage/usr/local/sbin/lab-timezone"
 cat > "$stage/etc/apt/apt.conf.d/99-lab-hardening" <<'APT_POLICY'
 // Managed by lab-hardening-block.sh. Debian release stays fixed at trixie.
 #clear Unattended-Upgrade::Allowed-Origins;
@@ -1650,6 +2365,148 @@ ExecStartPre=-/usr/local/sbin/lab-apt-wait-online
 APT_DROPIN
 done
 
+# ── Postfix inventory and runtime verification (read-only) ────────────────────
+cat > "$stage/usr/local/sbin/lab-postfix-check" <<'POSTFIX_CHECK_HELPER'
+#!/usr/bin/python3
+"""Read-only Postfix inventory and removal checks for the native Debian service."""
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+
+os.environ['LC_ALL'] = 'C'
+os.environ['PATH'] = '/usr/sbin:/usr/bin:/sbin:/bin'
+STANDARD_UNITS = {
+    'postfix.service', 'postfix@.service',
+    'postfix.socket', 'postfix@.socket',
+    'postfix-resolvconf.service', 'postfix-resolvconf.path',
+}
+INSTANCE = re.compile(r'postfix@[^/\s]+\.(?:service|socket)')
+TEMPLATES = {'postfix@.service', 'postfix@.socket'}
+# Debian's packaged daemon names are only an ambiguity guard when procfs denies
+# executable inspection, never sufficient identity for stopping/killing a PID.
+DAEMON_NAMES = {'master', 'anvil', 'bounce', 'cleanup', 'discard', 'dnsblog', 'error',
+                'flush', 'fsstone', 'lmtp', 'local', 'nqmgr', 'oqmgr', 'pickup', 'pipe',
+                'postlogd', 'postscreen', 'proxymap', 'qmgr', 'qmqpd', 'scache', 'showq',
+                'smtp', 'smtpd', 'spawn', 'tlsmgr', 'tlsproxy', 'trivial-rewrite',
+                'verify', 'virtual', 'postfix', 'postmulti', 'postdrop', 'postqueue'}
+
+def is_postfix_unit(name):
+    return name in STANDARD_UNITS or INSTANCE.fullmatch(name) is not None
+
+def command(args):
+    result = subprocess.run(args, capture_output=True, text=True, timeout=30)
+    if result.returncode:
+        raise RuntimeError(f'{" ".join(args)} exited {result.returncode}: '
+                           + (result.stderr.strip()[:1500] or '(no stderr)'))
+    return result.stdout
+
+try:
+    if os.geteuid() != 0:
+        raise ValueError('Root is required to inspect process ownership.')
+    if len(sys.argv) != 2 or sys.argv[1] not in {
+            '--units', '--stop-units', '--check-stopped', '--check-removed'}:
+        raise ValueError('Use --units, --stop-units, --check-stopped or --check-removed.')
+    mode = sys.argv[1]
+    runtime = {}
+    # Include not-found/masked units that systemd still has in memory. Never
+    # equate LoadState=not-found or package absence with a stopped service.
+    output = command(['systemctl', 'list-units', '--all', '--plain', '--full',
+                      '--no-legend', '--no-pager', 'postfix*'])
+    for line in output.splitlines():
+        fields = line.split()
+        if not fields:
+            continue
+        if len(fields) < 4:
+            raise ValueError('Malformed systemd unit inventory.')
+        unit, load, active, sub = fields[:4]
+        if is_postfix_unit(unit):
+            runtime[unit] = (load, active, sub)
+    units = set(STANDARD_UNITS) | runtime.keys()
+    if mode in {'--units', '--check-removed'}:
+        output = command(['systemctl', 'list-unit-files', '--full', '--no-legend',
+                          '--no-pager', 'postfix*'])
+        for line in output.splitlines():
+            fields = line.split()
+            if fields and is_postfix_unit(fields[0]):
+                units.add(fields[0])
+    if mode == '--units':
+        print('\n'.join(sorted(units)))
+        raise SystemExit(0)
+    if mode == '--stop-units':
+        # Only instantiated runtime units need stopping. Templates cannot run;
+        # absent/inactive units would make systemctl stop fail needlessly.
+        pending = [unit for unit, (_, active, _) in runtime.items()
+                   if unit not in TEMPLATES and active != 'inactive']
+        print('\n'.join(sorted(pending, key=lambda u: (u.endswith('.service'), u))))
+        raise SystemExit(0)
+
+    errors = []
+    for unit, (load, active, sub) in sorted(runtime.items()):
+        if active != 'inactive':
+            errors.append(f'{unit}: LoadState={load}, ActiveState={active}, SubState={sub}')
+    # Executable paths catch detached daemons and deleted executables. Cgroup
+    # membership catches remaining workers even if the unit file has vanished.
+    # Do not match a bare process name such as "master" and never signal a PID.
+    for process in Path('/proc').iterdir():
+        if not process.name.isdecimal():
+            continue
+        try:
+            groups = process.joinpath('cgroup').read_text()
+            try:
+                executable = os.readlink(process / 'exe').removesuffix(' (deleted)')
+            except FileNotFoundError:
+                executable = ''  # exited process, kernel thread or zombie
+            except PermissionError:
+                executable = ''
+                # LXC root need not have ptrace access to every unrelated
+                # process. Keep cgroup detection and fail on ambiguous daemon
+                # names instead of requiring extra CT capabilities.
+                name = process.joinpath('comm').read_text().strip()
+                if name in DAEMON_NAMES:
+                    errors.append(f'Cannot exclude a Postfix process: PID={process.name}, '
+                                  f'comm={name}; executable inspection denied')
+            group_owned = any(is_postfix_unit(component)
+                              for line in groups.splitlines()
+                              for component in line.split(':', 2)[-1].split('/'))
+            exe_owned = (executable.startswith(('/usr/lib/postfix/', '/usr/libexec/postfix/'))
+                         or executable in {'/usr/sbin/postfix', '/usr/sbin/postmulti',
+                                           '/usr/sbin/postdrop', '/usr/sbin/postqueue'})
+            if group_owned or exe_owned:
+                errors.append(f'Postfix process remains: PID={process.name}, '
+                              f'executable={executable or "unavailable"}')
+        except FileNotFoundError:
+            continue  # process exited during the read-only scan
+        except OSError as exc:
+            errors.append(f'Cannot inspect PID {process.name}: {exc.strerror}')
+    if mode == '--check-removed':
+        package = subprocess.run(['dpkg-query', '-W', '-f=${db:Status-Status}', 'postfix'],
+                                 capture_output=True, text=True, timeout=30)
+        absent = (package.returncode == 0 and package.stdout.strip() == 'not-installed')
+        absent = absent or (package.returncode == 1 and not package.stdout.strip()
+                            and package.stderr.strip() == 'dpkg-query: no packages found matching postfix')
+        if not absent:
+            errors.append('Postfix package is not confirmed purged: '
+                          + (package.stdout.strip() or package.stderr.strip()[:500] or 'unknown status'))
+        for unit in sorted(units):
+            # is-enabled returns nonzero for masked units; validate its text
+            # and reject runtime-only masks, which would disappear at boot.
+            result = subprocess.run(['systemctl', 'is-enabled', unit],
+                                    capture_output=True, text=True, timeout=30)
+            if result.returncode not in (0, 1) or result.stdout.strip() != 'masked':
+                errors.append(f'Persistent Postfix mask missing: {unit}')
+    if errors:
+        for error in errors:
+            print('ERROR: ' + error, file=sys.stderr)
+        raise SystemExit(1)
+    print('Postfix units and processes stopped.' if mode == '--check-stopped' else
+          'Postfix package purged; units masked; no remaining Postfix processes.')
+except Exception as exc:
+    print('ERROR: Postfix verification: ' + str(exc), file=sys.stderr)
+    raise SystemExit(1)
+POSTFIX_CHECK_HELPER
+
 # ── Reusable verification/report helper ────────────────────────────────────────
 # This helper reads policy/runtime state. Its only writes are its lock and report.
 # It never changes firewall rules, installs updates or restarts applications.
@@ -1672,6 +2529,7 @@ os.environ['PATH'] = '/usr/sbin:/usr/bin:/sbin:/bin'
 
 STATE = Path('/var/lib/lab-hardening')
 errors, warnings, listeners = [], [], []
+timezone = None
 
 def run(args, timeout=30):
     try:
@@ -1707,6 +2565,13 @@ try:
                     f'Managed file changed: {path}; review and rerun the hardening block.')
         except OSError:
             errors.append(f'Managed file missing: {path}')
+
+    # Check selected zone and file identity without freezing tzdata database bytes.
+    tz_result = subprocess.run(['/usr/local/sbin/lab-timezone', 'check', str(STATE / 'policy.json')],
+                               text=True, capture_output=True, timeout=30)
+    timezone = tz_result.stdout.strip() if tz_result.returncode == 0 else None
+    require(tz_result.returncode == 0, 'Timezone policy verification failed: '
+            + (tz_result.stderr.strip()[:1000] or 'see guest timezone files'))
 
     # Runtime readback, including dotted interface names through procfs globbing.
     for line in read('/etc/sysctl.d/99-hardening.conf').splitlines():
@@ -1808,6 +2673,14 @@ try:
             require(run(['systemctl', 'is-enabled', unit])[1] == 'masked', f'{unit} is not masked.')
             require(run(['systemctl', 'is-active', '--quiet', unit])[0] != 0, f'{unit} is active.')
 
+    if policy['remove_postfix']:
+        # Keep the detailed diagnostic in the hardening report. This helper is
+        # read-only and checks runtime units/processes even after package purge.
+        postfix = subprocess.run(['/usr/local/sbin/lab-postfix-check', '--check-removed'],
+                                 capture_output=True, text=True, timeout=90)
+        require(postfix.returncode == 0,
+                'Postfix removal incomplete: ' + (postfix.stderr.strip()[:4000] or 'verification failed'))
+
     # Inventory excludes loopback; optional port lists verify external listeners.
     rc, sockets = run(['ss', '-H', '-lntu'])
     require(rc == 0, 'Cannot inspect listening sockets.')
@@ -1842,7 +2715,7 @@ except Exception as exc:
 
 status = 'FAIL' if errors else ('WARN' if warnings else 'OK')
 report = {'status': status, 'checked_at': int(time.time()), 'errors': errors,
-          'warnings': warnings, 'external_listeners': listeners}
+          'warnings': warnings, 'external_listeners': listeners, 'timezone': timezone}
 temporary = STATE / ('status.' + str(os.getpid()) + '.tmp')
 temporary.write_text(json.dumps(report, indent=2) + '\n')
 temporary.chmod(0o644)
@@ -1938,6 +2811,22 @@ install -m 0644 "$stage/index-refreshed" /var/lib/lab-hardening/last-index-refre
 
 # ── Remove and verify unwanted services ───────────────────────────────────────
 remove_packages=()
+if [[ $REMOVE_POSTFIX == 1 ]]; then
+  # Scope operations to known Debian Postfix units and actual instances only.
+  # Read inventory before masking/purging; a not-found unit can still be active.
+  postfix_unit_text=$(/usr/local/sbin/lab-postfix-check --units)
+  mapfile -t postfix_units <<< "$postfix_unit_text"
+  postfix_stop_text=$(/usr/local/sbin/lab-postfix-check --stop-units)
+  if [[ -n $postfix_stop_text ]]; then
+    mapfile -t postfix_stop_units <<< "$postfix_stop_text"
+    echo 'Stopping Postfix units before package removal...'
+    timeout 60 systemctl stop "${postfix_stop_units[@]}"
+  fi
+  # Mask without --force: never overwrite a local custom unit. No blanket
+  # process-name kills. If stopping or masking fails, preserve the CT and fail.
+  systemctl mask "${postfix_units[@]}"
+  /usr/local/sbin/lab-postfix-check --check-stopped
+fi
 if [[ $KEEP_SSH == 0 ]]; then
   for unit in ssh.service ssh.socket; do
     if [[ $(systemctl show "$unit" -p LoadState --value) != not-found ]]; then
@@ -1949,7 +2838,10 @@ fi
 [[ $REMOVE_POSTFIX == 0 ]] || remove_packages+=(postfix)
 installed_remove=()
 for package in "${remove_packages[@]}"; do
-  if [[ $(dpkg-query -W -f='${db:Status-Status}' "$package" 2>/dev/null || true) == installed ]]; then
+  package_status=$(dpkg-query -W -f='${db:Status-Status}' "$package" 2>/dev/null || true)
+  if [[ $package_status == installed ]] ||
+     [[ $package == postfix && -n $package_status && $package_status != not-installed ]]; then
+    # Include Postfix config-files/partial states, not just fully installed.
     installed_remove+=("$package")
   fi
 done
@@ -1963,6 +2855,11 @@ fi
 
 # ── Activate common policy ────────────────────────────────────────────────────
 systemctl daemon-reload
+if [[ $REMOVE_POSTFIX == 1 ]]; then
+  # Package maintainer scripts can remove a mask; restore our explicit policy.
+  systemctl mask "${postfix_units[@]}"
+  /usr/local/sbin/lab-postfix-check --check-removed
+fi
 install -d -o root -g systemd-journal -m 2755 /var/log/journal
 systemctl restart systemd-journald.service
 journalctl --flush
@@ -1988,6 +2885,8 @@ for source in stage.rglob('*'):
 policy = {'profile': profile, 'keep_ssh': keep == '1', 'remove_postfix': remove == '1',
           'update_max_age_hours': int(age), 'tcp_ports': list(map(int, tcp.split())),
           'udp_ports': list(map(int, udp.split())), 'files': files,
+          'version': '1.2.0',
+          'timezone': json.loads((stage / 'timezone-policy.json').read_text()),
           'journal': {'Storage': 'persistent', 'Compress': 'yes', 'SystemMaxUse': maximum + 'M',
                       'SystemKeepFree': '128M', 'RuntimeMaxUse': runtime + 'M',
                       'MaxRetentionSec': days + 'day', 'RateLimitIntervalSec': '30s', 'RateLimitBurst': '10000'}}
@@ -2003,6 +2902,9 @@ if ! systemctl start lab-hardening-check.service; then
   false
 fi
 cat /var/lib/lab-hardening/status.json
+effective_timezone=$(/usr/local/sbin/lab-timezone check /var/lib/lab-hardening/policy.json)
+timezone_action=set; [[ $PRESERVE_TIMEZONE != 1 ]] || timezone_action=preserved
+printf "Timezone: %s (%s; guest files verified).\n" "$effective_timezone" "$timezone_action"
 printf '\nShared hardening applied (%s). Backups: %s\n' "$PROFILE" "$backup"
 echo 'Manual check: /usr/local/sbin/lab-hardening-check'
 echo 'Local reports: /var/lib/lab-hardening/status.json and journalctl -u lab-hardening-check'
@@ -2010,37 +2912,64 @@ echo 'Application image updates, source-specific UFW rules and app health remain
 LAB_HARDENING_GUEST
 )
 # ── End shared hardening block ────────────────────────────────────────────────
+# END CANONICAL HARDENING v1.2.0
 
-# ── Final verification after hardening ────────────────────────────────────────
-# The common block hard-fails on FAIL; WARN for reviewed restarts is successful.
-# Listener inventory is separate from the application's real /health check.
-if ! pct exec "$CT_ID" -- /usr/local/bin/flatnotes-maint.sh check --initial; then
-  echo "ERROR: Final application/image/firewall verification failed; CT $CT_ID is preserved." >&2
-  false
-fi
-UFW_RULES_AFTER="$(pct exec "$CT_ID" -- bash -lc '
-  set -euo pipefail
-  sha256sum /etc/ufw/{before,after,user}{,6}.rules
-')"
-[[ "$UFW_RULES_AFTER" == "$UFW_RULES_BEFORE" ]] || {
-  echo "ERROR: UFW rule files changed during hardening; CT $CT_ID is preserved." >&2
+# COMMON UFW PRESERVATION CHECK
+INSTALL_STAGE="final verification"
+UFW_RULES_AFTER=$(pct exec "$CT_ID" -- bash -s <<'UFW_SNAPSHOT_AFTER'
+set -euo pipefail
+sha256sum /etc/ufw/{before,after,user}{,6}.rules
+iptables -w 5 -S
+ip6tables -w 5 -S
+UFW_SNAPSHOT_AFTER
+)
+[[ $UFW_RULES_BEFORE == "$UFW_RULES_AFTER" ]] || {
+  echo 'ERROR: Persistent/effective UFW rules changed during hardening; CT preserved.' >&2
   false
 }
-pct exec "$CT_ID" -- bash -s -- "$APP_PORT" "${UFW_ALLOWED_SOURCES[@]}" <<'FINAL_UFW_CHECK'
-set -euo pipefail
-port=$1; shift
-for source in "$@"; do
-  tool=iptables; prefix=ufw
-  if [[ $source == *:* ]]; then tool=ip6tables; prefix=ufw6; fi
-  "$tool" -w 5 -C "$prefix-user-input" -s "$source" -p tcp -m tcp --dport "$port" -j ACCEPT
-done
-FINAL_UFW_CHECK
-HARDENING_STATUS="$(pct exec "$CT_ID" -- python3 -c 'import json; print(json.load(open("/var/lib/lab-hardening/status.json"))["status"])')"
-case "$HARDENING_STATUS" in
+unset UFW_RULES_BEFORE UFW_RULES_AFTER
+# END COMMON UFW PRESERVATION CHECK
+
+pct exec "$CT_ID" -- /usr/local/bin/flatnotes-maint.sh check --initial
+pct exec "$CT_ID" -- /usr/local/sbin/lab-hardening-check
+# COMMON FINAL TIMEZONE CHECK
+EFFECTIVE_GUEST_TIMEZONE=$(pct exec "$CT_ID" -- /usr/local/sbin/lab-timezone check /var/lib/lab-hardening/policy.json)
+[[ $EFFECTIVE_GUEST_TIMEZONE == "$APP_TZ" ]] || {
+  echo 'ERROR: Planned application timezone differs from the final guest timezone; CT preserved.' >&2
+  false
+}
+unset TIMEZONE_PLAN
+# END COMMON FINAL TIMEZONE CHECK
+
+HARDENING_STATUS=$(pct exec "$CT_ID" -- python3 -c 'import json; print(json.load(open("/var/lib/lab-hardening/status.json"))["status"])')
+case $HARDENING_STATUS in
   OK|WARN) ;;
-  *) echo "ERROR: Hardening status is $HARDENING_STATUS; CT $CT_ID is preserved." >&2; false ;;
+  *) echo 'ERROR: Final common hardening report failed; CT preserved.' >&2; false ;;
 esac
-echo "  Final verification passed: Flatnotes healthy, image verified, UFW rules preserved; hardening $HARDENING_STATUS."
+
+INSTALL_STAGE="timer and protection"
+pct exec "$CT_ID" -- bash -s -- "$AUTO_UPDATE" "$UPDATE_TIME" <<'TIMER_FINAL'
+set -euo pipefail
+systemctl daemon-reload
+grep -qx "OnCalendar=\*-\*-\* $2:00" /etc/systemd/system/flatnotes-update.timer
+grep -qx 'Persistent=true' /etc/systemd/system/flatnotes-update.timer
+systemd-analyze calendar "*-*-* $2:00" >/dev/null
+if [[ $1 == 1 ]]; then
+  systemctl enable --now flatnotes-update.timer
+  systemctl is-enabled --quiet flatnotes-update.timer
+  systemctl is-active --quiet flatnotes-update.timer
+  next=$(systemctl show flatnotes-update.timer -p NextElapseUSecRealtime --value)
+  [[ -n $next && $next != 0 && $next != n/a ]]
+else
+  systemctl disable --now flatnotes-update.timer
+  enabled=$(systemctl is-enabled flatnotes-update.timer) || [[ $? == 1 ]]
+  active=$(systemctl is-active flatnotes-update.timer) || [[ $? == 3 ]]
+  [[ $enabled == disabled && $active == inactive ]]
+fi
+calendar=$(systemctl show flatnotes-update.timer -p TimersCalendar --value)
+[[ $calendar == *"OnCalendar=*-*-* $2:00"* ]]
+systemctl show flatnotes-update.timer -p UnitFileState -p ActiveState -p TimersCalendar -p NextElapseUSecRealtime
+TIMER_FINAL
 
 # ── Proxmox UI description ────────────────────────────────────────────────────
 FN_DESC_LINK="http://${CT_IP}:${APP_PORT}${APP_WEB_PATH}"
@@ -2057,82 +2986,64 @@ pct set "$CT_ID" --description "$FN_DESC"
 pct set "$CT_ID" --protection 1
 
 
-cat <<OPERATIONS
+# ── Summary ───────────────────────────────────────────────────────────────────
+INSTALL_STAGE="summary"
+CT_IPS=$(pct exec "$CT_ID" -- ip -o address show scope global | awk '{print $4}' | paste -sd ' ')
+cat <<SUMMARY
 
-  FLATNOTES — OPERATIONS
+  FLATNOTES
 
-  CONTAINER     $HN | CT $CT_ID | $CT_IP
-  WEB/ADMIN     http://$CT_IP:$APP_PORT${APP_WEB_PATH}
-  ALLOWED FROM  $FIREWALL_ACCESS_LABEL
-  FIREWALL      UFW inside the CT, IPv4 and IPv6; no PVE firewall dependency
-  HARDENING     $HARDENING_STATUS | v1.1.1 LXC policy; checked after boot and hourly
-  OS UPDATES    automatic Debian packages; no automatic reboot; needrestart report-only
-  APP UPDATE    $AUTO_UPDATE | daily $UPDATE_TIME ($APP_TZ)
-  IMAGES        exact local IDs, Pull=never; old images retained for review
+  Container:  $HN | CT $CT_ID | $CT_IPS
+              Debian 13, unprivileged, protection enabled; root password set
+              Console: pct enter $CT_ID | SSH preserved: $HARDENING_KEEP_SSH (no added SSH access)
 
-  RUN ON THE PROXMOX HOST
-    pct enter $CT_ID
+  Access:     http://${CT_IP}:${APP_PORT}${APP_WEB_PATH}
+              TCP $APP_PORT allowed from: $FIREWALL_ACCESS_LABEL
+              Auth: $FLATNOTES_AUTH_TYPE | NPM upstream: http://${CT_IP}:${APP_PORT}
+  Firewall:   UFW inside CT, IPv4/IPv6; no Proxmox firewall dependency
+  Inventory:  TCP=${HARDENING_TCP_PORTS:-inventory-only}; UDP=${HARDENING_UDP_PORTS:-inventory-only}
+              Inventory does not grant access. No backend listener is required.
+
+  Timezone:   $EFFECTIVE_GUEST_TIMEZONE ($TIMEZONE_ACTION); guest and Flatnotes TZ/use verified
+  Image:      $APP_IMAGE
+              $APP_IMAGE_ID | Pull=never; default image entrypoint retained
+  Files:      $QUADLET_FILE
+              /opt/flatnotes/.env; /opt/flatnotes/access.json; /opt/flatnotes/timezone-plan.json
+              /opt/flatnotes/flatnotes.env (credentials, 0600)
+              /opt/flatnotes/data (notes, attachments and .flatnotes search index)
+
+  Updates:    AUTO_UPDATE=$AUTO_UPDATE | daily $UPDATE_TIME in $EFFECTIVE_GUEST_TIMEZONE
+              Debian unattended updates; no automatic reboot; needrestart report only
+              Common verification after boot and hourly; final hardening: $HARDENING_STATUS (v1.2.0)
+  Recovery:   Verify PBS/PVE coverage of the CT and all /opt/flatnotes state before updating.
+              No external bind mount is created. Any later external mount needs its own backup.
+              --yes creates/verifies no backup. No automatic image downgrade after candidate start.
+              Image rollback cannot undo persistent data or search-index changes.
+
+  Run on Proxmox:
+    pct exec $CT_ID -- /usr/local/bin/flatnotes-maint.sh check
     pct exec $CT_ID -- /usr/local/bin/flatnotes-maint.sh version
-
-  RUN INSIDE THE CT
+    pct exec $CT_ID -- /usr/local/sbin/lab-hardening-check
+  Run inside CT:
     /usr/local/bin/flatnotes-maint.sh check
-    /usr/local/sbin/lab-hardening-check
-    cat /var/lib/lab-hardening/status.json
+    /usr/local/bin/flatnotes-maint.sh version
     /usr/local/bin/flatnotes-maint.sh update $APP_TAG
-    ufw status verbose
+    /usr/local/sbin/lab-hardening-check
     journalctl -u flatnotes.service --no-pager -n 80
 
-  ACCESS CHECK
-    Test the web endpoint from your intended client/proxy.
-    If you restricted sources, also test from outside the allowed list.
-    Installer rule checks do not prove the full network path.
-    Add/delete UFW rules directly; do not restart ufw.service while apps run.
-
-  RECOVERY
-    Verify a matching PBS/PVE checkpoint before updates; --yes only skips prompts.
-    If FUSE is enabled, use stop-mode PBS. Back up external bind mounts separately.
-    Flatnotes can restore its prior image; content edits are never undone.
-    The helper changes one component at a time; earlier successes remain applied.
-    Creators build new CTs. Existing CTs require a reviewed control-file migration.
-
-OPERATIONS
-
-# ── Summary ───────────────────────────────────────────────────────────────────
-echo ""
-echo "    CT: $CT_ID | IP: ${CT_IP} | Web UI: http://${CT_IP}:${APP_PORT}${APP_WEB_PATH}"
-if [[ -n "$APP_FQDN" ]]; then
-  echo "    Public:  https://${APP_FQDN}${APP_WEB_PATH}"
+  Verification: application checks passed; six UFW files and both filter tables preserved.
+                Common result: $HARDENING_STATUS. Review WARN entries in /var/lib/lab-hardening/status.json.
+                Still required: client/proxy access, denied-source tests, DHCP renewal,
+                reviewed reboot persistence and backup/restore acceptance.
+SUMMARY
+if [[ -n $APP_FQDN ]]; then
+  printf '  Public URL (operator-configured proxy/DNS): https://%s%s\n' "$APP_FQDN" "$APP_WEB_PATH"
 fi
-echo "    Hardening: $HARDENING_STATUS (WARN means review the report; no automatic CT restart)"
-echo "    Image:   ${APP_IMAGE}"
-echo "    Auth:    ${FLATNOTES_AUTH_TYPE}$([ -n "$FLATNOTES_USERNAME" ] && echo " (user: ${FLATNOTES_USERNAME})")"
-echo "    Quadlet: ${QUADLET_FILE}"
-echo "    Creds:   ${APP_ENV_FILE}"
-echo "    Data:    ${APP_DIR}/data"
-echo "    Policy:  $([ "$AUTO_UPDATE" -eq 1 ] && echo "auto-update (re-pull pinned ${APP_TAG})" || echo "pinned (manual)")"
-if [[ "$FLATNOTES_AUTH_TYPE" == "totp" ]]; then
-  echo ""
-  echo "    !! TOTP setup required — add this key to your authenticator app:"
-  echo "       Authenticator key: ${FLATNOTES_TOTP_MANUAL_KEY}"
-  echo "       QR code + key as printed by Flatnotes:"
-  echo "       pct exec $CT_ID -- journalctl -u flatnotes.service -o cat --no-pager -n 60"
+if [[ $FLATNOTES_AUTH_TYPE == totp ]]; then
+  # Explicit one-time enrollment output, never part of generic diagnostics or MOTD.
+  printf '\n  TOTP enrollment key (store privately): %s\n' "$FLATNOTES_TOTP_MANUAL_KEY"
 fi
-echo ""
-echo "    pct exec $CT_ID -- systemctl status flatnotes.service"
-echo "    pct exec $CT_ID -- journalctl -u flatnotes.service --no-pager -n 50"
-echo "    pct exec $CT_ID -- /usr/local/bin/flatnotes-maint.sh update <tag>  # e.g. v5.6.0 — no :latest"
-echo "    pct exec $CT_ID -- /usr/local/bin/flatnotes-maint.sh auto-update   # re-pull pinned tag (if AUTO_UPDATE=1)"
-echo "    pct exec $CT_ID -- /usr/local/bin/flatnotes-maint.sh version"
-echo "    Backup/restore: use PBS or PVE snapshots"
-echo ""
-echo "    NPM reverse proxy: http | ${CT_IP}:${APP_PORT} (no websockets needed)"
-echo "    Port ${APP_PORT} listens on all CT interfaces (Network=host) — access follows the UFW source choice shown above."
-if [[ "$FLATNOTES_AUTH_TYPE" == "none" || "$FLATNOTES_AUTH_TYPE" == "read_only" ]]; then
-  echo "    WARNING: auth=${FLATNOTES_AUTH_TYPE} — anyone reaching port ${APP_PORT} can $([ "$FLATNOTES_AUTH_TYPE" = none ] && echo 'read and edit' || echo 'read') your notes."
+unset FLATNOTES_TOTP_MANUAL_KEY FLATNOTES_USERNAME
+if [[ $PODMAN_FUSE_OVERLAY == 1 ]]; then
+  printf '  FUSE storage: use reviewed stop-mode backups; snapshot freezing can deadlock.\n'
 fi
-if [[ "$PODMAN_FUSE_OVERLAY" -eq 1 ]]; then
-  echo "    Backups: fuse=1 + fuse-overlayfs can deadlock under snapshot-mode vzdump/PBS (freezer)."
-  echo "             Use stop-mode backups for this CT, or test PODMAN_FUSE_OVERLAY=0."
-fi
-echo "    To change credentials: edit ${APP_ENV_FILE} then systemctl restart flatnotes.service"
-echo ""
