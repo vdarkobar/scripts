@@ -92,21 +92,7 @@ Run on the **RTC VPS**:
 sudo bash matrix-rtc.sh
 ```
 
-## 5. Integrate an existing Matrix server
-
-If the revised Matrix creator already wrote the RTC settings, skip this step. Otherwise, copy `matrixrtc-integrate-existing.py` from the package into the Matrix LXC and run **inside that LXC as root**:
-
-```bash
-apt-get install python3-yaml
-python3 matrixrtc-integrate-existing.py \
-  --rtc-url https://rtc.your-domain.tld/livekit/jwt --apply
-```
-
-Review the result and type **APPLY**. The helper validates, backs up and updates **`/opt/matrix/synapse/homeserver.yaml`**, then restarts Synapse. Alternatively, follow the manual YAML/backup steps printed in the RTC installer's summary.
-
-If NPM serves a static client `.well-known` response, merge the RTC focus there too, preserving `m.homeserver`. No Element Web configuration change is needed for the supplied baseline.
-
-## 6. Verify and keep working
+## 5. Verify and keep working
 
 **RTC VPS:**
 
@@ -119,13 +105,3 @@ curl -fsS https://matrix.your-domain.tld/.well-known/matrix/client \
 ```
 
 Expected: maintenance checks pass; validation returns **401** without a token; discovery contains `org.matrix.msc4143.rtc_foci` with `livekit_service_url` **`https://rtc.your-domain.tld/livekit/jwt`**. Reopen **Element X on both phones**, then test a call across Wi-Fi/mobile data.
-
-**Older installer showing “Service unreachable” / v1 route 404:** run the corrected installer on the existing RTC VPS and choose **ROUTES**. It backs up and repairs the proxy rules.
-
-**Later hardening runs — preserve RTC firewall rules:**
-
-```bash
-sudo env ENABLE_UFW=0 /usr/local/sbin/phase2-hardening.sh
-```
-
-If phase 2 reset the firewall, run `sudo matrixrtc-maint firewall-repair`, then `sudo matrixrtc-maint check`.
