@@ -1,4 +1,4 @@
-# Matrix + RTC — quick setup guide
+# Synapse [matrix] + RTC — quick setup guide
 
 **Domain: `your-domain.tld` · Debian 13 RTC VPS · Updated 9 September 2026**
 
