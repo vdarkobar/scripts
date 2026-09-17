@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
 set -Eeo pipefail
+umask 022
+export LC_ALL=C
 
 # Fresh-install creator; run on the Proxmox host. Edit the top Config block.
 # Lab baseline: Tier 1 pinned Quadlet images, host networking, PBS/PVE recovery.
-# Revision: 2026-09-13 — embedded approved hardening v1.1.1; final verification.
+# Revision: 2026-09-17 — common contract 1.0.0; canonical hardening v1.2.0.
+# One reusable verifier gates initial, final, manual and post-update checks.
 # PostgreSQL verification fix: validate PGDATA owner UID and mode 0700; its group may be root.
 # Standalone creator: no separate hardening file/download is required.
 # Input fix: NPM subnet entries produce a host-address hint without a traceback.
@@ -15,10 +18,7 @@ set -Eeo pipefail
 # https://manpages.debian.org/trixie/podman/quadlet.5.en.html
 # https://manpages.debian.org/trixie/ufw/ufw.8.en.html
 # https://github.com/element-hq/element-call/blob/main/docs/self_hosting.md
-# Provisioning must create system files readable by unprivileged services (_apt).
-# Restrict permissions locally when writing credentials; do not pass 077 to pct.
-umask 022
-export LC_ALL=C
+# Provisioning uses 022; credential writes use 077 locally.
 
 # ── Config ────────────────────────────────────────────────────────────────────
 CT_ID=""                             # empty = next free cluster ID
@@ -33,7 +33,12 @@ DEBIAN_VERSION=13
 MATRIX_DOMAIN="example.com"          # REQUIRED: replace; server identity is matrix.<domain>
 SYNAPSE_PORT=8008
 ELEMENT_PORT=8080
-APP_TZ="Europe/Berlin"
+# BEGIN COMMON: TIMEZONE INPUTS
+# COMMON TIMEZONE INPUTS
+SERVER_TIMEZONE="${SERVER_TIMEZONE-Europe/Berlin}"
+PRESERVE_EXISTING_TIMEZONE="${PRESERVE_EXISTING_TIMEZONE-0}"
+APP_TZ=""
+# END COMMON: TIMEZONE INPUTS
 MAX_UPLOAD_SIZE="90M"                # headroom below a 100 MB upstream request cap; also configure NPM
 TAGS="matrix;podman;quadlet;lxc"
 
@@ -84,26 +89,26 @@ MAPTILER_KEY=""
 AUTO_UPDATE=0
 UPDATE_TIME="03:00"
 INITIAL_WAIT_SECONDS=180              # fresh install: fail early on a crash loop
-SYNAPSE_WAIT_SECONDS=1800             # upgrades: allow long migrations; never auto-downgrade
+UPDATE_WAIT_SECONDS=1800             # upgrades: allow long migrations; never auto-downgrade
 PODMAN_FUSE_OVERLAY=1                 # lab default; use stop-mode PBS backups with FUSE
 # Native overlay (=0) still needs validation under snapshot-mode backup with I/O.
 EXTRA_PACKAGES=()
-CLEANUP_ON_FAIL=1                     # until first service start; CT preserved after that
+CLEANUP_ON_FAIL=0                     # opt-in 1: ordinary early failure only; signals preserve CT
 SCRIPT_URL="https://raw.githubusercontent.com/vdarkobar/scripts/main/bash/matrix-quadlet.sh"
 SCRIPT_LOCAL="/root/matrix-quadlet.sh"
 
 # Shared hardening: final port lists inventory/reject external listeners only;
 # they do not create UFW rules or prove health. Empty = inventory-only.
-HARDENING_PROFILE="lxc"              # Debian 13 service LXC; no VPS/VM profile
-HARDENING_RP_FILTER="1"              # 1=strict; 2=loose for asymmetric paths
-HARDENING_KEEP_SSH="0"               # 0=remove SSH; manage with pct enter/exec
-HARDENING_REMOVE_POSTFIX="1"         # 1=remove Postfix; 0=keep intentional mail service
-HARDENING_JOURNAL_DAYS="14"
-HARDENING_JOURNAL_MAX_MB="256"
-HARDENING_JOURNAL_RUNTIME_MB="64"
-HARDENING_UPDATE_MAX_AGE_HOURS="72"
-HARDENING_TCP_PORTS="auto"           # Creator-only auto = finalized Synapse + Element ports
-HARDENING_UDP_PORTS="68 546"          # DHCPv4/v6 can listen even with ip6=manual
+HARDENING_PROFILE="${HARDENING_PROFILE-lxc}"              # Debian 13 service LXC; no VPS/VM profile
+HARDENING_RP_FILTER="${HARDENING_RP_FILTER-1}"              # 1=strict; 2=loose for asymmetric paths
+HARDENING_KEEP_SSH="${HARDENING_KEEP_SSH-0}"               # 0=remove SSH; manage with pct enter/exec
+HARDENING_REMOVE_POSTFIX="${HARDENING_REMOVE_POSTFIX-1}"         # 1=remove Postfix; 0=keep intentional mail service
+HARDENING_JOURNAL_DAYS="${HARDENING_JOURNAL_DAYS-14}"
+HARDENING_JOURNAL_MAX_MB="${HARDENING_JOURNAL_MAX_MB-256}"
+HARDENING_JOURNAL_RUNTIME_MB="${HARDENING_JOURNAL_RUNTIME_MB-64}"
+HARDENING_UPDATE_MAX_AGE_HOURS="${HARDENING_UPDATE_MAX_AGE_HOURS-72}"
+HARDENING_TCP_PORTS="${HARDENING_TCP_PORTS-auto}"           # Creator-only auto = finalized Synapse + Element ports
+HARDENING_UDP_PORTS="${HARDENING_UDP_PORTS-68 546}"          # DHCPv4/v6 can listen even with ip6=manual
 # If retaining SSH/mail, explicitly account for their external listeners in a
 # custom TCP list and separately review UFW access; no SSH/mail rule is added.
 
@@ -157,55 +162,89 @@ POSTGRES_QUADLET_SERVICE="matrix-postgres.service"
 #   /var/lib/lab-hardening/                            (policy, status, locks, refresh stamp)
 #   /var/backups/lab-hardening/<run>/                  (managed configuration backups)
 #   /etc/sysctl.d/99-hardening.conf
+#   /etc/localtime; existing /etc/timezone             (common set mode only)
+#   /usr/local/sbin/lab-timezone, lab-postfix-check
+#   /etc/systemd/system/ssh.{service,socket}            (common removal masks)
+#   /etc/systemd/system/postfix*.{service,socket,path}   (common removal masks)
+#   /opt/matrix/postgres-init.sh                       (DB role initialization; no secrets)
+#   /opt/matrix/install-policy.json                    (expected non-secret app policy)
+#   /run/matrix-install-bootstrap.json                 (temporary initial-check allowance)
+#   /etc/containers/{storage,containers}.conf
+#   /etc/locale.gen, /etc/default/locale, /etc/motd, /root/.bashrc
+#   /run/lock/{matrix-creator,matrix-maint}.lock         (host/guest respectively)
 
-# ── Trap cleanup ──────────────────────────────────────────────────────────────
-# rc is captured before the trap is reset; $LINENO is the failing line at top
-# level (BASH_LINENO[0] is 0 outside a function). After CREATED=1, failing
-# checks must use `false` rather than `exit 1` so this trap runs cleanup.
-STAGE="preflight"
-# Assigned inside the trap at runtime.
-# shellcheck disable=SC2154
-trap 'rc=$?;
-  trap - ERR
-  echo "  ERROR: ${STAGE:-unknown} failed (rc=$rc) near line ${LINENO:-?}" >&2
-  # BASH_COMMAND can contain an entire heredoc, including embedded code. Print
-  # only its command word; guest stderr above retains the original failure.
-  command_word=${BASH_COMMAND%%[[:space:]]*}
-  printf "  Command: %.80s (arguments/body omitted)\n" "$command_word" >&2
-  if [[ "${CLEANUP_ON_FAIL:-0}" -eq 1 && "${CREATED:-0}" -eq 1 ]]; then
-    echo "  Cleanup: stopping/destroying CT ${CT_ID} ..." >&2
-    pct stop "${CT_ID}" >/dev/null 2>&1 || true
-    pct destroy "${CT_ID}" >/dev/null 2>&1 || true
+# BEGIN COMMON: CREATOR TRAPS
+# COMMON CREATOR TRAPS
+INSTALL_STAGE="configuration"
+CREATED=0
+trap 'rc=$? err_line=$LINENO;
+  trap - ERR INT TERM HUP
+  if (( BASH_SUBSHELL > 0 )); then exit "$rc"; fi
+  printf "  ERROR: stage=%s rc=%s line=%s\n" "$INSTALL_STAGE" "$rc" "$err_line" >&2
+  printf "  Command text and arguments are omitted. External data is never removed by cleanup.\n" >&2
+  if [[ $rc != 129 && $rc != 130 && $rc != 143 && ${CLEANUP_ON_FAIL:-0} == 1 && ${CREATED:-0} == 1 ]]; then
+    if pct stop "$CT_ID" >/dev/null 2>&1; then
+      pct destroy "$CT_ID" >/dev/null 2>&1 || printf "  CT cleanup failed; inspect the preserved state.\n" >&2
+    else
+      printf "  CT stop failed; no destruction attempted.\n" >&2
+    fi
+  else
+    printf "  CT state is preserved for inspection.\n" >&2
   fi
   exit "$rc"
 ' ERR
-
-trap 'rc=130;
+trap 'rc=130; err_line=$LINENO;
   trap - ERR INT TERM HUP
-  echo "  Interrupted during ${STAGE:-unknown} (rc=$rc), line ${LINENO:-?}" >&2
-  if [[ "${CLEANUP_ON_FAIL:-0}" -eq 1 && "${CREATED:-0}" -eq 1 ]]; then
-    echo "  Cleanup: stopping/destroying CT ${CT_ID} ..." >&2
-    pct stop "${CT_ID}" >/dev/null 2>&1 || true
-    pct destroy "${CT_ID}" >/dev/null 2>&1 || true
-  fi
+  if (( BASH_SUBSHELL > 0 )); then exit "$rc"; fi
+  printf "  Interrupted: stage=%s rc=%s line=%s\n" "$INSTALL_STAGE" "$rc" "$err_line" >&2
+  printf "  CT and external data are preserved for inspection.\n" >&2
   exit "$rc"
-' INT TERM HUP
+' INT
+trap 'rc=143; err_line=$LINENO;
+  trap - ERR INT TERM HUP
+  if (( BASH_SUBSHELL > 0 )); then exit "$rc"; fi
+  printf "  Interrupted: stage=%s rc=%s line=%s\n" "$INSTALL_STAGE" "$rc" "$err_line" >&2
+  printf "  CT and external data are preserved for inspection.\n" >&2
+  exit "$rc"
+' TERM
+trap 'rc=129; err_line=$LINENO;
+  trap - ERR INT TERM HUP
+  if (( BASH_SUBSHELL > 0 )); then exit "$rc"; fi
+  printf "  Interrupted: stage=%s rc=%s line=%s\n" "$INSTALL_STAGE" "$rc" "$err_line" >&2
+  printf "  CT and external data are preserved for inspection.\n" >&2
+  exit "$rc"
+' HUP
+# END COMMON: CREATOR TRAPS
+
+# BEGIN COMMON: TIMEZONE VALIDATION
+# COMMON TIMEZONE VALIDATION
+[[ $PRESERVE_EXISTING_TIMEZONE =~ ^[01]$ ]] || {
+  echo 'ERROR: PRESERVE_EXISTING_TIMEZONE must be exactly 0 or 1.' >&2
+  exit 1
+}
+TIMEZONE_ACTION=preserved
+TIMEZONE_LABEL='preserve existing guest timezone'
+if [[ $PRESERVE_EXISTING_TIMEZONE == 0 ]]; then
+  [[ $SERVER_TIMEZONE =~ ^[A-Za-z0-9_+-]+(/[A-Za-z0-9_+-]+)*$ ]] || {
+    echo 'ERROR: SERVER_TIMEZONE must be a nonempty IANA timezone name.' >&2
+    exit 1
+  }
+  TIMEZONE_ACTION=set
+  TIMEZONE_LABEL=$SERVER_TIMEZONE
+fi
+# END COMMON: TIMEZONE VALIDATION
 
 # ── Preflight — root & commands ───────────────────────────────────────────────
-[[ "$(id -u)" -eq 0 ]] || { echo "  ERROR: Run as root on the Proxmox host." >&2; exit 1; }
+INSTALL_STAGE="preflight"
+[[ $EUID == 0 && -d /etc/pve ]] || { echo "  ERROR: Run as root on the Proxmox host." >&2; exit 1; }
 
 for cmd in pveversion sha256sum pvesh pveam pct pvesm qm curl python3 ip awk grep sed sort paste seq readlink cp chmod dpkg head tail tr mktemp mv flock rm sleep id cat bash install sync; do
   command -v "$cmd" >/dev/null 2>&1 || { echo "  ERROR: Missing required command: $cmd" >&2; exit 1; }
 done
 
-# Verified Proxmox-only caller: discard the HOST login marker before any guest
-# dispatch. A real SSH session running the standalone block inside a CT retains
-# its marker and is still refused when KEEP_SSH=0.
 pveversion >/dev/null
-unset SSH_CONNECTION
 
 [[ "$HN" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]] || { echo "ERROR: Invalid HN." >&2; exit 1; }
-[[ -f "/usr/share/zoneinfo/$APP_TZ" ]] || { echo "ERROR: Unknown APP_TZ." >&2; exit 1; }
 # Serialize creators so another invocation cannot race ID/hostname selection.
 exec 7>/run/lock/matrix-creator.lock
 flock -n 7 || { echo "ERROR: Another Matrix creator is running." >&2; exit 1; }
@@ -229,7 +268,7 @@ fi
 [[ -t 8 ]] || { echo "ERROR: Prompt input is not a terminal." >&2; exit 1; }
 
 if [[ -n "$CT_ID" ]]; then
-  [[ "$CT_ID" =~ ^[0-9]+$ ]] && (( CT_ID >= 100 && CT_ID <= 999999999 )) \
+  [[ "$CT_ID" =~ ^[1-9][0-9]{2,8}$ ]] && (( CT_ID >= 100 && CT_ID <= 999999999 )) \
     || { echo "  ERROR: CT_ID must be an integer >= 100." >&2; exit 1; }
   if pct status "$CT_ID" >/dev/null 2>&1 || qm status "$CT_ID" >/dev/null 2>&1; then
     echo "  ERROR: CT_ID $CT_ID is already in use on this node." >&2
@@ -237,7 +276,7 @@ if [[ -n "$CT_ID" ]]; then
   fi
 else
   CT_ID="$(pvesh get /cluster/nextid)"
-  [[ -n "$CT_ID" ]] || { echo "  ERROR: Could not obtain next CT ID." >&2; exit 1; }
+  [[ $CT_ID =~ ^[1-9][0-9]{2,8}$ ]] && (( CT_ID >= 100 )) || { echo "ERROR: Invalid allocated CT ID." >&2; exit 1; }
 fi
 
 # Creator scripts are not idempotent: a re-run would create a second CT with the
@@ -288,14 +327,15 @@ cat <<EOF2
   MatrixRTC:         ${MATRIX_RTC_AUTH_URL:-NOT configured — external LiveKit + authorization backend required}
   TURN guests:       $([ "$TURN_ALLOW_GUESTS" -eq 1 ] && echo "allowed" || echo "denied")
   MapTiler key:      $([ -n "$MAPTILER_KEY" ] && echo "set" || echo "unset (map feature disabled)")
-  Timezone:          $APP_TZ
+  Timezone plan:     $TIMEZONE_LABEL (validated inside the guest)
   Podman storage:    $([ "$PODMAN_FUSE_OVERLAY" -eq 1 ] && echo "fuse-overlayfs (fuse=1)" || echo "native overlay (no FUSE)")
   Tags:              $TAGS
   Auto-update:       $([ "$AUTO_UPDATE" -eq 1 ] && echo "enabled — daily at ${UPDATE_TIME} (re-pull ${SYNAPSE_TAG} / ${ELEMENT_TAG} / ${POSTGRES_TAG})" || echo "disabled (${SYNAPSE_TAG} / ${ELEMENT_TAG} / ${POSTGRES_TAG}, manual)")
-  Cleanup on fail:   $CLEANUP_ON_FAIL (until first service start; CT preserved after that)
+  Cleanup on fail:   $CLEANUP_ON_FAIL (opt-in only before persistent app startup)
+  Interruptions:     INT/TERM/HUP always preserve CT and external data
   Update recovery:   PBS/PVE checkpoint managed on the host; no in-CT archives
   Initial health:    ${INITIAL_WAIT_SECONDS}s; crash loops fail earlier
-  Migration wait:    ${SYNAPSE_WAIT_SECONDS}s; timeout never downgrades a migrated database
+  Migration wait:    ${UPDATE_WAIT_SECONDS}s; timeout never downgrades a migrated database
   ────────────────────────────────────────
   To change defaults, press Enter and
   edit the Config section at the top of
@@ -306,7 +346,7 @@ EOF2
 SCRIPT_SELF="$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")"
 
 response=""
-read -r -p "  Continue with these settings? [y/N]: " response <&8 || response=""
+read -r -p "  Continue with these settings? [y/N]: " response <&8
 case "$response" in
   [yY][eE][sS]|[yY]) ;;
   *)
@@ -341,12 +381,12 @@ echo ""
 
 # ── Config validation ─────────────────────────────────────────────────────────
 [[ "$HN" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]] || { echo "ERROR: HN must be a lowercase hostname." >&2; exit 1; }
-for number in CPU RAM DISK SYNAPSE_PORT ELEMENT_PORT SYNAPSE_WAIT_SECONDS INITIAL_WAIT_SECONDS TURN_USER_LIFETIME_MS; do
+for number in CPU RAM DISK SYNAPSE_PORT ELEMENT_PORT UPDATE_WAIT_SECONDS INITIAL_WAIT_SECONDS TURN_USER_LIFETIME_MS; do
   [[ ${!number} =~ ^[1-9][0-9]{0,9}$ ]] || { echo "ERROR: $number must be a positive decimal integer." >&2; exit 1; }
 done
 (( CPU >= 1 && RAM >= 2048 && DISK >= 16 )) || { echo "ERROR: CPU >= 1, RAM >= 2048 MB, DISK >= 16 GB required." >&2; exit 1; }
 [[ $DEBIAN_VERSION == 13 ]] || { echo "ERROR: This installer targets Debian 13 only." >&2; exit 1; }
-(( SYNAPSE_WAIT_SECONDS >= 60 && SYNAPSE_WAIT_SECONDS <= 86400 )) || { echo "ERROR: SYNAPSE_WAIT_SECONDS must be 60..86400." >&2; exit 1; }
+(( UPDATE_WAIT_SECONDS >= 30 && UPDATE_WAIT_SECONDS <= 86400 )) || { echo "ERROR: UPDATE_WAIT_SECONDS must be 30..86400." >&2; exit 1; }
 for port in SYNAPSE_PORT ELEMENT_PORT; do
   (( ${!port} >= 1024 && ${!port} <= 65535 && ${!port} != 5432 )) || { echo "ERROR: Invalid/reserved $port." >&2; exit 1; }
 done
@@ -362,7 +402,6 @@ done
 [[ $POSTGRES_TAG =~ ^18\.[0-9]+(-[a-z0-9.]+)?$ ]] || { echo "ERROR: Only PostgreSQL 18.MINOR[-variant] is supported by this data layout." >&2; exit 1; }
 [[ $MAX_UPLOAD_SIZE =~ ^[1-9][0-9]*[KMG]$ ]] || { echo "ERROR: Invalid upload size." >&2; exit 1; }
 [[ $UPDATE_TIME =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]] || { echo "ERROR: UPDATE_TIME must be HH:MM." >&2; exit 1; }
-[[ $APP_TZ =~ ^[A-Za-z0-9._+-]+(/[A-Za-z0-9._+-]+)+$ && -f /usr/share/zoneinfo/$APP_TZ ]] || { echo "ERROR: Invalid timezone." >&2; exit 1; }
 [[ $TAGS =~ ^[a-z0-9._-]+(;[a-z0-9._-]+)*$ ]] || { echo "ERROR: Invalid tags." >&2; exit 1; }
 [[ -z $MAPTILER_KEY || $MAPTILER_KEY =~ ^[A-Za-z0-9_-]+$ ]] || { echo "ERROR: Invalid MapTiler key." >&2; exit 1; }
 for pkg in "${EXTRA_PACKAGES[@]}"; do
@@ -371,7 +410,7 @@ done
 for name in BRIDGE TEMPLATE_STORAGE CONTAINER_STORAGE; do
   [[ ${!name} =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] || { echo "ERROR: Invalid $name." >&2; exit 1; }
 done
-(( INITIAL_WAIT_SECONDS >= 30 && INITIAL_WAIT_SECONDS <= 600 )) || { echo "ERROR: INITIAL_WAIT_SECONDS must be 30..600." >&2; exit 1; }
+(( INITIAL_WAIT_SECONDS >= 30 && INITIAL_WAIT_SECONDS <= 86400 )) || { echo "ERROR: INITIAL_WAIT_SECONDS must be 30..86400." >&2; exit 1; }
 case $TURN_MODE in
   external) (( ${#TURN_URIS[@]} > 0 )) || { echo "ERROR: External TURN needs TURN_URIS." >&2; exit 1; } ;;
   disabled) TURN_URIS=(); TURN_SHARED_SECRET="" ;;
@@ -440,7 +479,20 @@ fi
 
 
 # Final listener lists: auto is a creator convenience, never passed to the block.
-[[ $HARDENING_TCP_PORTS != auto ]] || HARDENING_TCP_PORTS="$SYNAPSE_PORT $ELEMENT_PORT"
+[[ $HARDENING_KEEP_SSH != 1 || $HARDENING_TCP_PORTS != auto ]] || {
+  echo 'ERROR: Keeping SSH requires an explicit complete TCP list or empty inventory-only mode.' >&2
+  exit 1
+}
+[[ $HARDENING_REMOVE_POSTFIX != 0 || $HARDENING_TCP_PORTS != auto ]] || {
+  echo 'ERROR: Keeping Postfix requires an explicit complete TCP list or empty inventory-only mode.' >&2
+  exit 1
+}
+FINALIZED_APP_TCP_PORTS="$SYNAPSE_PORT $ELEMENT_PORT"
+# BEGIN COMMON: TCP RESOLUTION
+# COMMON TCP RESOLUTION
+[[ $HARDENING_TCP_PORTS != auto ]] || HARDENING_TCP_PORTS=$FINALIZED_APP_TCP_PORTS
+# END COMMON: TCP RESOLUTION
+
 [[ $HARDENING_PROFILE == lxc ]] || { echo "ERROR: This creator requires HARDENING_PROFILE=lxc." >&2; exit 1; }
 [[ $HARDENING_RP_FILTER =~ ^[12]$ ]] || { echo "ERROR: HARDENING_RP_FILTER must be 1 or 2." >&2; exit 1; }
 for flag in HARDENING_KEEP_SSH HARDENING_REMOVE_POSTFIX; do
@@ -448,6 +500,12 @@ for flag in HARDENING_KEEP_SSH HARDENING_REMOVE_POSTFIX; do
 done
 for number in HARDENING_JOURNAL_DAYS HARDENING_JOURNAL_MAX_MB HARDENING_JOURNAL_RUNTIME_MB HARDENING_UPDATE_MAX_AGE_HOURS; do
   [[ ${!number} =~ ^[1-9][0-9]{0,3}$ ]] || { echo "ERROR: $number must be 1..9999." >&2; exit 1; }
+done
+for list in "$HARDENING_TCP_PORTS" "$HARDENING_UDP_PORTS"; do
+  [[ $list != *$'\n'* && $list != *$'\r'* && $list != *$'\t'* && $list != *[!0-9\ ]* ]] || {
+    echo 'ERROR: Hardening port lists must be one line of space-separated decimal ports.' >&2
+    exit 1
+  }
 done
 for port in $HARDENING_TCP_PORTS $HARDENING_UDP_PORTS; do
   [[ $port =~ ^[1-9][0-9]{0,4}$ ]] && (( port <= 65535 )) || { echo "ERROR: Hardening port lists require integers 1..65535." >&2; exit 1; }
@@ -527,7 +585,7 @@ else
   pveam download "$TEMPLATE_STORAGE" "$TEMPLATE"
 fi
 
-STAGE="CT creation"
+INSTALL_STAGE="create LXC"
 # ── Create LXC ────────────────────────────────────────────────────────────────
 # Root password is set after start via chpasswd on stdin, keeping it out of
 # the host process list (pct create -password exposes it in ps).
@@ -551,6 +609,7 @@ PCT_OPTIONS=(
 
 pct create "$CT_ID" "${TEMPLATE_STORAGE}:vztmpl/${TEMPLATE}" "${PCT_OPTIONS[@]}"
 CREATED=1
+pct config "$CT_ID" | grep -qx 'unprivileged: 1'
 
 # ── Start & wait for IPv4 ─────────────────────────────────────────────────────
 pct start "$CT_ID"
@@ -568,18 +627,21 @@ echo "  CT $CT_ID is up — IP: $CT_IP"
 printf 'root:%s\n' "$PASSWORD" | pct exec "$CT_ID" -- chpasswd
 unset PASSWORD PW1 PW2
 
-STAGE="OS bootstrap"
+INSTALL_STAGE="OS bootstrap"
 # ── OS update ─────────────────────────────────────────────────────────────────
-pct exec "$CT_ID" -- bash -lc '
+pct exec "$CT_ID" -- bash -s -- "$HOST_ARCH" <<'OS_BOOTSTRAP'
   set -euo pipefail
+  . /etc/os-release
+  [[ $EUID == 0 && $ID == debian && $VERSION_ID == 13 && -d /run/systemd/system ]]
+  [[ $(systemd-detect-virt --container) == lxc ]]
+  [[ $(dpkg --print-architecture) == "$1" ]]
   export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l
   export LANG=C.UTF-8
   export LC_ALL=C.UTF-8
-  apt-get update -qq
+  apt-get -o DPkg::Lock::Timeout=120 -o APT::Update::Error-Mode=any update -qq
   apt-get -o Dpkg::Options::="--force-confold" -y dist-upgrade
-  apt-get -y autoremove
   apt-get clean
-'
+OS_BOOTSTRAP
 
 # ── Base packages, locale, timezone ───────────────────────────────────────────
 # python3 is used once below to patch the generated homeserver.yaml (the standard
@@ -590,16 +652,214 @@ PODMAN_FUSE_PKG=""
 pct exec "$CT_ID" -- bash -lc "
   set -euo pipefail
   export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l
-  apt-get update -qq
-  apt-get install -y locales curl ca-certificates iproute2 podman tar gzip python3 python3-yaml util-linux ufw iptables ${PODMAN_FUSE_PKG}
+  apt-get -o DPkg::Lock::Timeout=120 -o APT::Update::Error-Mode=any update -qq
+  apt-get install -y tzdata locales curl ca-certificates iproute2 podman tar gzip python3 python3-yaml util-linux ufw iptables ${PODMAN_FUSE_PKG}
   sed -i 's/^# *en_US.UTF-8/en_US.UTF-8/' /etc/locale.gen
   locale-gen
   update-locale LANG=en_US.UTF-8
-  ln -sf /usr/share/zoneinfo/${APP_TZ} /etc/localtime
-  echo '${APP_TZ}' > /etc/timezone
 "
 
-STAGE="firewall setup"
+# ── Early guest timezone helper; plan only ────────────────────────────────────
+INSTALL_STAGE="guest timezone validation"
+pct exec "$CT_ID" -- bash -s <<'EARLY_TIMEZONE_GUEST'
+set -euo pipefail
+umask 022
+target=/usr/local/sbin/lab-timezone
+[[ ! -L $target && ( ! -e $target || -f $target ) ]] || {
+  echo 'ERROR: Refusing a symlink/nonregular timezone helper destination.' >&2
+  exit 1
+}
+install -d -m 0755 /usr/local/sbin
+temporary=$(mktemp /usr/local/sbin/.lab-timezone.XXXXXX)
+trap 'rm -f -- "$temporary"' EXIT
+cat > "$temporary" <<'EARLY_TIMEZONE_HELPER'
+#!/usr/bin/python3
+"""LXC timezone policy, adapted from debian-hardening.sh v1.0.3.
+
+Only apply writes timezone files; plan/check are read-only. No timedated,
+clock, RTC, NTP, SSH, or access-recovery operations are performed.
+"""
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+from zoneinfo import ZoneInfo
+
+ZONES = Path('/usr/share/zoneinfo')
+LOCALTIME = Path('/etc/localtime')
+TIMEZONE = Path('/etc/timezone')
+
+
+def guest_guard():
+    if os.geteuid() != 0 or shutil.which('pveversion') or Path('/etc/pve').exists():
+        raise ValueError('Timezone operations require root inside the selected Debian 13 LXC.')
+    release = dict(line.split('=', 1) for line in Path('/etc/os-release').read_text().splitlines()
+                   if '=' in line and not line.startswith('#'))
+    if release.get('ID', '').strip('"') != 'debian' or release.get('VERSION_ID', '').strip('"') != '13':
+        raise ValueError('Timezone policy requires Debian 13.')
+    result = subprocess.run(['systemd-detect-virt', '--container'], text=True,
+                            capture_output=True, timeout=10)
+    if result.returncode or result.stdout.strip() != 'lxc':
+        raise ValueError('Timezone policy refuses environments other than LXC.')
+
+
+def zone_path(name):
+    # Same name grammar as the native source; validate against guest tzdata.
+    if not re.fullmatch(r'[A-Za-z0-9_+-]+(?:/[A-Za-z0-9_+-]+)*', name):
+        raise ValueError('Invalid SERVER_TIMEZONE; use an installed IANA timezone name.')
+    if name.split('/')[0] in ('posix', 'right', 'localtime', 'posixrules'):
+        raise ValueError('SERVER_TIMEZONE must identify an IANA zone, not a special tzdata tree.')
+    path = ZONES / name
+    try:
+        path.resolve(strict=True).relative_to(ZONES.resolve(strict=True))
+        with path.open('rb') as stream:
+            ZoneInfo.from_file(stream, key=name)
+    except (OSError, ValueError) as exc:
+        raise ValueError('Timezone is unavailable or invalid in this guest: ' + name) from exc
+    return path
+
+
+def effective_timezone():
+    if not LOCALTIME.exists() and not LOCALTIME.is_symlink():
+        zone_path('UTC')
+        return 'UTC'  # localtime(5): absent /etc/localtime means UTC.
+    if LOCALTIME.is_symlink():
+        # Keep the selected alias, rather than resolving US/Eastern to another name.
+        link = Path(os.path.normpath(LOCALTIME.parent / os.readlink(LOCALTIME)))
+        try:
+            name = str(link.relative_to(ZONES))
+        except ValueError as exc:
+            raise ValueError('/etc/localtime does not link into the guest zoneinfo tree.') from exc
+        zone_path(name)
+        return name
+    if LOCALTIME.is_file() and TIMEZONE.is_file() and not TIMEZONE.is_symlink():
+        name = TIMEZONE.read_text().strip()
+        if LOCALTIME.read_bytes() == zone_path(name).read_bytes():
+            return name
+    raise ValueError('Cannot identify the guest timezone from /etc/localtime and /etc/timezone.')
+
+
+def fingerprint(path):
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return {'kind': 'absent'}
+    if stat.S_ISLNK(info.st_mode):
+        return {'kind': 'symlink', 'target': os.readlink(path)}
+    if stat.S_ISREG(info.st_mode):
+        return {'kind': 'file', 'sha256': hashlib.sha256(path.read_bytes()).hexdigest()}
+    raise ValueError('Unsupported timezone file type: ' + str(path))
+
+
+def fingerprints():
+    return {str(path): fingerprint(path) for path in (LOCALTIME, TIMEZONE)}
+
+
+def plan(preserve, requested):
+    if preserve not in ('0', '1'):
+        raise ValueError('PRESERVE_EXISTING_TIMEZONE must be exactly 0 or 1.')
+    if preserve == '0':
+        zone_path(requested)
+        if TIMEZONE.is_symlink() or (TIMEZONE.exists() and not TIMEZONE.is_file()):
+            raise ValueError('Refusing to replace a non-regular /etc/timezone.')
+    before = effective_timezone()
+    return {'preserve': preserve == '1', 'requested': None if preserve == '1' else requested,
+            'before': before, 'effective': before if preserve == '1' else requested,
+            'files_before': fingerprints()}
+
+
+def verify(setting):
+    actual = effective_timezone()
+    if actual != setting['effective']:
+        raise ValueError('Guest timezone drift: expected ' + setting['effective'] + ', found ' + actual)
+    expected_files = setting.get('files', setting['files_before'])
+    if fingerprints() != expected_files:
+        raise ValueError('Guest timezone files changed; review /etc/localtime and /etc/timezone.')
+    return actual
+
+
+def apply(setting, backup):
+    if fingerprints() != setting['files_before'] or effective_timezone() != setting['before']:
+        raise ValueError('Guest timezone changed after validation; refusing to overwrite it.')
+    if not setting['preserve']:
+        target = zone_path(setting['requested'])
+        saved = Path(backup) / 'timezone'
+        saved.mkdir(mode=0o700, parents=True, exist_ok=False)
+        (saved / 'before.json').write_text(json.dumps(setting, indent=2) + '\n')
+        for path in (LOCALTIME, TIMEZONE):
+            if path.exists() or path.is_symlink():
+                shutil.copy2(path, saved / path.name, follow_symlinks=False)
+        # Atomic per-file replacement; no automatic undo of a later failure.
+        if setting['before'] != setting['requested']:
+            with tempfile.TemporaryDirectory(prefix='.lab-timezone-', dir=LOCALTIME.parent) as tmp:
+                replacement = Path(tmp) / 'localtime'
+                replacement.symlink_to(target)
+                os.replace(replacement, LOCALTIME)
+        # Debian uses /etc/localtime. Keep an existing legacy file consistent;
+        # do not introduce /etc/timezone when the template does not maintain it.
+        desired = setting['requested'] + '\n'
+        if TIMEZONE.exists() and TIMEZONE.read_text() != desired:
+            with tempfile.TemporaryDirectory(prefix='.lab-timezone-', dir=TIMEZONE.parent) as tmp:
+                replacement = Path(tmp) / 'timezone'
+                replacement.write_text(desired)
+                replacement.chmod(0o644)
+                os.replace(replacement, TIMEZONE)
+    final = {**setting, 'files': fingerprints()}
+    if setting['preserve'] and final['files'] != setting['files_before']:
+        raise ValueError('Preserve mode detected a timezone-file change.')
+    verify(final)
+    return final
+
+
+def main():
+    guest_guard()
+    if len(sys.argv) == 4 and sys.argv[1] == 'plan':
+        print(json.dumps(plan(sys.argv[2], sys.argv[3])))
+    elif len(sys.argv) == 4 and sys.argv[1] == 'apply':
+        setting = json.loads(Path(sys.argv[2]).read_text())
+        print(json.dumps(apply(setting, sys.argv[3])))
+    elif len(sys.argv) == 3 and sys.argv[1] == 'check':
+        policy = json.loads(Path(sys.argv[2]).read_text())
+        print(verify(policy['timezone']))
+    else:
+        raise ValueError('Invalid timezone helper arguments.')
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except Exception as exc:
+        print('ERROR: LXC timezone: ' + str(exc), file=sys.stderr)
+        raise SystemExit(1)
+EARLY_TIMEZONE_HELPER
+chown root:root "$temporary"
+chmod 0755 "$temporary"
+mv -T "$temporary" "$target"
+EARLY_TIMEZONE_GUEST
+# BEGIN COMMON: EARLY TIMEZONE PLAN
+# COMMON EARLY TIMEZONE PLAN
+INSTALL_STAGE="guest timezone validation"
+TIMEZONE_PLAN=$(pct exec "$CT_ID" -- /usr/local/sbin/lab-timezone plan "$PRESERVE_EXISTING_TIMEZONE" "$SERVER_TIMEZONE")
+APP_TZ=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["effective"])' "$TIMEZONE_PLAN")
+printf '  Guest timezone plan: %s (%s during shared hardening).\n' "$APP_TZ" "$TIMEZONE_ACTION"
+# END COMMON: EARLY TIMEZONE PLAN
+
+# Explicit bootstrap allowance for --initial only; removed before late hardening.
+printf '%s\n' "$TIMEZONE_PLAN" | pct exec "$CT_ID" -- bash -c '
+  set -euo pipefail
+  umask 077
+  test ! -e /run/matrix-install-bootstrap.json
+  test ! -L /run/matrix-install-bootstrap.json
+  cat > /run/matrix-install-bootstrap.json
+'
+
+INSTALL_STAGE="UFW setup"
 # ── UFW inside the CT ─────────────────────────────────────────────────────────
 # Fresh CT only: preserve UFW rule files; add only the selected application rules.
 # Network=host means these HTTP listeners use this CT's INPUT chain, without
@@ -662,26 +922,146 @@ FWPOLICY
 
 tmp="$(mktemp)"
 cat > "$tmp" <<'UFWCHECK'
-#!/usr/bin/env bash
-set -euo pipefail
-export LC_ALL=C
-# A running oneshot unit alone does not prove UFW was enabled or rules loaded.
-# Called before every Synapse/Element start, including boot and updates.
-grep -qx 'ENABLED=yes' /etc/ufw/ufw.conf
-grep -qx 'IPV6=yes' /etc/default/ufw
-status=$(/usr/sbin/ufw status)
-grep -qx 'Status: active' <<< "$status"
-for tool in /usr/sbin/iptables /usr/sbin/ip6tables; do
-  prefix=ufw
-  [[ ${tool##*/} != ip6tables ]] || prefix=ufw6
-  rules=$("$tool" -w 5 -S INPUT)
-  grep -qx -- '-P INPUT DROP' <<< "$rules"
-  rules=$("$tool" -w 5 -S FORWARD)
-  grep -qx -- '-P FORWARD DROP' <<< "$rules"
-  # UFW uses ufw-* for IPv4 and ufw6-* for IPv6, even with no allowed IPv6 sources.
-  "$tool" -w 5 -C INPUT -j "${prefix}-before-input"
-  "$tool" -w 5 -S "${prefix}-user-input" >/dev/null
-done
+#!/usr/bin/python3
+"""Read-only Matrix UFW guard: exact host access and reachable INPUT policy."""
+import ipaddress
+import json
+import os
+from pathlib import Path
+import re
+import shlex
+import subprocess
+import sys
+
+os.environ['PATH'] = '/usr/sbin:/usr/bin:/sbin:/bin'
+os.environ['LC_ALL'] = 'C'
+
+
+def require(ok, label):
+    if not ok:
+        raise RuntimeError(label)
+
+
+def run(args):
+    p = subprocess.run(args, text=True, capture_output=True, timeout=20)
+    require(p.returncode == 0, 'Cannot read required UFW/netfilter state')
+    return p.stdout.strip()
+
+
+def normalize(words):
+    words = list(words)
+    for token in ('-s', '-d'):
+        if token in words:
+            i = words.index(token) + 1
+            words[i] = str(ipaddress.ip_network(words[i], strict=True))
+    return tuple(words)
+
+
+def table_check(text, family, prefix, ports, sources):
+    chains, policies = {}, {}
+    for line in text.splitlines():
+        words = shlex.split(line)
+        require(bool(words), 'Empty filter rule')
+        if words[0] == '-P' and len(words) == 3:
+            policies[words[1]] = words[2]
+            chains.setdefault(words[1], [])
+        elif words[0] == '-N' and len(words) == 2:
+            chains.setdefault(words[1], [])
+        elif words[0] == '-A' and len(words) >= 4:
+            chains.setdefault(words[1], []).append(normalize(words))
+        else:
+            raise RuntimeError('Unrecognized filter-table declaration')
+    require(policies == {'INPUT': 'DROP', 'FORWARD': 'DROP', 'OUTPUT': 'ACCEPT'},
+            'Effective filter defaults differ from deny-in/deny-routed/allow-out')
+    hooks = [prefix + '-' + suffix for suffix in
+             ('before-logging-input', 'before-input', 'after-input',
+              'after-logging-input', 'reject-input', 'track-input')]
+    require(chains.get('INPUT') == [('-A', 'INPUT', '-j', hook) for hook in hooks],
+            'INPUT must contain only the ordered UFW hooks')
+    user = prefix + '-user-input'
+    networks = [s for s in sources if s.version == family] if sources else [None]
+    expected = set()
+    for source in networks:
+        for port in ports:
+            rule = ['-A', user] + (['-s', str(source)] if source else [])
+            expected.add(tuple(rule + ['-p', 'tcp', '-m', 'tcp', '--dport', str(port), '-j', 'ACCEPT']))
+    actual = chains.get(user)
+    require(actual is not None and len(actual) == len(expected) and set(actual) == expected,
+            'Selected host/port rules differ or contain extra rules')
+    require(('-A', prefix + '-before-input', '-j', user) in chains.get(prefix + '-before-input', []),
+            'UFW before-input does not reach the selected user policy')
+
+    # Conservatively examine paths for new, non-loopback TCP. Standard DHCP,
+    # ICMP, established replies and local loopback are separate control traffic.
+    # Follow declared chains before classifying terminal targets: UFW uses its
+    # own ufw[-6]-skip-to-policy and not-local chains as normal control flow.
+    seen = set()
+    def walk(chain, stack=()):
+        require(chain not in stack, 'Cyclic reachable INPUT chain')
+        require(chain in chains, 'Missing reachable INPUT chain')
+        if chain in seen:
+            return
+        seen.add(chain)
+        for rule in chains[chain]:
+            def value(option):
+                return rule[rule.index(option) + 1] if option in rule else None
+            # Negation prevents these exclusions; ambiguous rules fail closed.
+            if '!' not in rule:
+                if value('-p') not in (None, 'tcp', '6', 'all', '0'):
+                    continue
+                if value('-i') == 'lo':
+                    continue
+                states = value('--ctstate') or value('--state')
+                if states and 'NEW' not in states.split(','):
+                    continue
+            jump = value('-j') or value('-g')
+            require(jump is not None, 'Reachable INPUT rule has no reviewed target')
+            if jump in chains:
+                walk(jump, stack + (chain,))
+            elif jump == 'ACCEPT':
+                require(chain == user and rule in expected,
+                        'Reachable TCP acceptance bypasses selected host/port policy')
+            elif jump not in ('DROP', 'REJECT', 'RETURN', 'LOG', 'NFLOG'):
+                raise RuntimeError('Unrecognized reachable INPUT target; review custom filtering')
+    walk('INPUT')
+
+
+def main():
+    require(os.geteuid() == 0 and len(sys.argv) == 1, 'Run Matrix UFW guard as root without arguments')
+    for filename, expected in [('/etc/ufw/ufw.conf', {'ENABLED': 'yes'}),
+            ('/etc/default/ufw', {'IPV6': 'yes', 'DEFAULT_INPUT_POLICY': 'DROP',
+                                 'DEFAULT_FORWARD_POLICY': 'DROP', 'DEFAULT_OUTPUT_POLICY': 'ACCEPT'})]:
+        content = Path(filename).read_text()
+        for key, value in expected.items():
+            found = re.findall(r'^' + key + r'=(.*)$', content, re.M)
+            require(len(found) == 1 and found[0].strip('"\'') == value,
+                    'Persistent UFW defaults/enablement differ')
+    require('Status: active' in run(['ufw', 'status']).splitlines(), 'UFW is inactive')
+    run(['systemctl', 'is-enabled', '--quiet', 'ufw.service'])
+    policy_path = Path('/opt/matrix/firewall-policy.json')
+    st = policy_path.lstat()
+    require(policy_path.is_file() and not policy_path.is_symlink() and st.st_uid == 0
+            and not st.st_mode & 0o022, 'Unsafe firewall policy file')
+    policy = json.loads(policy_path.read_text())
+    ports = policy['ports']
+    require(len(ports) == 2 and all(type(p) is int and 1024 <= p <= 65535 and p != 5432 for p in ports)
+            and len(set(ports)) == 2, 'Invalid Matrix firewall ports')
+    sources = [ipaddress.ip_network(s, strict=True) for s in policy['sources']]
+    require(all(s.prefixlen == s.max_prefixlen and not
+                (s.network_address.is_multicast or s.network_address.is_unspecified or s.network_address.is_loopback)
+                for s in sources), 'Matrix restrictions require reachable host addresses')
+    require(not sources or any(s.version == 4 for s in sources), 'Restricted Synapse needs an IPv4 source')
+    for family, tool, prefix in [(4, 'iptables', 'ufw'), (6, 'ip6tables', 'ufw6')]:
+        table_check(run([tool, '-w', '5', '-S']), family, prefix, ports, sources)
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except Exception as exc:
+        detail = str(exc) if isinstance(exc, RuntimeError) else type(exc).__name__
+        print('ERROR: Matrix UFW: ' + detail, file=sys.stderr)
+        raise SystemExit(1)
 UFWCHECK
 pct push "$CT_ID" "$tmp" /usr/local/sbin/matrix-ufw-check --perms 0755
 rm -f "$tmp"
@@ -728,7 +1108,7 @@ GRAPH_DRIVER="$(pct exec "$CT_ID" -- podman info --format '{{.Store.GraphDriverN
 [[ "$GRAPH_DRIVER" == "overlay" ]] || { echo "  ERROR: Podman storage driver is '${GRAPH_DRIVER}', expected overlay." >&2; false; }
 echo "  Podman: cgroup ${CGROUPS_VERSION}, storage driver ${GRAPH_DRIVER}$([ "$PODMAN_FUSE_OVERLAY" -eq 1 ] && echo " (fuse-overlayfs)" || echo " (native)")"
 
-STAGE="image acquisition"
+INSTALL_STAGE="image compatibility"
 # ── Pull images ───────────────────────────────────────────────────────────────
 for img in "$POSTGRES_IMAGE" "$SYNAPSE_IMAGE" "$ELEMENT_IMAGE"; do
   echo "  Pulling image: ${img} ..."
@@ -747,7 +1127,7 @@ for component in SYNAPSE ELEMENT POSTGRES; do
   printf -v "${component}_IMAGE_ID" 'sha256:%s' "$resolved"
 done
 
-STAGE="image compatibility"
+INSTALL_STAGE="image compatibility"
 # ── Detect container UIDs/GIDs for bind mounts ────────────────────────────────
 # PostgreSQL drops to its own service user before touching the mount; the UID
 # differs between the Debian (999) and Alpine (70) variants, so read it from
@@ -781,10 +1161,11 @@ pct exec "$CT_ID" -- bash -lc "
   install -d -m 0750 -o ${SYNAPSE_UID}  -g ${SYNAPSE_GID}  '${SYNAPSE_DATA_DIR}' '${SYNAPSE_DATA_DIR}/media_store'
 "
 
-STAGE="application configuration"
+INSTALL_STAGE="application configuration"
 # ── Generate Synapse homeserver.yaml ──────────────────────────────────────────
-# The image's `generate` mode writes homeserver.yaml, the signing key and the log
-# config into /data (as UID:GID) with --open-private-ports, i.e. the listener
+# The image's `generate` mode renders the log config before dropping privileges;
+# it can remain root-owned and must be readable by UID:GID 991:991. Homeserver
+# config and signing key are generated as UID:GID with --open-private-ports; the listener
 # binds all interfaces — required for Network=host. The server_name written here
 # is permanent: it is baked into every user ID and event this homeserver signs.
 echo "  Generating Synapse configuration for server_name ${SYNAPSE_SERVER_NAME} ..."
@@ -1100,6 +1481,18 @@ SQL
 PGINIT
 
 
+# ── Expected application policy ───────────────────────────────────────────────
+python3 - "$APP_TZ" "$SYNAPSE_SERVER_NAME" "$SYNAPSE_PORT" "$ELEMENT_PORT" \
+  "$TURN_MODE" "$TURN_USER_LIFETIME_MS" "$TURN_ALLOW_GUESTS" "$MATRIX_RTC_AUTH_URL" \
+  "$MATRIX_RTC_HEALTH_URL" "$MAX_UPLOAD_SIZE" "${TURN_URIS[@]}" <<'APP_POLICY' | pct exec "$CT_ID" -- bash -c 'set -euo pipefail; umask 022; cat > /opt/matrix/install-policy.json; chmod 0644 /opt/matrix/install-policy.json'
+import json, sys
+zone, server, sy, el, turn, lifetime, guests, rtc, health, upload = sys.argv[1:11]
+print(json.dumps({'timezone': zone, 'server_name': server, 'synapse_port': int(sy),
+    'element_port': int(el), 'turn_mode': turn, 'turn_lifetime': int(lifetime),
+    'turn_guests': guests == '1', 'rtc_auth': rtc, 'rtc_health': health,
+    'max_upload_size': upload, 'turn_uris': sys.argv[11:]}))
+APP_POLICY
+
 # ── Runtime state file ────────────────────────────────────────────────────────
 # .env is not read by Quadlet or systemd. It is the maint script's source of
 # truth for current image tags and policy flags. Keep it in sync with the
@@ -1129,7 +1522,7 @@ APP_TZ=${APP_TZ}
 AUTO_UPDATE=${AUTO_UPDATE}
 UPDATE_TIME=${UPDATE_TIME}
 INITIAL_WAIT_SECONDS=${INITIAL_WAIT_SECONDS}
-SYNAPSE_WAIT_SECONDS=${SYNAPSE_WAIT_SECONDS}
+UPDATE_WAIT_SECONDS=${UPDATE_WAIT_SECONDS}
 PODMAN_FUSE_OVERLAY=${PODMAN_FUSE_OVERLAY}
 TURN_MODE=${TURN_MODE}
 MATRIX_RTC_AUTH_URL=${MATRIX_RTC_AUTH_URL}
@@ -1138,220 +1531,342 @@ EOF2
   chmod 0600 '${APP_DIR}/.env'
 "
 
-STAGE="startup"
-# ── Start via Quadlet ─────────────────────────────────────────────────────────
-# daemon-reload triggers the Quadlet generator which produces matrix-synapse.service,
-# matrix-element.service and matrix-postgres.service as transient systemd units.
-# WantedBy=multi-user.target handles boot restarts. Transient units cannot be
-# systemctl-enabled; daemon-reload is sufficient. Starting matrix-synapse.service
-# pulls in PostgreSQL via Requires= and waits for its health check (Notify=healthy);
-# Element is started alongside and is independent of both.
-pct exec "$CT_ID" -- bash -lc '
-  set -euo pipefail
-  /usr/lib/systemd/system-generators/podman-system-generator --dryrun >/dev/null
-  systemctl daemon-reload
-  for service in matrix-postgres matrix-synapse matrix-element; do
-    test "$(systemctl show "$service.service" -p LoadState --value)" = loaded
-  done
-'
+# ── Final verification helper ─────────────────────────────────────────────────
+# Reads configuration/runtime state; no updates, restarts or report-file writes.
+tmp=$(mktemp)
+cat > "$tmp" <<'MATRIX_VERIFY'
+#!/usr/bin/python3
+"""Read-only Matrix checks. No repairs, package/image changes or report writes."""
+import ipaddress
+from datetime import datetime
+import json
+import os
+from pathlib import Path
+import re
+import stat
+import subprocess
+import sys
+import time
+import urllib.request
+import yaml
+from zoneinfo import ZoneInfo
 
-# Fail before persistent app startup if filtering was disabled during provisioning.
-pct exec "$CT_ID" -- /usr/local/sbin/matrix-ufw-check
+os.environ['PATH'] = '/usr/sbin:/usr/bin:/sbin:/bin'
+os.environ['LC_ALL'] = 'C'
+errors = []
 
-# First persistent service start: disarm BEFORE the command, including a failed start.
-CLEANUP_ON_FAIL=0
-pct exec "$CT_ID" -- bash -lc "
-  set -euo pipefail
-  systemctl start '${SYNAPSE_QUADLET_SERVICE}' '${ELEMENT_QUADLET_SERVICE}'
-"
+def require(ok, label):
+    if not ok:
+        raise RuntimeError(label)
 
-STAGE="early verification"
-# ── Verification ──────────────────────────────────────────────────────────────
-sleep 30
-VERIFY_FAIL=0
+def run(args, label, data=None, acceptable=(0,)):
+    p = subprocess.run(args, input=data, text=True, capture_output=True, timeout=30)
+    # Never print argv/environment or raw stderr: either may contain credentials.
+    require(p.returncode in acceptable, f'{label}: command failed (rc={p.returncode})')
+    return p.stdout.strip()
 
-for svc in "$POSTGRES_QUADLET_SERVICE" "$SYNAPSE_QUADLET_SERVICE" "$ELEMENT_QUADLET_SERVICE"; do
-  if pct exec "$CT_ID" -- systemctl is-active --quiet "$svc" 2>/dev/null; then
-    echo "  Quadlet service is active: ${svc}"
-  else
-    echo "  ERROR: ${svc} is not active" >&2
-    echo "  Check: pct exec $CT_ID -- systemctl status ${svc}" >&2
-    echo "  Check: pct exec $CT_ID -- journalctl -u ${svc} --no-pager -n 50" >&2
-    VERIFY_FAIL=1
-  fi
-done
+def state_file(path):
+    result = {}
+    for line in Path(path).read_text().splitlines():
+        if not line or line.startswith('#'):
+            continue
+        k, v = line.split('=', 1)
+        require(re.fullmatch(r'[A-Z][A-Z0-9_]*', k) and k not in result, 'Malformed/duplicate configuration key')
+        result[k] = v
+    return result
 
-RUNNING="$(pct exec "$CT_ID" -- sh -lc \
-  'podman ps --filter name=^matrix-synapse$ --filter name=^matrix-element$ --filter name=^matrix-postgres$ --format "{{.Names}}" 2>/dev/null | wc -l' \
-  2>/dev/null || echo 0)"
-pct exec "$CT_ID" -- bash -lc 'set -euo pipefail; podman ps' || true
+def http(port, path):
+    with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(f'http://127.0.0.1:{port}{path}', timeout=5) as response:
+        require(response.status == 200, 'Unexpected HTTP status')
+        return response.read()
 
-if [[ "$RUNNING" -lt 3 ]]; then
-  echo "  ERROR: Expected 3 containers running (matrix-synapse, matrix-element, matrix-postgres), found $RUNNING" >&2
-  VERIFY_FAIL=1
-else
-  echo "  Container count OK ($RUNNING running)"
-fi
+def check_firewall():
+    run(['/usr/local/sbin/matrix-ufw-check'], 'UFW boot guard')
+    policy = json.loads(Path('/opt/matrix/firewall-policy.json').read_text())
+    require(policy['ports'] == [sy_port, el_port], 'Firewall/application ports differ')
 
-if pct exec "$CT_ID" -- sh -lc 'podman exec matrix-postgres pg_isready -h 127.0.0.1 -U synapse -d synapse >/dev/null 2>&1' 2>/dev/null; then
-  echo "  PostgreSQL accepts connections on 127.0.0.1:5432"
-else
-  echo "  ERROR: PostgreSQL did not answer pg_isready on 127.0.0.1:5432" >&2
-  echo "  Check: pct exec $CT_ID -- journalctl -u matrix-postgres.service --no-pager -n 50" >&2
-  VERIFY_FAIL=1
-fi
+def service_counts():
+    result = {}
+    for container in ('matrix-postgres', 'matrix-synapse', 'matrix-element'):
+        value = run(['systemctl', 'show', container + '.service', '-p', 'NRestarts', '--value'], 'Service restart count')
+        require(value.isdigit(), 'Missing service restart count')
+        result[container] = value
+    return result
 
-# Network=host: PostgreSQL must be bound to loopback only, otherwise the DB is
-# reachable by every host on the LAN with only its password in front of it.
-EXPOSED_BACKENDS="$(pct exec "$CT_ID" -- sh -lc 'ss -Hltn 2>/dev/null | awk "\$4 ~ /:5432\$/ && \$4 !~ /^127\\.0\\.0\\.1:/ {print \$4}"' 2>/dev/null || true)"
-if [[ -z "$EXPOSED_BACKENDS" ]]; then
-  echo "  PostgreSQL listens on loopback only"
-else
-  echo "  ERROR: PostgreSQL bound beyond loopback: ${EXPOSED_BACKENDS}" >&2
-  echo "  Check: pct exec $CT_ID -- ss -ltnp" >&2
-  VERIFY_FAIL=1
-fi
+def wait_ready():
+    restart_counts.update(service_counts())
+    require(not initial or all(v == '0' for v in restart_counts.values()), 'Unexpected initial service restart')
+    deadline = time.monotonic() + wait_seconds
+    while True:
+        require(service_counts() == restart_counts, 'Service restarted while waiting for readiness')
+        ready = True
+        for container in restart_counts:
+            status = run(['systemctl', 'show', container + '.service', '-p', 'ActiveState', '--value'], 'Service startup state')
+            require(status not in ('failed', 'inactive', 'deactivating'), 'Service failed/stopped before readiness')
+            ready = ready and status == 'active'
+        try:
+            run(['podman', 'exec', 'matrix-postgres', 'pg_isready', '-h', '127.0.0.1', '-U', 'synapse', '-d', 'synapse'], 'Database startup readiness')
+            http(sy_port, '/health')
+            http(el_port, '/')
+            if ready:
+                return
+        except Exception:
+            pass
+        require(time.monotonic() < deadline, 'Application readiness budget expired; services left for inspection')
+        time.sleep(2)
 
-# PG18 layout check: the cluster must be inside the bind mount, not in an
-# anonymous podman volume (that is exactly what the old /var/lib/postgresql/data
-# mount did on 18-era images).
-PG_MAJOR="${POSTGRES_TAG%%.*}"
-if pct exec "$CT_ID" -- test -f "${APP_DIR}/postgresdata/${PG_MAJOR}/docker/PG_VERSION" 2>/dev/null; then
-  echo "  PostgreSQL cluster lives in ${APP_DIR}/postgresdata/${PG_MAJOR}/docker (bind mount)"
-else
-  echo "  ERROR: ${APP_DIR}/postgresdata/${PG_MAJOR}/docker/PG_VERSION not found — the cluster is not inside the bind mount" >&2
-  echo "  Check: pct exec $CT_ID -- podman exec matrix-postgres sh -c 'echo \$PGDATA'" >&2
-  VERIFY_FAIL=1
-fi
+def check_synapse_generated_files():
+    # `generate` renders log.config before dropping privileges. It can remain
+    # root-owned; the signing key is generated by Synapse as UID 991.
+    # Verify access without rewriting either file or exposing its contents.
+    for suffix, label, owners in [('.signing.key', 'Synapse signing key', (991,)),
+                                   ('.log.config', 'Synapse log configuration', (0, 991))]:
+        filename = state['SYNAPSE_SERVER_NAME'] + suffix
+        path = Path('/opt/matrix/synapse') / filename
+        try:
+            info = path.lstat()
+        except FileNotFoundError:
+            raise RuntimeError(label + ': missing file') from None
+        require(stat.S_ISREG(info.st_mode) and info.st_size > 0,
+                label + ': expected nonempty regular file')
+        require(info.st_uid in owners,
+                f'{label}: uid={info.st_uid}, gid={info.st_gid}; expected uid in {owners}')
+        require(info.st_mode & 0o022 == 0,
+                f'{label}: unsafe group/other write permissions (mode={info.st_mode & 0o7777:04o})')
+        run(['podman', 'exec', '--user', '991:991', 'matrix-synapse', 'python', '-c',
+             'import os,sys; assert (os.getuid(),os.getgid()) == (991,991); '
+             'f=open(sys.argv[1],"rb"); sys.exit(0 if f.read(1) else 1)',
+             '/data/' + filename], label + ': runtime readability as 991:991')
 
-# Synapse refuses to start on a database whose collation is not "C" (initdb
-# must have received POSTGRES_INITDB_ARGS). Query pg_database — the lc_collate
-# server variable no longer exists since PostgreSQL 16.
-DB_COLLATE="$(pct exec "$CT_ID" -- sh -lc "podman exec matrix-postgres psql -U postgres -d synapse -tAc \"select datcollate from pg_database where datname = current_database()\" 2>/dev/null" 2>/dev/null | tr -d '[:space:]' || true)"
-if [[ "$DB_COLLATE" == "C" ]]; then
-  echo "  Database collation is C (Synapse requirement)"
-else
-  echo "  ERROR: synapse database collation is '${DB_COLLATE:-n/a}', expected 'C' — POSTGRES_INITDB_ARGS was not applied at initdb" >&2
-  echo "  Inspect POSTGRES_INITDB_ARGS in ${POSTGRES_ENV_FILE} without sharing its secrets." >&2
-  VERIFY_FAIL=1
-fi
+def check_identity():
+    for name, key, mounts in [
+        ('synapse', 'SYNAPSE', {'/data': ('/opt/matrix/synapse', True)}),
+        ('element', 'ELEMENT', {'/app/config.json': ('/opt/matrix/element-config.json', False)}),
+        ('postgres', 'POSTGRES', {'/var/lib/postgresql': ('/opt/matrix/postgresdata', True),
+                               '/docker-entrypoint-initdb.d/10-synapse.sh': ('/opt/matrix/postgres-init.sh', False)})]:
+        container = 'matrix-' + name
+        unit = Path('/etc/containers/systemd/' + container + '.container').read_text()
+        ids = re.findall(r'^Image=(sha256:[a-f0-9]{64})$', unit, re.M)
+        require(len(ids) == 1 and ids[0] == state[key + '_IMAGE_ID'], container + ': image metadata mismatch')
+        require(re.findall(r'^Pull=(.*)$', unit, re.M) == ['never'], container + ': Pull policy')
+        require(re.findall(r'^Network=(.*)$', unit, re.M) == ['host'], container + ': Quadlet host network')
+        require(re.findall(r'^# MatrixTag=(.*)$', unit, re.M) == [state[key + '_TAG']], container + ': tag metadata')
+        require(re.findall(r'^# MatrixImage=(.*)$', unit, re.M) == [state[key + '_IMAGE']], container + ': reference metadata')
+        require(state[key + '_IMAGE'] == state[key + '_IMAGE_REPO'] + ':' + state[key + '_TAG'], container + ': repository metadata')
+        info = json.loads(run(['podman', 'inspect', container], container + ' inspection'))[0]
+        require(info['State']['Running'] and 'sha256:' + info['Image'].removeprefix('sha256:') == ids[0], container + ': running image/identity')
+        require(info['HostConfig']['NetworkMode'] == 'host', container + ': host network')
+        actual = {m['Destination']: (m['Source'], m['RW']) for m in info['Mounts']}
+        require(len(actual) == len(info['Mounts']) and actual == mounts, container + ': unexpected/duplicate persistent mount')
+        for destination, value in mounts.items():
+            require(actual.get(destination) == value, container + ': persistent mount ' + destination)
+        run(['systemctl', 'is-active', '--quiet', container + '.service'], container + ' active')
+        before = run(['systemctl', 'show', container + '.service', '-p', 'NRestarts', '--value'], container + ' restarts')
+        require(before.isdigit(), container + ': missing restart counter')
+        require(restart_counts.get(container) == before and (not initial or before == '0'), container + ': restart count changed')
+        process_rows = run(['podman', 'top', container, 'hpid'], container + ' process membership').splitlines()
+        require(process_rows and process_rows[0].strip().upper() == 'HPID', 'Unexpected process inventory format')
+        process_ids = {int(row.strip()) for row in process_rows[1:] if row.strip().isdigit()}
+        require(len(process_ids) == len(process_rows) - 1 and info['State']['Pid'] in process_ids, container + ': process inventory')
+        container_pids[container] = process_ids
+        status = Path('/proc/' + str(info['State']['Pid']) + '/status').read_text()
+        uid = int(re.search(r'^Uid:\s+(\d+)', status, re.M)[1])
+        if name == 'synapse':
+            require(uid == 991, 'Synapse main process UID must be 991')
+            gid = int(re.search(r'^Gid:\s+(\d+)', status, re.M)[1])
+            require(gid == 991, 'Synapse main process GID must be 991')
+            for item in ('UID=991', 'GID=991', 'SYNAPSE_CONFIG_PATH=/data/homeserver.yaml'):
+                require(item in info['Config']['Env'], 'Synapse runtime identity/configuration environment')
+        elif name == 'postgres':
+            expected_uid = int(run(['podman', 'exec', container, 'id', '-u', 'postgres'], 'PostgreSQL UID'))
+            require(uid == expected_uid and uid != 0, 'PostgreSQL main process UID')
+            require('PGDATA=/var/lib/postgresql/18/docker' in info['Config']['Env'], 'PostgreSQL runtime data directory')
+            cluster = Path('/opt/matrix/postgresdata/18/docker')
+            require((cluster / 'PG_VERSION').read_text().strip() == '18', 'PostgreSQL persistent major')
+            # The selected official entrypoint uses `chown postgres` (UID only)
+            # and chmod 00700. PGDATA can therefore be postgres:root; owner-only
+            # access makes its group irrelevant. Never chown it to satisfy a check.
+            cluster_info = cluster.stat()
+            require(cluster_info.st_uid == expected_uid,
+                    f'PostgreSQL cluster ownership: uid={cluster_info.st_uid}, gid={cluster_info.st_gid}; expected uid={expected_uid}')
+            cluster_mode = cluster_info.st_mode & 0o7777
+            require(cluster_mode == 0o700,
+                    f'PostgreSQL cluster permissions: mode={cluster_mode:04o}; expected 0700')
+        else:
+            require(uid != 0, 'Element main process must remain unprivileged')
+    for path in ['/opt/matrix/synapse', '/opt/matrix/synapse/media_store']:
+        st = Path(path).stat()
+        require((st.st_uid, st.st_gid) == (991, 991), 'Synapse data ownership')
+    for path in ['/opt/matrix/synapse/homeserver.yaml', '/opt/matrix/postgres.env']:
+        require(Path(path).stat().st_mode & 0o777 == 0o600, 'Credential file mode: ' + path)
+    check_synapse_generated_files()
+    require(Path('/opt/matrix/element-config.json').stat().st_uid == 0 and
+            Path('/opt/matrix/element-config.json').stat().st_mode & 0o777 == 0o644, 'Element read-only config ownership/mode')
 
-SY_HEALTHY=0
-SY_WAIT_START=$SECONDS
-while (( SECONDS - SY_WAIT_START < INITIAL_WAIT_SECONDS )); do
-  SY_STATE=$(pct exec "$CT_ID" -- systemctl show matrix-synapse.service -p ActiveState --value)
-  SY_RESTARTS=$(pct exec "$CT_ID" -- systemctl show matrix-synapse.service -p NRestarts --value)
-  [[ $SY_STATE != failed && ${SY_RESTARTS:-0} == 0 ]] || break
-  HTTP_CODE="$(pct exec "$CT_ID" -- sh -lc "curl -s -o /dev/null -w '%{http_code}' --max-time 3 'http://127.0.0.1:${SYNAPSE_PORT}/health' 2>/dev/null" 2>/dev/null || echo 000)"
-  case "$HTTP_CODE" in
-    200)
-      SY_HEALTHY=1
-      break
-      ;;
-  esac
-  sleep 2
-done
+def check_http():
+    http(sy_port, '/health')
+    key = json.loads(http(sy_port, '/_matrix/key/v2/server'))
+    require(key['server_name'] == state['SYNAPSE_SERVER_NAME'], 'Synapse server identity')
+    versions = json.loads(http(sy_port, '/_matrix/client/versions'))
+    require(bool(versions['versions']), 'Matrix client versions response')
+    require(json.loads(http(el_port, '/config.json')) == json.loads(Path('/opt/matrix/element-config.json').read_text()), 'Element served configuration')
+    index = run(['podman', 'exec', 'matrix-element', 'cat', '/app/index.html'], 'Element image index')
+    require(http(el_port, '/').decode().strip() == index, 'Element index differs from running image')
+    discovery = json.loads(http(sy_port, '/.well-known/matrix/client'))
+    require(discovery['m.homeserver']['base_url'].rstrip('/') == 'https://' + state['SYNAPSE_FQDN'], 'Client discovery base URL')
+    server = json.loads(http(sy_port, '/.well-known/matrix/server'))
+    require(server['m.server'] == state['SYNAPSE_FQDN'] + ':443', 'Federation discovery')
+    if app_policy['rtc_auth']:
+        require(discovery.get('org.matrix.msc4143.rtc_foci') ==
+                [{'type': 'livekit', 'livekit_service_url': app_policy['rtc_auth']}], 'MatrixRTC discovery')
 
-if [[ "$SY_HEALTHY" -eq 1 ]]; then
-  echo "  Synapse health check passed (HTTP $HTTP_CODE on port ${SYNAPSE_PORT})"
-else
-  echo "  ERROR: Synapse /health did not return 200 on port ${SYNAPSE_PORT}" >&2
-  echo "  Check: pct exec $CT_ID -- systemctl status matrix-synapse.service" >&2
-  echo "  Check: pct exec $CT_ID -- journalctl -u matrix-synapse.service --no-pager -n 80" >&2
-  VERIFY_FAIL=1
-fi
+def check_database():
+    run(['podman', 'exec', 'matrix-postgres', 'pg_isready', '-h', '127.0.0.1', '-U', 'synapse', '-d', 'synapse'], 'Database readiness')
+    password = config['database']['args']['password']
+    env = state_file('/opt/matrix/postgres.env')
+    require(password == env['SYNAPSE_DB_PASSWORD'], 'Synapse/database credential match')
+    for name in ['POSTGRES_PASSWORD', 'SYNAPSE_DB_PASSWORD', 'POSTGRES_INITDB_ARGS']:
+        got = run(['podman', 'exec', 'matrix-postgres', 'printenv', name], name + ' round trip')
+        require(got == env[name], name + ' round trip differs')
+    sql = "SELECT current_user = 'synapse' AND (SELECT count(*) > 0 FROM information_schema.tables WHERE table_schema='public');"
+    output = run(['podman', 'exec', '-i', 'matrix-postgres', 'bash', '-c',
+        'IFS= read -r PGPASSWORD; export PGPASSWORD; exec psql -X -w -v ON_ERROR_STOP=1 -h 127.0.0.1 -U synapse -d synapse -tAc "$1"', 'verify', sql], 'Authenticated application-role query/migrations', password + '\n')
+    require(output == 't', 'Application-role schema/migration query')
+    bad = subprocess.run(['podman', 'exec', '-e', 'PGPASSWORD=deliberately-wrong', 'matrix-postgres', 'psql', '-X', '-w', '-h', '127.0.0.1', '-U', 'synapse', '-d', 'synapse', '-tAc', 'SELECT 1'], capture_output=True, text=True, timeout=15)
+    require(bad.returncode != 0 and 'password authentication failed' in bad.stderr, 'Wrong password must fail specifically with authentication rejection')
+    queries = [
+        "SELECT rolcanlogin AND NOT rolsuper AND NOT rolcreatedb AND NOT rolcreaterole AND NOT rolreplication AND NOT rolbypassrls FROM pg_roles WHERE rolname='synapse'",
+        "SELECT pg_get_userbyid(datdba)='synapse' AND datcollate='C' AND datctype='C' FROM pg_database WHERE datname='synapse'",
+        "SELECT count(*)=0 FROM pg_hba_file_rules WHERE error IS NOT NULL OR (type LIKE 'host%' AND auth_method <> 'scram-sha-256')"]
+    for label, query in zip(['Application role restrictions', 'Database owner/locale', 'SCRAM host policy'], queries):
+        require(run(['podman', 'exec', 'matrix-postgres', 'psql', '-X', '-v', 'ON_ERROR_STOP=1', '-U', 'postgres', '-d', 'postgres', '-tAc', query], label) == 't', label)
 
-# The signing key response carries the server_name Synapse actually runs with —
-# the one baked into every user ID. It must be what was configured.
-KEY_SERVER_NAME="$(pct exec "$CT_ID" -- python3 -c '
-import json, sys, urllib.request
-with urllib.request.urlopen(sys.argv[1], timeout=3) as response:
-    print(json.load(response)["server_name"])
-' "http://127.0.0.1:${SYNAPSE_PORT}/_matrix/key/v2/server" 2>/dev/null || true)"
-if [[ "$KEY_SERVER_NAME" == "$SYNAPSE_SERVER_NAME" ]]; then
-  echo "  Synapse server_name confirmed: ${KEY_SERVER_NAME}"
-else
-  echo "  ERROR: Synapse reports server_name '${KEY_SERVER_NAME:-n/a}', expected '${SYNAPSE_SERVER_NAME}'" >&2
-  VERIFY_FAIL=1
-fi
+def check_sockets():
+    sockets = run(['ss', '-H', '-lntp'], 'TCP socket/process inventory')
+    ports = {}
+    for line in sockets.splitlines():
+        endpoint = line.split()[3]
+        address, port = endpoint.rsplit(':', 1)
+        address = address.split('%', 1)[0].strip('[]')
+        ports.setdefault(int(port), []).append(address)
+        owner = {5432: 'matrix-postgres', sy_port: 'matrix-synapse', el_port: 'matrix-element'}.get(int(port))
+        if owner:
+            pids = {int(p) for p in re.findall(r'pid=(\d+)', line)}
+            require(pids and pids <= container_pids.get(owner, set()), 'Application socket belongs to unexpected/unidentified process')
+    require(ports.get(5432) == ['127.0.0.1'], 'PostgreSQL must listen on IPv4 loopback only')
+    require(ports.get(sy_port) == ['0.0.0.0'], 'Synapse wildcard IPv4 listener differs from configured bind')
+    require(ports.get(el_port) and all(a in ('0.0.0.0', '::', '*') for a in ports[el_port]), 'Element wildcard listener missing/changed')
 
-# Synapse creates its schema on first start; an empty public schema means it came
-# up without a working database block (or the deltas failed silently).
-TABLE_COUNT="$(pct exec "$CT_ID" -- sh -lc "podman exec matrix-postgres psql -U postgres -d synapse -tAc \"select count(*) from pg_tables where schemaname='public'\" 2>/dev/null" 2>/dev/null | tr -d '[:space:]' || true)"
-if [[ "$TABLE_COUNT" =~ ^[0-9]+$ ]] && (( TABLE_COUNT > 0 )); then
-  echo "  Database schema created (${TABLE_COUNT} tables in schema public)"
-else
-  echo "  ERROR: No tables found in the synapse database — schema was not created" >&2
-  echo "  Check: pct exec $CT_ID -- journalctl -u matrix-synapse.service --no-pager -n 80" >&2
-  VERIFY_FAIL=1
-fi
+def check_configuration():
+    require(app_policy['server_name'] == state['SYNAPSE_SERVER_NAME'] == config['server_name'], 'Immutable Matrix identity differs')
+    require([app_policy['synapse_port'], app_policy['element_port']] == [sy_port, el_port], 'Recorded Matrix ports differ')
+    require(config['listeners'] == [{'port': sy_port, 'tls': False, 'type': 'http', 'x_forwarded': True,
+        'bind_addresses': ['0.0.0.0'], 'resources': [{'names': ['client', 'federation'], 'compress': False}]}], 'Synapse bind/resource/proxy-header contract')
+    require(config['database']['name'] == 'psycopg2', 'Synapse database driver')
+    for key, expected in {'user': 'synapse', 'database': 'synapse', 'host': '127.0.0.1', 'port': 5432}.items():
+        require(config['database']['args'][key] == expected, 'Synapse database endpoint/role contract')
+    require(config['media_store_path'] == '/data/media_store', 'Synapse media must remain in persistent data mount')
+    require(config['public_baseurl'] == 'https://' + state['SYNAPSE_FQDN'] + '/' and
+            config['serve_server_wellknown'] is True, 'Public URL/discovery configuration')
+    require(config['enable_registration'] is True and config['registration_requires_token'] is True
+            and bool(config['registration_shared_secret']), 'Token-protected registration configuration')
+    require(config['max_upload_size'] == app_policy['max_upload_size'], 'Upload size configuration')
+    require(config['turn_uris'] == app_policy['turn_uris'] and config['turn_allow_guests'] == app_policy['turn_guests']
+            and config['turn_user_lifetime'] == app_policy['turn_lifetime'], 'TURN configuration')
+    require(bool(config.get('turn_shared_secret')) == (app_policy['turn_mode'] != 'disabled'), 'TURN secret presence')
+    if app_policy['rtc_auth']:
+        require(config['matrix_rtc']['transports'] == [{'type': 'livekit', 'livekit_service_url': app_policy['rtc_auth']}], 'RTC transport configuration')
+        require(all(config['experimental_features'].get(k) is True for k in ('msc3266_enabled', 'msc4143_enabled', 'msc4222_enabled'))
+                and config['max_event_delay_duration'] == '24h', 'RTC delayed-event prerequisites')
+    element = json.loads(Path('/opt/matrix/element-config.json').read_text())
+    require(element['default_server_config']['m.homeserver'] == {
+        'base_url': 'https://' + state['SYNAPSE_FQDN'], 'server_name': state['SYNAPSE_SERVER_NAME']}, 'Element homeserver configuration')
+    # Check the live mounted file privately, including registration/TURN secrets.
+    mounted = run(['podman', 'exec', '--user', '991:991', 'matrix-synapse', 'cat', '/data/homeserver.yaml'], 'Synapse mounted configuration')
+    require(yaml.safe_load(mounted) == config, 'Synapse runtime configuration delivery')
 
-EL_HEALTHY=0
-# shellcheck disable=SC2034
-for i in $(seq 1 30); do
-  HTTP_CODE="$(pct exec "$CT_ID" -- sh -lc "curl -s -o /dev/null -w '%{http_code}' --max-time 3 'http://127.0.0.1:${ELEMENT_PORT}/' 2>/dev/null" 2>/dev/null || echo 000)"
-  case "$HTTP_CODE" in
-    200)
-      EL_HEALTHY=1
-      break
-      ;;
-  esac
-  sleep 2
-done
+def check_timezone():
+    zone = state['APP_TZ']
+    require(zone == app_policy['timezone'], 'Application timezone policy differs')
+    ZoneInfo(zone)
+    policy_path = Path('/var/lib/lab-hardening/policy.json')
+    if policy_path.exists():
+        policy = json.loads(policy_path.read_text())
+        require(policy['version'] == '1.2.0' and policy['profile'] == 'lxc', 'Hardening version/profile differs')
+        require(policy['timezone']['effective'] == zone, 'Final hardening/application timezone mismatch')
+        require(run(['/usr/local/sbin/lab-timezone', 'check', str(policy_path)], 'Guest timezone check') == zone, 'Guest timezone mismatch')
+    else:
+        marker = Path('/run/matrix-install-bootstrap.json')
+        require(initial and marker.is_file() and not marker.is_symlink(), 'Final hardening policy is missing')
+        st = marker.stat()
+        require(st.st_uid == 0 and st.st_mode & 0o777 == 0o600, 'Unsafe initial verification marker')
+        plan = json.loads(marker.read_text())
+        require(plan['effective'] == zone, 'Bootstrap timezone mismatch')
+        actual = json.loads(run(['/usr/local/sbin/lab-timezone', 'plan', '1' if plan['preserve'] else '0',
+                                plan['requested'] or ''], 'Bootstrap timezone recheck'))
+        require(actual == plan, 'Bootstrap guest timezone plan changed')
+    for container in ('matrix-synapse', 'matrix-element', 'matrix-postgres'):
+        unit = Path('/etc/containers/systemd/' + container + '.container').read_text()
+        require(re.findall(r'^Environment=TZ=(.*)$', unit, re.M) == [zone], 'Quadlet timezone delivery')
+        info = json.loads(run(['podman', 'inspect', container], 'Timezone container inspection'))[0]
+        require([v for v in info['Config']['Env'] if v.startswith('TZ=')] == ['TZ=' + zone], 'Running container timezone environment')
+        require(run(['podman', 'exec', container, 'printenv', 'TZ'], 'Runtime timezone delivery') == zone, 'Runtime TZ differs')
+    # Synapse's Python local-time mechanism is checked at fixed winter/summer
+    # epochs. Element is static web content; browser display uses client time.
+    # PostgreSQL SQL/log timezone is separate and is not rewritten for uniformity.
+    for stamp in (1768435200, 1784073600):
+        expected = datetime.fromtimestamp(stamp, ZoneInfo(zone)).strftime('%Y-%m-%dT%H:%M:%S%z')
+        actual = run(['podman', 'exec', 'matrix-synapse', 'python', '-c',
+            'import time,sys; print(time.strftime("%Y-%m-%dT%H:%M:%S%z",time.localtime(int(sys.argv[1]))))', str(stamp)], 'Synapse local-time behavior')
+        require(actual == expected, 'Synapse timezone use differs from planned guest zone')
 
-if [[ "$EL_HEALTHY" -eq 1 ]]; then
-  echo "  Element health check passed (HTTP $HTTP_CODE on port ${ELEMENT_PORT})"
-else
-  echo "  ERROR: Element did not return 200 on port ${ELEMENT_PORT}" >&2
-  echo "  Check: pct exec $CT_ID -- journalctl -u matrix-element.service --no-pager -n 50" >&2
-  VERIFY_FAIL=1
-fi
+if os.geteuid() != 0 or sys.argv[1:] not in ([], ['--initial']):
+    raise SystemExit('Usage: matrix-verify [--initial] as root inside the Matrix CT')
+initial = sys.argv[1:] == ['--initial']
+try:
+    for path in ['/opt/matrix/.env', '/opt/matrix/install-policy.json', '/opt/matrix/firewall-policy.json']:
+        p = Path(path)
+        require(p.is_file() and not p.is_symlink() and p.stat().st_uid == 0 and not p.stat().st_mode & 0o022, 'Unsafe application policy/state file')
+    state = state_file('/opt/matrix/.env')
+    sy_port, el_port = int(state['SYNAPSE_PORT']), int(state['ELEMENT_PORT'])
+    require(1024 <= sy_port <= 65535 and 1024 <= el_port <= 65535 and len({sy_port, el_port, 5432}) == 3, 'Invalid service ports')
+    for key in ['INITIAL_WAIT_SECONDS', 'UPDATE_WAIT_SECONDS']:
+        require(re.fullmatch(r'[1-9][0-9]{1,4}', state[key]) and 30 <= int(state[key]) <= 86400, 'Invalid readiness budget')
+    wait_seconds = int(state['INITIAL_WAIT_SECONDS' if initial else 'UPDATE_WAIT_SECONDS'])
+    require(state['AUTO_UPDATE'] in ('0', '1') and re.fullmatch(r'(?:[01][0-9]|2[0-3]):[0-5][0-9]', state['UPDATE_TIME']), 'Invalid image timer policy')
+    app_policy = json.loads(Path('/opt/matrix/install-policy.json').read_text())
+    config = yaml.safe_load(Path('/opt/matrix/synapse/homeserver.yaml').read_text())
+except Exception:
+    raise SystemExit('FAIL: Matrix configuration is missing or malformed; no changes made.')
+restart_counts = {}
+container_pids = {}
+for label, check in [('UFW effective sources', check_firewall), ('Bounded readiness and initial restart policy', wait_ready), ('Services, images, mounts and ownership', check_identity), ('Application configuration and discovery settings', check_configuration), ('Application HTTP contracts', check_http), ('Database authentication and privileges', check_database), ('Listener bindings and process ownership', check_sockets), ('Guest/application timezone policy and delivery', check_timezone)]:
+    try:
+        check()
+        print('PASS: ' + label)
+    except Exception as exc:
+        # RuntimeError messages above are deliberately secret-free; other
+        # exceptions might embed configuration or request contents.
+        detail = str(exc) if isinstance(exc, RuntimeError) else type(exc).__name__
+        errors.append(label)
+        print('FAIL: ' + label + ': ' + detail)
+if restart_counts:
+    time.sleep(3)
+    for container, before in restart_counts.items():
+        try:
+            after = run(['systemctl', 'show', container + '.service', '-p', 'NRestarts', '--value'], container + ' restart stability')
+            require(before == after, container + ': restarted during verification')
+            run(['systemctl', 'is-active', '--quiet', container + '.service'], container + ' remains active')
+        except Exception:
+            errors.append(container + ' stability')
+            print('FAIL: ' + container + ' did not stay active with stable restart count')
+print('Matrix verification: ' + ('FAIL' if errors else 'PASS'))
+sys.exit(1 if errors else 0)
+MATRIX_VERIFY
+pct push "$CT_ID" "$tmp" /usr/local/sbin/matrix-verify --perms 0755
+rm -f "$tmp"
 
-# ── Verify authentication and effective database privileges ───────────────────
-# pg_isready alone cannot verify passwords. Require a deliberately bad password
-# to fail, then verify the real application password over TCP without argv leaks.
-if pct exec "$CT_ID" -- podman exec -e PGPASSWORD=deliberately-wrong matrix-postgres \
-  psql -w -h 127.0.0.1 -U synapse -d synapse -tAc 'SELECT 1' >/dev/null 2>&1; then
-  echo "ERROR: PostgreSQL accepted an incorrect password on TCP loopback." >&2
-  VERIFY_FAIL=1
-fi
-if ! printf '%s\n' "$DB_PASSWORD" | pct exec "$CT_ID" -- podman exec -i matrix-postgres \
-  bash -c 'IFS= read -r PGPASSWORD; export PGPASSWORD; exec psql -w -h 127.0.0.1 -U synapse -d synapse -tAc "SELECT 1"' >/dev/null; then
-  echo "ERROR: PostgreSQL rejected the application password over TCP." >&2
-  VERIFY_FAIL=1
-fi
-ROLE_OK=$(pct exec "$CT_ID" -- podman exec matrix-postgres psql -U postgres -d postgres -tAc \
-  "SELECT rolcanlogin AND NOT rolsuper AND NOT rolcreatedb AND NOT rolcreaterole AND NOT rolreplication AND NOT rolbypassrls FROM pg_roles WHERE rolname='synapse'" | tr -d '[:space:]')
-[[ $ROLE_OK == t ]] || { echo "ERROR: Synapse database role has unexpected privileges." >&2; VERIFY_FAIL=1; }
-OWNER_OK=$(pct exec "$CT_ID" -- podman exec matrix-postgres psql -U postgres -d postgres -tAc \
-  "SELECT pg_get_userbyid(datdba)='synapse' AND datcollate='C' AND datctype='C' FROM pg_database WHERE datname='synapse'" | tr -d '[:space:]')
-[[ $OWNER_OK == t ]] || { echo "ERROR: Database owner/locale is incorrect." >&2; VERIFY_FAIL=1; }
-HBA_OK=$(pct exec "$CT_ID" -- podman exec matrix-postgres psql -U postgres -d postgres -tAc \
-  "SELECT count(*)=0 FROM pg_hba_file_rules WHERE error IS NOT NULL OR (type LIKE 'host%' AND auth_method <> 'scram-sha-256')" | tr -d '[:space:]')
-[[ $HBA_OK == t ]] || { echo "ERROR: Unexpected host authentication rule in pg_hba.conf." >&2; VERIFY_FAIL=1; }
-# Round-trip unquoted env-file secrets, without printing their values.
-for secret in POSTGRES_PASSWORD SYNAPSE_DB_PASSWORD; do
-  got=$(pct exec "$CT_ID" -- podman exec matrix-postgres printenv "$secret") || got=""
-  expected=$DB_PASSWORD
-  [[ $secret != POSTGRES_PASSWORD ]] || expected=$PG_ADMIN_PASSWORD
-  [[ $got == "$expected" ]] || { echo "ERROR: $secret env-file round trip failed." >&2; VERIFY_FAIL=1; }
-done
-unset DB_PASSWORD PG_ADMIN_PASSWORD TURN_SHARED_SECRET got expected
-
-
-if ! pct exec "$CT_ID" -- /usr/local/sbin/matrix-ufw-check; then
-  echo "  ERROR: UFW is inactive or its IPv4/IPv6 filtering is incomplete." >&2
-  VERIFY_FAIL=1
-fi
-
-if (( VERIFY_FAIL == 1 )); then
-  echo "" >&2
-  echo "  FATAL: Core verification failed — CT $CT_ID is preserved but the install is incomplete." >&2
-  echo "  Collect read-only diagnostics; correct the creator and use a fresh ID and hostname." >&2
-  false
-fi
-
-STAGE="maintenance setup"
+INSTALL_STAGE="maintenance setup"
 # ── Maintenance helper ────────────────────────────────────────────────────────
 tmp="$(mktemp)"
 cat > "$tmp" <<'MAINT'
@@ -1359,6 +1874,7 @@ cat > "$tmp" <<'MAINT'
 set -Eeo pipefail
 umask 077
 export LC_ALL=C
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 
 APP_DIR=/opt/matrix
 ENV_FILE=$APP_DIR/.env
@@ -1395,19 +1911,21 @@ read_state() {
     [[ ! ${seen[$key]+yes} ]] || die "Duplicate state key: $key"
     seen[$key]=1
     case $key in
-      SYNAPSE_IMAGE_REPO|SYNAPSE_TAG|SYNAPSE_IMAGE|SYNAPSE_IMAGE_ID|ELEMENT_IMAGE_REPO|ELEMENT_TAG|ELEMENT_IMAGE|ELEMENT_IMAGE_ID|POSTGRES_IMAGE_REPO|POSTGRES_TAG|POSTGRES_IMAGE|POSTGRES_IMAGE_ID|SYNAPSE_PORT|ELEMENT_PORT|SYNAPSE_WAIT_SECONDS|AUTO_UPDATE|PODMAN_FUSE_OVERLAY)
+      SYNAPSE_IMAGE_REPO|SYNAPSE_TAG|SYNAPSE_IMAGE|SYNAPSE_IMAGE_ID|ELEMENT_IMAGE_REPO|ELEMENT_TAG|ELEMENT_IMAGE|ELEMENT_IMAGE_ID|POSTGRES_IMAGE_REPO|POSTGRES_TAG|POSTGRES_IMAGE|POSTGRES_IMAGE_ID|SYNAPSE_PORT|ELEMENT_PORT|UPDATE_WAIT_SECONDS|INITIAL_WAIT_SECONDS|AUTO_UPDATE|PODMAN_FUSE_OVERLAY)
         [[ $value =~ ^[A-Za-z0-9_./:+-]+$ ]] || die "Invalid value for $key. Use unquoted KEY=value."
         printf -v "$key" '%s' "$value"
         ;;
       *) ;;  # preserve other configuration keys without executing or interpreting them
     esac
   done < "$ENV_FILE"
-  for key in SYNAPSE_PORT ELEMENT_PORT SYNAPSE_WAIT_SECONDS AUTO_UPDATE PODMAN_FUSE_OVERLAY; do
+  for key in SYNAPSE_PORT ELEMENT_PORT UPDATE_WAIT_SECONDS INITIAL_WAIT_SECONDS AUTO_UPDATE PODMAN_FUSE_OVERLAY; do
     [[ ${seen[$key]+yes} ]] || die "Missing state key: $key"
   done
   [[ $SYNAPSE_PORT =~ ^[1-9][0-9]{3,4}$ && $ELEMENT_PORT =~ ^[1-9][0-9]{3,4}$ ]] || die "Invalid HTTP ports."
-  (( SYNAPSE_PORT <= 65535 && ELEMENT_PORT <= 65535 )) || die "Invalid HTTP ports."
-  [[ $SYNAPSE_WAIT_SECONDS =~ ^[1-9][0-9]{1,4}$ ]] && (( SYNAPSE_WAIT_SECONDS <= 86400 )) || die "Invalid migration wait."
+  (( SYNAPSE_PORT >= 1024 && ELEMENT_PORT >= 1024 && SYNAPSE_PORT <= 65535 && ELEMENT_PORT <= 65535 && SYNAPSE_PORT != ELEMENT_PORT && SYNAPSE_PORT != 5432 && ELEMENT_PORT != 5432 )) || die "Invalid HTTP ports."
+  for key in UPDATE_WAIT_SECONDS INITIAL_WAIT_SECONDS; do
+    [[ ${!key} =~ ^[1-9][0-9]{1,4}$ ]] && (( ${!key} >= 30 && ${!key} <= 86400 )) || die "Invalid verification wait."
+  done
   [[ $AUTO_UPDATE =~ ^[01]$ && $PODMAN_FUSE_OVERLAY =~ ^[01]$ ]] || die "Invalid policy flag."
 }
 unit_value() {
@@ -1493,7 +2011,7 @@ finish() {
         if [[ $COMPONENT == ELEMENT ]]; then
           systemctl restart "$SERVICE" && wait_for_component element 120 || restored=0
         elif (( APP_STOPPED )); then
-          systemctl start matrix-synapse.service && wait_for_component synapse "$SYNAPSE_WAIT_SECONDS" || restored=0
+          systemctl start matrix-synapse.service && wait_for_component synapse "$UPDATE_WAIT_SECONDS" || restored=0
         fi
       fi
       if (( restored )); then
@@ -1505,7 +2023,6 @@ finish() {
       printf '  Target %s image is retained. No automatic database/image downgrade.\n' "$COMPONENT" >&2
       printf '  Synapse may still be migrating. Inspect journalctl -u matrix-synapse.service -u matrix-postgres.service.\n' >&2
       printf '  Recovery is through the matching PBS/PVE checkpoint if required.\n' >&2
-      [[ $COMPONENT != POSTGRES ]] || printf '  After PostgreSQL is healthy: systemctl start matrix-synapse.service\n' >&2
     fi
   elif (( rc != 0 && APP_STOPPED )); then
     systemctl start matrix-synapse.service || printf '  Could not resume Synapse; inspect its journal.\n' >&2
@@ -1523,7 +2040,7 @@ trap 'exit 129' HUP
 
 update_component() {
   local component=$1 requested=${2:-} repo_key repo old_tag old_image old_id actual target new_id key configured
-  local old_variant new_variant old_version new_version target_image use_previous=0 previous_id="" old_previous_id=""
+  local old_variant new_variant old_version new_version target_image use_previous=0 previous_id=""
   COMPONENT=$component; UNIT="$UNIT_DIR/matrix-${component,,}.container"
   SERVICE="matrix-${component,,}.service"
   SWITCHED=0; START_ATTEMPTED=0; APP_STOPPED=0
@@ -1540,7 +2057,6 @@ update_component() {
   [[ $(unit_value 'Pull=' "$UNIT") == never ]] || die "Unit must use Pull=never."
   target=${requested:-$old_tag}
   if [[ $component == ELEMENT ]]; then
-    old_previous_id=$(unit_value '# PreviousImageID=' "$UNIT" 2>/dev/null || true)
     if [[ $target == previous ]]; then
       use_previous=1
       target=$(unit_value '# PreviousTag=' "$UNIT") || die "No previous Element version recorded yet."
@@ -1561,11 +2077,11 @@ update_component() {
     [[ $(printf '%s\n%s\n' "$old_version" "$new_version" | sort -V | head -n 1) == "$old_version" ]] \
       || die "Stateful downgrades require version-specific review and PBS/PVE recovery."
   fi
-  /usr/local/sbin/matrix-ufw-check || die "UFW filtering is not active; restore firewall policy before maintenance."
+  /usr/local/sbin/matrix-ufw-check || die "UFW policy verification failed; inspect the preserved configuration."
   systemctl is-active --quiet "$SERVICE" || die "$SERVICE must be active before updating."
   actual=$(podman inspect --format '{{.Image}}' "matrix-${component,,}") || die "Cannot inspect running image."
   actual=$(image_id "$actual") || die "Running image is unavailable."
-  [[ $actual == "$old_id" ]] || die "Running and configured IDs differ; inspect/restart the selected service first."
+  [[ $actual == "$old_id" ]] || die "Running and configured IDs differ; inspect the selected service."
   wait_for_component "${component,,}" 30 || die "$SERVICE is unhealthy before update."
   if [[ $component == POSTGRES ]]; then
     wait_for_component synapse 30 || die "Synapse must be healthy before a database update."
@@ -1579,6 +2095,9 @@ update_component() {
       break
     fi
   done
+  # Shared implementation; already holding matrix-maint.lock, so do not recurse
+  # through the maintenance CLI. This is also the installed-policy gate.
+  /usr/local/sbin/matrix-verify
   if (( YES == 0 )); then
     [[ -t 8 ]] || die "Interactive terminal or --yes is required."
     printf '  Take/verify a PVE checkpoint or PBS backup on the host before updating.\n'
@@ -1601,6 +2120,7 @@ update_component() {
     new_id=$(image_id "$target_image") || die "Target image ID unavailable."
   fi
   if [[ $new_id == "$old_id" && $target == "$old_tag" ]]; then
+    /usr/local/sbin/matrix-verify
     printf '  %s image unchanged; no restart.\n' "$component"
     return 0
   fi
@@ -1652,11 +2172,11 @@ update_component() {
     # Once a persistent target MIGHT start, never restart the old image automatically.
     START_ATTEMPTED=1
     systemctl restart "$SERVICE"
-    wait_for_component "${component,,}" "$([[ $component == SYNAPSE ]] && printf '%s' "$SYNAPSE_WAIT_SECONDS" || printf 120)" \
+    wait_for_component "${component,,}" "$([[ $component == SYNAPSE ]] && printf '%s' "$UPDATE_WAIT_SECONDS" || printf 120)" \
       || die "$SERVICE failed readiness or restarted. Inspect logs; migration timeout does not kill Synapse."
     if [[ $component == POSTGRES ]]; then
       systemctl start matrix-synapse.service
-      wait_for_component synapse "$SYNAPSE_WAIT_SECONDS" || die "Synapse did not recover after the database update."
+      wait_for_component synapse "$UPDATE_WAIT_SECONDS" || die "Synapse did not recover after the database update."
     fi
   fi
   actual=$(podman inspect --format '{{.Image}}' "matrix-${component,,}")
@@ -1664,19 +2184,11 @@ update_component() {
   if [[ $component == ELEMENT ]]; then
     curl -fsS --max-time 10 "http://127.0.0.1:$ELEMENT_PORT/config.json" | python3 -m json.tool >/dev/null
   fi
+  /usr/local/sbin/matrix-verify
   SWITCHED=0; START_ATTEMPTED=0; APP_STOPPED=0
   rm -rf -- "$WORK"; WORK=""
-  if [[ $old_id != "$new_id" ]]; then
-    # Element: retain exactly one previous image under a local reference. Reverting
-    # its exact captured ID uses update-element previous, with no DB restore.
-    if [[ $component == ELEMENT ]]; then
-      if [[ $old_previous_id =~ ^sha256:[a-f0-9]{64}$ && $old_previous_id != "$old_id" && $old_previous_id != "$new_id" ]]; then
-        podman rmi "$old_previous_id" >/dev/null 2>&1 || true
-      fi
-    else
-      podman rmi "$old_id" >/dev/null 2>&1 || true
-    fi
-  fi
+  # Keep captured old images for reviewed recovery. Their presence is not a DB
+  # rollback and does not make a stateful downgrade safe. No automatic pruning.
   read_state
   printf '  Updated %s to %s (%s).\n' "$component" "$target" "$new_id"
 }
@@ -1686,6 +2198,12 @@ for command in podman systemctl curl python3 awk sed sort head cat stat grep mkt
   command -v "$command" >/dev/null || die "Missing command: $command"
 done
 [[ -f $ENV_FILE ]] || die "Missing $ENV_FILE; this helper belongs to the rewritten creator."
+for path in "$ENV_FILE" "$UNIT_DIR" "$UNIT_DIR"/matrix-{synapse,element,postgres}.container; do
+  [[ ! -L $path ]] || die "Refusing a symlinked maintenance control path."
+  [[ $(stat -c %u "$path") == 0 ]] || die "Maintenance control paths must be root-owned."
+  mode=$(stat -c %a "$path")
+  (( (8#$mode & 8#022) == 0 )) || die "Maintenance control paths must not be writable by group/other."
+done
 exec 9>"$LOCK"
 flock -n 9 || die "Another maintenance operation is running."
 YES=0
@@ -1705,7 +2223,7 @@ case $cmd in
     update_component "$component" "${1:-}"
     ;;
   auto-update)
-    (( $# == 0 )) || die "auto-update takes no positional arguments."
+    (( $# == 0 && YES == 0 )) || die "auto-update takes no arguments."
     [[ $AUTO_UPDATE == 1 ]] || { echo '  AUTO_UPDATE=0; skipping.'; exit 0; }
     YES=1
     # No all-stack transaction: earlier successful component changes remain if
@@ -1714,8 +2232,13 @@ case $cmd in
     update_component SYNAPSE
     update_component ELEMENT
     ;;
+  check)
+    (( YES == 0 )) || die "check accepts only optional --initial."
+    (( $# == 0 )) || { (( $# == 1 )) && [[ $1 == --initial ]]; } || die "check accepts only optional --initial."
+    /usr/local/sbin/matrix-verify "$@"
+    ;;
   version)
-    (( $# == 0 )) || die "version takes no arguments."
+    (( $# == 0 && YES == 0 )) || die "version takes no arguments."
     for component in SYNAPSE ELEMENT POSTGRES; do
       unit="$UNIT_DIR/matrix-${component,,}.container"
       printf '%s: %s\n  configured: %s\n  running:    %s\n' "$component" \
@@ -1724,8 +2247,10 @@ case $cmd in
     done
     ;;
   --help|-h)
+    (( $# == 0 && YES == 0 )) || die "--help takes no arguments."
     cat <<'HELP'
 Usage (root inside the CT):
+  /usr/local/bin/matrix-maint.sh check [--initial]
   /usr/local/bin/matrix-maint.sh update [Synapse-vX.Y.Z] [--yes]
   /usr/local/bin/matrix-maint.sh update-element [Element-vX.Y.Z|previous] [--yes]
   /usr/local/bin/matrix-maint.sh update-postgres [18.MINOR-same-variant] [--yes]
@@ -1733,6 +2258,7 @@ Usage (root inside the CT):
   /usr/local/bin/matrix-maint.sh version
 
 PBS/PVE owns backups and recovery. No in-CT backup/restore/rollback commands.
+check is observational; --initial requires zero restarts and the initial budget.
 With FUSE use stop-mode PBS; a live CT freeze can deadlock FUSE mounts.
 Manual updates remind you of the checkpoint; --yes/timers do not verify one.
 A missing tag re-pulls that component's current tag. Auto-update re-pulls all
@@ -1745,13 +2271,47 @@ Read Synapse release notes before changing versions; test real client/call
 compatibility after Element changes. HTTP readiness is not an end-to-end test.
 HELP
     ;;
-  *) die "Unknown command: $cmd. Use --help." ;;
+  *) die "Unknown maintenance command. Use --help." ;;
 esac
 MAINT
 pct push "$CT_ID" "$tmp" /usr/local/bin/matrix-maint.sh --perms 0755
 rm -f "$tmp"
-pct exec "$CT_ID" -- /usr/local/bin/matrix-maint.sh version
 
+
+INSTALL_STAGE="Quadlet compatibility"
+# ── Start via Quadlet ─────────────────────────────────────────────────────────
+# daemon-reload triggers the Quadlet generator which produces matrix-synapse.service,
+# matrix-element.service and matrix-postgres.service as transient systemd units.
+# WantedBy=multi-user.target handles boot restarts. Transient units cannot be
+# systemctl-enabled; daemon-reload is sufficient. Starting matrix-synapse.service
+# pulls in PostgreSQL via Requires= and waits for its health check (Notify=healthy);
+# Element is started alongside and is independent of both.
+pct exec "$CT_ID" -- bash -lc '
+  set -euo pipefail
+  /usr/lib/systemd/system-generators/podman-system-generator --dryrun >/dev/null
+  systemctl daemon-reload
+  for service in matrix-postgres matrix-synapse matrix-element; do
+    test "$(systemctl show "$service.service" -p LoadState --value)" = loaded
+  done
+'
+
+# Fail before persistent app startup if filtering was disabled during provisioning.
+pct exec "$CT_ID" -- /usr/local/sbin/matrix-ufw-check
+
+# First persistent service start: disarm BEFORE the command, including a failed start.
+INSTALL_STAGE="application startup"
+CLEANUP_ON_FAIL=0
+pct exec "$CT_ID" -- bash -lc "
+  set -euo pipefail
+  systemctl start '${SYNAPSE_QUADLET_SERVICE}' '${ELEMENT_QUADLET_SERVICE}'
+"
+
+INSTALL_STAGE="early application verification"
+sleep 30
+pct exec "$CT_ID" -- /usr/local/bin/matrix-maint.sh check --initial
+unset DB_PASSWORD PG_ADMIN_PASSWORD TURN_SHARED_SECRET
+
+INSTALL_STAGE="image timer definitions"
 # ── Auto-update timer (policy-driven) ─────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc "
   set -euo pipefail
@@ -1782,13 +2342,8 @@ EOF2
 
   systemctl daemon-reload
 "
-if [[ "$AUTO_UPDATE" -eq 1 ]]; then
-  pct exec "$CT_ID" -- bash -lc 'set -euo pipefail; systemctl enable --now matrix-update.timer'
-  echo "  Auto-update timer enabled"
-else
-  pct exec "$CT_ID" -- bash -lc 'set -euo pipefail; systemctl disable --now matrix-update.timer >/dev/null 2>&1 || true'
-  echo "  Auto-update timer installed but disabled"
-fi
+pct exec "$CT_ID" -- systemctl disable --now matrix-update.timer
+echo '  Image timer installed; activation waits for final verification.'
 
 # ── Extra packages ────────────────────────────────────────────────────────────
 if [[ "${#EXTRA_PACKAGES[@]}" -gt 0 ]]; then
@@ -1799,17 +2354,15 @@ if [[ "${#EXTRA_PACKAGES[@]}" -gt 0 ]]; then
   "
 fi
 
-STAGE="package cleanup"
+INSTALL_STAGE="package cleanup and MOTD"
 # ── Cleanup packages ──────────────────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc '
   set -euo pipefail
   export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l
-  apt-get purge -y man-db manpages 2>/dev/null || true
-  apt-get -y autoremove
   apt-get -y clean
 '
 
-STAGE="MOTD"
+INSTALL_STAGE="package cleanup and MOTD"
 # ── MOTD (dynamic drop-ins) ───────────────────────────────────────────────────
 pct exec "$CT_ID" -- bash -lc '
   set -euo pipefail
@@ -1825,6 +2378,7 @@ printf '\n  Matrix Synapse + Element (Podman/Quadlet)\n'
 printf '  ────────────────────────────────────\n'
 MOTDHEADER
 pct push "$CT_ID" "$tmp" /etc/update-motd.d/00-header --perms 0755
+# BEGIN COMMON: MOTD SYSINFO
 cat > "$tmp" <<'MOTDSYSINFO'
 #!/bin/sh
 ip=$(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -n1)
@@ -1833,6 +2387,7 @@ printf '  IP:        %s\n' "${ip:-n/a}"
 printf '  Uptime:    %s\n' "$(uptime -p 2>/dev/null || uptime)"
 printf '  Disk:      %s\n' "$(df -h / | awk 'NR==2{printf "%s/%s (%s used)", $3, $2, $5}')"
 MOTDSYSINFO
+# END COMMON: MOTD SYSINFO
 pct push "$CT_ID" "$tmp" /etc/update-motd.d/10-sysinfo --perms 0755
 cat > "$tmp" <<'MOTDAPP'
 #!/bin/sh
@@ -1845,6 +2400,10 @@ if [ -r /opt/matrix/.env ]; then
   server=$(sed -n 's/^SYNAPSE_FQDN=//p' /opt/matrix/.env)
   chat=$(sed -n 's/^ELEMENT_FQDN=//p' /opt/matrix/.env)
   printf '  Synapse: https://%s/ | Element: https://%s/\n' "$server" "$chat"
+  auto=$(sed -n 's/^AUTO_UPDATE=//p' /opt/matrix/.env)
+  schedule=$(sed -n 's/^UPDATE_TIME=//p' /opt/matrix/.env)
+  zone=$(sed -n 's/^APP_TZ=//p' /opt/matrix/.env)
+  printf '  Image updates: AUTO_UPDATE=%s; daily %s (%s)\n' "$auto" "$schedule" "$zone"
   fuse=$(sed -n 's/^PODMAN_FUSE_OVERLAY=//p' /opt/matrix/.env)
   if [ "$fuse" = 1 ]; then printf '  FUSE: stop-mode PBS backups; freezing a live CT can deadlock.\n'; fi
 fi
@@ -1852,238 +2411,78 @@ printf '  Config: /opt/matrix/synapse/homeserver.yaml, /opt/matrix/.env\n'
 printf '  Maintenance: /usr/local/bin/matrix-maint.sh --help\n'
 printf '  Logs: journalctl -u matrix-synapse.service -f\n'
 printf '  Ingress: UFW policy in /opt/matrix/firewall-policy.json.\n'
-printf '  Verify: /usr/local/sbin/matrix-verify; /usr/local/sbin/lab-hardening-check\n'
+printf '  Check: /usr/local/bin/matrix-maint.sh check\n'
+printf '  Versions: /usr/local/bin/matrix-maint.sh version\n'
+printf '  Hardening: /usr/local/sbin/lab-hardening-check\n'
 printf '  Firewall: ufw status verbose; manage locally through pct enter/exec.\n'
 printf '  Before updates: host PBS/PVE checkpoint. Synapse image reversal may be unsafe.\n'
 printf '  Element updates are independent; HTTP readiness does not verify calls.\n'
 MOTDAPP
 pct push "$CT_ID" "$tmp" /etc/update-motd.d/30-app --perms 0755
+# BEGIN COMMON: MOTD FOOTER
 cat > "$tmp" <<'MOTDFOOTER'
 #!/bin/sh
 printf '  ────────────────────────────────────\n\n'
 MOTDFOOTER
+# END COMMON: MOTD FOOTER
 pct push "$CT_ID" "$tmp" /etc/update-motd.d/99-footer --perms 0755
 rm -f "$tmp"
 
-# ── Final verification helper ─────────────────────────────────────────────────
-# Reads configuration/runtime state; no updates, restarts or report-file writes.
-tmp=$(mktemp)
-cat > "$tmp" <<'MATRIX_VERIFY'
-#!/usr/bin/python3
-"""Read-only Matrix checks. No repairs, package/image changes or report writes."""
-import ipaddress
-import json
-import os
-from pathlib import Path
-import re
-import shlex
-import subprocess
-import sys
-import time
-import urllib.request
-import yaml
+# BEGIN COMMON: TERMINAL WRAPPER
+# COMMON TERMINAL WRAPPER
+pct exec "$CT_ID" -- bash -lc '
+  set -euo pipefail
+  touch /root/.bashrc
+  grep -q "^export TERM=" /root/.bashrc 2>/dev/null || echo "export TERM=xterm-256color" >> /root/.bashrc
+'
+# END COMMON: TERMINAL WRAPPER
 
-os.environ['PATH'] = '/usr/sbin:/usr/bin:/sbin:/bin'
-os.environ['LC_ALL'] = 'C'
-errors = []
+# BEGIN COMMON: TIMEZONE PLAN RECHECK
+# COMMON TIMEZONE PLAN RECHECK
+TIMEZONE_PLAN_LATE=$(pct exec "$CT_ID" -- /usr/local/sbin/lab-timezone plan "$PRESERVE_EXISTING_TIMEZONE" "$SERVER_TIMEZONE")
+[[ $TIMEZONE_PLAN == "$TIMEZONE_PLAN_LATE" ]] || {
+  echo 'ERROR: Guest timezone changed since early planning; CT preserved.' >&2
+  false
+}
+unset TIMEZONE_PLAN_LATE
+# END COMMON: TIMEZONE PLAN RECHECK
 
-def require(ok, label):
-    if not ok:
-        raise RuntimeError(label)
-
-def run(args, label, data=None, acceptable=(0,)):
-    p = subprocess.run(args, input=data, text=True, capture_output=True, timeout=30)
-    # Never print argv/environment or raw stderr: either may contain credentials.
-    require(p.returncode in acceptable, f'{label}: command failed (rc={p.returncode})')
-    return p.stdout.strip()
-
-def state_file(path):
-    result = {}
-    for line in Path(path).read_text().splitlines():
-        if not line or line.startswith('#'):
-            continue
-        k, v = line.split('=', 1)
-        require(k not in result, 'Duplicate configuration key')
-        result[k] = v
-    return result
-
-def http(port, path):
-    with urllib.request.urlopen(f'http://127.0.0.1:{port}{path}', timeout=5) as response:
-        require(response.status == 200, 'Unexpected HTTP status')
-        return response.read()
-
-def check_firewall():
-    run(['/usr/local/sbin/matrix-ufw-check'], 'UFW boot guard')
-    policy = json.loads(Path('/opt/matrix/firewall-policy.json').read_text())
-    require(policy['ports'] == [sy_port, el_port], 'Firewall/application ports differ')
-    sources = [ipaddress.ip_network(s) for s in policy['sources']]
-    for family, tool, prefix in [(4, 'iptables', 'ufw'), (6, 'ip6tables', 'ufw6')]:
-        chain = prefix + '-user-input'
-        networks = [s for s in sources if s.version == family] if sources else [None]
-        expected = set()
-        for source in networks:
-            for port in policy['ports']:
-                rule = (['-s', str(source)] if source else []) + ['-p', 'tcp', '-m', 'tcp', '--dport', str(port), '-j', 'ACCEPT']
-                run([tool, '-w', '5', '-C', chain] + rule, f'IPv{family} selected source rule / TCP {port}')
-                expected.add(tuple(['-A', chain] + rule))
-        actual = run([tool, '-w', '5', '-S', chain], f'IPv{family} user rules')
-        # Exact user-chain policy also rejects broad/earlier rules that could
-        # override the selected sources. Normalize host /32 and /128 spelling.
-        actual_rules = set()
-        for line in actual.splitlines():
-            words = shlex.split(line)
-            if words[:1] != ['-A']:
-                continue
-            if '-s' in words:
-                i = words.index('-s') + 1
-                words[i] = str(ipaddress.ip_network(words[i]))
-            actual_rules.add(tuple(words))
-        require(actual_rules == expected, f'IPv{family} UFW user policy has extra/mismatched rules; review without resetting UFW')
-
-def check_identity():
-    for name, key, mounts in [
-        ('synapse', 'SYNAPSE', {'/data': ('/opt/matrix/synapse', True)}),
-        ('element', 'ELEMENT', {'/app/config.json': ('/opt/matrix/element-config.json', False)}),
-        ('postgres', 'POSTGRES', {'/var/lib/postgresql': ('/opt/matrix/postgresdata', True),
-                               '/docker-entrypoint-initdb.d/10-synapse.sh': ('/opt/matrix/postgres-init.sh', False)})]:
-        container = 'matrix-' + name
-        unit = Path('/etc/containers/systemd/' + container + '.container').read_text()
-        ids = re.findall(r'^Image=(sha256:[a-f0-9]{64})$', unit, re.M)
-        require(len(ids) == 1 and ids[0] == state[key + '_IMAGE_ID'], container + ': image metadata mismatch')
-        require(re.findall(r'^Pull=(.*)$', unit, re.M) == ['never'], container + ': Pull policy')
-        info = json.loads(run(['podman', 'inspect', container], container + ' inspection'))[0]
-        require(info['State']['Running'] and 'sha256:' + info['Image'].removeprefix('sha256:') == ids[0], container + ': running image/identity')
-        require(info['HostConfig']['NetworkMode'] == 'host', container + ': host network')
-        actual = {m['Destination']: (m['Source'], m['RW']) for m in info['Mounts']}
-        for destination, value in mounts.items():
-            require(actual.get(destination) == value, container + ': persistent mount ' + destination)
-        run(['systemctl', 'is-active', '--quiet', container + '.service'], container + ' active')
-        before = run(['systemctl', 'show', container + '.service', '-p', 'NRestarts', '--value'], container + ' restarts')
-        require(before.isdigit(), container + ': missing restart counter')
-        restart_counts[container] = before
-        status = Path('/proc/' + str(info['State']['Pid']) + '/status').read_text()
-        uid = int(re.search(r'^Uid:\s+(\d+)', status, re.M)[1])
-        if name == 'synapse':
-            require(uid == 991, 'Synapse main process UID must be 991')
-        elif name == 'postgres':
-            expected_uid = int(run(['podman', 'exec', container, 'id', '-u', 'postgres'], 'PostgreSQL UID'))
-            require(uid == expected_uid and uid != 0, 'PostgreSQL main process UID')
-            cluster = Path('/opt/matrix/postgresdata/18/docker')
-            require((cluster / 'PG_VERSION').read_text().strip() == '18', 'PostgreSQL persistent major')
-            # The selected official entrypoint uses `chown postgres` (UID only)
-            # and chmod 00700. PGDATA can therefore be postgres:root; owner-only
-            # access makes its group irrelevant. Never chown it to satisfy a check.
-            cluster_info = cluster.stat()
-            require(cluster_info.st_uid == expected_uid,
-                    f'PostgreSQL cluster ownership: uid={cluster_info.st_uid}, gid={cluster_info.st_gid}; expected uid={expected_uid}')
-            cluster_mode = cluster_info.st_mode & 0o7777
-            require(cluster_mode == 0o700,
-                    f'PostgreSQL cluster permissions: mode={cluster_mode:04o}; expected 0700')
-        else:
-            require(uid != 0, 'Element main process must remain unprivileged')
-    for path in ['/opt/matrix/synapse', '/opt/matrix/synapse/media_store']:
-        st = Path(path).stat()
-        require((st.st_uid, st.st_gid) == (991, 991), 'Synapse data ownership')
-    for path in ['/opt/matrix/synapse/homeserver.yaml', '/opt/matrix/postgres.env']:
-        require(Path(path).stat().st_mode & 0o777 == 0o600, 'Credential file mode: ' + path)
-
-def check_http():
-    start = time.monotonic()
-    while True:
-        try:
-            http(sy_port, '/health')
-            key = json.loads(http(sy_port, '/_matrix/key/v2/server'))
-            require(key['server_name'] == state['SYNAPSE_SERVER_NAME'], 'Synapse server identity')
-            versions = json.loads(http(sy_port, '/_matrix/client/versions'))
-            require(bool(versions['versions']), 'Matrix client versions response')
-            require(json.loads(http(el_port, '/config.json')) == json.loads(Path('/opt/matrix/element-config.json').read_text()), 'Element served configuration')
-            index = run(['podman', 'exec', 'matrix-element', 'cat', '/app/index.html'], 'Element image index')
-            require(http(el_port, '/').decode().strip() == index, 'Element index differs from running image')
-            return
-        except Exception:
-            if time.monotonic() - start >= 60:
-                raise
-            time.sleep(2)
-
-def check_database():
-    run(['podman', 'exec', 'matrix-postgres', 'pg_isready', '-h', '127.0.0.1', '-U', 'synapse', '-d', 'synapse'], 'Database readiness')
-    password = config['database']['args']['password']
-    env = state_file('/opt/matrix/postgres.env')
-    require(password == env['SYNAPSE_DB_PASSWORD'], 'Synapse/database credential match')
-    for name in ['POSTGRES_PASSWORD', 'SYNAPSE_DB_PASSWORD', 'POSTGRES_INITDB_ARGS']:
-        got = run(['podman', 'exec', 'matrix-postgres', 'printenv', name], name + ' round trip')
-        require(got == env[name], name + ' round trip differs')
-    sql = "SELECT current_user = 'synapse' AND (SELECT count(*) > 0 FROM information_schema.tables WHERE table_schema='public');"
-    output = run(['podman', 'exec', '-i', 'matrix-postgres', 'bash', '-c',
-        'IFS= read -r PGPASSWORD; export PGPASSWORD; exec psql -X -w -v ON_ERROR_STOP=1 -h 127.0.0.1 -U synapse -d synapse -tAc "$1"', 'verify', sql], 'Authenticated application-role query/migrations', password + '\n')
-    require(output == 't', 'Application-role schema/migration query')
-    bad = subprocess.run(['podman', 'exec', '-e', 'PGPASSWORD=deliberately-wrong', 'matrix-postgres', 'psql', '-X', '-w', '-h', '127.0.0.1', '-U', 'synapse', '-d', 'synapse', '-tAc', 'SELECT 1'], capture_output=True, text=True, timeout=15)
-    require(bad.returncode != 0 and 'password authentication failed' in bad.stderr, 'Wrong password must fail specifically with authentication rejection')
-    queries = [
-        "SELECT rolcanlogin AND NOT rolsuper AND NOT rolcreatedb AND NOT rolcreaterole AND NOT rolreplication AND NOT rolbypassrls FROM pg_roles WHERE rolname='synapse'",
-        "SELECT pg_get_userbyid(datdba)='synapse' AND datcollate='C' AND datctype='C' FROM pg_database WHERE datname='synapse'",
-        "SELECT count(*)=0 FROM pg_hba_file_rules WHERE error IS NOT NULL OR (type LIKE 'host%' AND auth_method <> 'scram-sha-256')"]
-    for label, query in zip(['Application role restrictions', 'Database owner/locale', 'SCRAM host policy'], queries):
-        require(run(['podman', 'exec', 'matrix-postgres', 'psql', '-X', '-v', 'ON_ERROR_STOP=1', '-U', 'postgres', '-d', 'postgres', '-tAc', query], label) == 't', label)
-
-def check_sockets():
-    sockets = run(['ss', '-H', '-lnt'], 'TCP socket inventory')
-    ports = {}
-    for line in sockets.splitlines():
-        endpoint = line.split()[3]
-        address, port = endpoint.rsplit(':', 1)
-        address = address.split('%', 1)[0].strip('[]')
-        ports.setdefault(int(port), []).append(address)
-    require(ports.get(5432) == ['127.0.0.1'], 'PostgreSQL must listen on IPv4 loopback only')
-    for port in [sy_port, el_port]:
-        require(any(a == '*' or not ipaddress.ip_address(a).is_loopback for a in ports.get(port, [])), f'External application TCP {port} missing')
-
-require(os.geteuid() == 0, 'Run matrix-verify as root inside the Matrix CT')
-try:
-    state = state_file('/opt/matrix/.env')
-    sy_port, el_port = int(state['SYNAPSE_PORT']), int(state['ELEMENT_PORT'])
-    config = yaml.safe_load(Path('/opt/matrix/synapse/homeserver.yaml').read_text())
-except Exception:
-    raise SystemExit('FAIL: Matrix configuration is missing or malformed; no changes made.')
-restart_counts = {}
-for label, check in [('UFW effective sources', check_firewall), ('Services, images, mounts and ownership', check_identity), ('Application HTTP contracts', check_http), ('Database authentication and privileges', check_database), ('Listener bindings', check_sockets)]:
-    try:
-        check()
-        print('PASS: ' + label)
-    except Exception as exc:
-        # RuntimeError messages above are deliberately secret-free; other
-        # exceptions might embed configuration or request contents.
-        detail = str(exc) if isinstance(exc, RuntimeError) else type(exc).__name__
-        errors.append(label)
-        print('FAIL: ' + label + ': ' + detail)
-if restart_counts:
-    time.sleep(3)
-    for container, before in restart_counts.items():
-        try:
-            after = run(['systemctl', 'show', container + '.service', '-p', 'NRestarts', '--value'], container + ' restart stability')
-            require(before == after, container + ': restarted during verification')
-            run(['systemctl', 'is-active', '--quiet', container + '.service'], container + ' remains active')
-        except Exception:
-            errors.append(container + ' stability')
-            print('FAIL: ' + container + ' did not stay active with stable restart count')
-print('Matrix verification: ' + ('FAIL' if errors else 'PASS'))
-sys.exit(1 if errors else 0)
-MATRIX_VERIFY
-pct push "$CT_ID" "$tmp" /usr/local/sbin/matrix-verify --perms 0755
-rm -f "$tmp"
-
-# ── Shared hardening integration ──────────────────────────────────────────────
-STAGE="hardening"
-# Capture all six persistent rule files and effective filter tables. No counters
-# are included, so normal traffic cannot produce a false preservation failure.
-UFW_FILES_BEFORE=$(pct exec "$CT_ID" -- sha256sum /etc/ufw/before.rules /etc/ufw/after.rules /etc/ufw/user.rules /etc/ufw/before6.rules /etc/ufw/after6.rules /etc/ufw/user6.rules)
-UFW_V4_BEFORE=$(pct exec "$CT_ID" -- iptables -w 5 -S)
-UFW_V6_BEFORE=$(pct exec "$CT_ID" -- ip6tables -w 5 -S)
-# BEGIN APPROVED BASELINE: lab-hardening-block-v1.1.1.sh
-# SHA256: d9a70377b0bea40f2d415f89a26678bf5b266b7812f734706235509dbf18f6b2
+pct exec "$CT_ID" -- rm /run/matrix-install-bootstrap.json
+# BEGIN COMMON: HARDENING CALLER
+# COMMON HARDENING CALLER
+INSTALL_STAGE="shared hardening"
+CLEANUP_ON_FAIL=0
+[[ $EUID == 0 && -d /etc/pve ]] || {
+  echo 'ERROR: Shared hardening caller must be the verified Proxmox host.' >&2
+  false
+}
+command -v pveversion >/dev/null
+command -v pct >/dev/null
+pveversion >/dev/null
+[[ $CT_ID =~ ^[1-9][0-9]+$ ]] || {
+  echo 'ERROR: Invalid selected CT_ID.' >&2
+  false
+}
+pct status "$CT_ID" | grep -qx 'status: running'
+pct config "$CT_ID" | grep -qx 'unprivileged: 1'
+# A verified host login marker is not a guest SSH session.
+unset SSH_CONNECTION
+UFW_RULES_BEFORE=$(pct exec "$CT_ID" -- bash -s <<'UFW_SNAPSHOT_BEFORE'
+set -euo pipefail
+sha256sum /etc/ufw/{before,after,user}{,6}.rules
+iptables -w 5 -S
+ip6tables -w 5 -S
+UFW_SNAPSHOT_BEFORE
+)
+# END COMMON: HARDENING CALLER
+# BEGIN CANONICAL HARDENING: v1.2.0
 #!/usr/bin/env bash
 # ── Shared Debian 13 LXC hardening block ───────────────────────────────────────
-# Version: 1.1.1 (2026-09-12; scoped IPv6 listener parsing fix)
+# Version: 1.2.0 (2026-09-15; user-authorized LXC timezone adaptation)
+# Base v1.1.2 SHA-256: ae2fa917d7dfe007c5f3700ea9d8c6686867a892d4323af2eb78c847092c3774
+# Timezone policy source: debian-hardening.sh v1.0.3; native access code excluded.
+# Guest-only /etc/localtime handling replaces the native timedated dependency.
+# Timezone backups are observational; later failures have no automatic undo.
 # Paste this whole file AFTER the creator's MOTD/cleanup steps and BEFORE its
 # final verification/summary. Later MOTD code must not delete 25-lab-hardening.
 # Replace its old unattended-upgrades and sysctl sections with this block.
@@ -2107,21 +2506,26 @@ UFW_V6_BEFORE=$(pct exec "$CT_ID" -- ip6tables -w 5 -S)
 # UFW logging and all allow/deny rules retain the installer's existing policy.
 #
 # Managed paths:
+#   /etc/localtime; existing /etc/timezone (set mode only)
+#   /usr/local/sbin/lab-timezone (plan/check read-only; apply internal)
 #   /etc/sysctl.d/99-hardening.conf
 #   /etc/apt/apt.conf.d/99-lab-hardening
 #   /etc/needrestart/conf.d/99-lab-hardening.conf
 #   /etc/systemd/journald.conf.d/99-lab-hardening.conf
 #   /etc/systemd/system/apt-daily{,-upgrade}.service.d/90-lab-readiness.conf (LXC)
 #   /etc/systemd/system/lab-hardening-check.{service,timer}
-#   /usr/local/sbin/lab-{apt-wait-online,hardening-check}
+#   /usr/local/sbin/lab-{apt-wait-online,hardening-check,postfix-check}
 #   /etc/update-motd.d/25-lab-hardening
 #   /etc/default/ufw (IPT_SYSCTL only); SSH service/socket masks (when SSH removed)
+#   /etc/systemd/system/postfix*.{service,socket,path} masks (when Postfix removed)
 #   /var/lib/lab-hardening/{policy.json,status.json,last-index-refresh,check.lock}
 #   /var/backups/lab-hardening/<run>/ (configuration copies and dry-run log)
 # References: Debian trixie apt.conf(5), systemd-sysctl(8), ifquery(8),
 # journald.conf(5), needrestart(1); kernel.org networking/ip-sysctl.html.
 #
 # Settings may instead be assigned in the creator's top config section.
+SERVER_TIMEZONE="${SERVER_TIMEZONE-Europe/Berlin}"
+PRESERVE_EXISTING_TIMEZONE="${PRESERVE_EXISTING_TIMEZONE-0}" # 0=set; 1=keep guest zone
 HARDENING_PROFILE="${HARDENING_PROFILE:-lxc}"              # lxc; auto remains a compatible alias
 HARDENING_RP_FILTER="${HARDENING_RP_FILTER:-1}"            # 1=strict; 2=loose for asymmetric paths
 HARDENING_KEEP_SSH="${HARDENING_KEEP_SSH:-0}"              # 0=remove; 1=preserve
@@ -2158,7 +2562,7 @@ fi
   "$HARDENING_REMOVE_POSTFIX" "$HARDENING_JOURNAL_DAYS" \
   "$HARDENING_JOURNAL_MAX_MB" "$HARDENING_JOURNAL_RUNTIME_MB" \
   "$HARDENING_UPDATE_MAX_AGE_HOURS" "$HARDENING_TCP_PORTS" \
-  "$HARDENING_UDP_PORTS" <<'LAB_HARDENING_GUEST'
+  "$HARDENING_UDP_PORTS" "$PRESERVE_EXISTING_TIMEZONE" "$SERVER_TIMEZONE" <<'LAB_HARDENING_GUEST'
 set -Eeuo pipefail
 umask 022
 export LC_ALL=C DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l
@@ -2166,6 +2570,7 @@ export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 PROFILE=$1 RP_FILTER=$2 KEEP_SSH=$3 REMOVE_POSTFIX=$4
 JOURNAL_DAYS=$5 JOURNAL_MAX_MB=$6 JOURNAL_RUNTIME_MB=$7 UPDATE_MAX_AGE=$8
 TCP_PORTS=$9 UDP_PORTS=${10}
+PRESERVE_TIMEZONE=${11} REQUESTED_TIMEZONE=${12}
 [[ $EUID == 0 && -d /run/systemd/system ]] || {
   echo 'ERROR: A running systemd guest and root access are required.' >&2; exit 1;
 }
@@ -2201,7 +2606,7 @@ for port in $TCP_PORTS $UDP_PORTS; do
     echo 'ERROR: Port lists require space-separated numbers from 1 to 65535.' >&2; exit 1
   fi
 done
-for command in ufw iptables ip6tables ip ss sysctl python3 systemctl apt-get flock; do
+for command in ufw iptables ip6tables ip ss sysctl python3 systemctl apt-get flock timeout; do
   command -v "$command" >/dev/null || { echo "ERROR: Missing prerequisite: $command" >&2; exit 1; }
 done
 exec 9>/run/lock/lab-hardening-install.lock
@@ -2232,6 +2637,176 @@ install -d -m 0700 "$backup"
 hardening_exit=0
 trap 'hardening_exit=$?; rm -rf -- "$stage"; exit "$hardening_exit"' EXIT
 trap 'echo "ERROR: Hardening failed near guest line $LINENO. Guest preserved; config backups: $backup" >&2' ERR
+# Timezone policy is owned here, inside the verified LXC dispatch boundary.
+# Validate and apply before package operations; preserve mode makes no timezone writes.
+cat > "$stage/timezone.py" <<'TIMEZONE_HELPER'
+#!/usr/bin/python3
+"""LXC timezone policy, adapted from debian-hardening.sh v1.0.3.
+
+Only apply writes timezone files; plan/check are read-only. No timedated,
+clock, RTC, NTP, SSH, or access-recovery operations are performed.
+"""
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+from zoneinfo import ZoneInfo
+
+ZONES = Path('/usr/share/zoneinfo')
+LOCALTIME = Path('/etc/localtime')
+TIMEZONE = Path('/etc/timezone')
+
+
+def guest_guard():
+    if os.geteuid() != 0 or shutil.which('pveversion') or Path('/etc/pve').exists():
+        raise ValueError('Timezone operations require root inside the selected Debian 13 LXC.')
+    release = dict(line.split('=', 1) for line in Path('/etc/os-release').read_text().splitlines()
+                   if '=' in line and not line.startswith('#'))
+    if release.get('ID', '').strip('"') != 'debian' or release.get('VERSION_ID', '').strip('"') != '13':
+        raise ValueError('Timezone policy requires Debian 13.')
+    result = subprocess.run(['systemd-detect-virt', '--container'], text=True,
+                            capture_output=True, timeout=10)
+    if result.returncode or result.stdout.strip() != 'lxc':
+        raise ValueError('Timezone policy refuses environments other than LXC.')
+
+
+def zone_path(name):
+    # Same name grammar as the native source; validate against guest tzdata.
+    if not re.fullmatch(r'[A-Za-z0-9_+-]+(?:/[A-Za-z0-9_+-]+)*', name):
+        raise ValueError('Invalid SERVER_TIMEZONE; use an installed IANA timezone name.')
+    if name.split('/')[0] in ('posix', 'right', 'localtime', 'posixrules'):
+        raise ValueError('SERVER_TIMEZONE must identify an IANA zone, not a special tzdata tree.')
+    path = ZONES / name
+    try:
+        path.resolve(strict=True).relative_to(ZONES.resolve(strict=True))
+        with path.open('rb') as stream:
+            ZoneInfo.from_file(stream, key=name)
+    except (OSError, ValueError) as exc:
+        raise ValueError('Timezone is unavailable or invalid in this guest: ' + name) from exc
+    return path
+
+
+def effective_timezone():
+    if not LOCALTIME.exists() and not LOCALTIME.is_symlink():
+        zone_path('UTC')
+        return 'UTC'  # localtime(5): absent /etc/localtime means UTC.
+    if LOCALTIME.is_symlink():
+        # Keep the selected alias, rather than resolving US/Eastern to another name.
+        link = Path(os.path.normpath(LOCALTIME.parent / os.readlink(LOCALTIME)))
+        try:
+            name = str(link.relative_to(ZONES))
+        except ValueError as exc:
+            raise ValueError('/etc/localtime does not link into the guest zoneinfo tree.') from exc
+        zone_path(name)
+        return name
+    if LOCALTIME.is_file() and TIMEZONE.is_file() and not TIMEZONE.is_symlink():
+        name = TIMEZONE.read_text().strip()
+        if LOCALTIME.read_bytes() == zone_path(name).read_bytes():
+            return name
+    raise ValueError('Cannot identify the guest timezone from /etc/localtime and /etc/timezone.')
+
+
+def fingerprint(path):
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return {'kind': 'absent'}
+    if stat.S_ISLNK(info.st_mode):
+        return {'kind': 'symlink', 'target': os.readlink(path)}
+    if stat.S_ISREG(info.st_mode):
+        return {'kind': 'file', 'sha256': hashlib.sha256(path.read_bytes()).hexdigest()}
+    raise ValueError('Unsupported timezone file type: ' + str(path))
+
+
+def fingerprints():
+    return {str(path): fingerprint(path) for path in (LOCALTIME, TIMEZONE)}
+
+
+def plan(preserve, requested):
+    if preserve not in ('0', '1'):
+        raise ValueError('PRESERVE_EXISTING_TIMEZONE must be exactly 0 or 1.')
+    if preserve == '0':
+        zone_path(requested)
+        if TIMEZONE.is_symlink() or (TIMEZONE.exists() and not TIMEZONE.is_file()):
+            raise ValueError('Refusing to replace a non-regular /etc/timezone.')
+    before = effective_timezone()
+    return {'preserve': preserve == '1', 'requested': None if preserve == '1' else requested,
+            'before': before, 'effective': before if preserve == '1' else requested,
+            'files_before': fingerprints()}
+
+
+def verify(setting):
+    actual = effective_timezone()
+    if actual != setting['effective']:
+        raise ValueError('Guest timezone drift: expected ' + setting['effective'] + ', found ' + actual)
+    expected_files = setting.get('files', setting['files_before'])
+    if fingerprints() != expected_files:
+        raise ValueError('Guest timezone files changed; review /etc/localtime and /etc/timezone.')
+    return actual
+
+
+def apply(setting, backup):
+    if fingerprints() != setting['files_before'] or effective_timezone() != setting['before']:
+        raise ValueError('Guest timezone changed after validation; refusing to overwrite it.')
+    if not setting['preserve']:
+        target = zone_path(setting['requested'])
+        saved = Path(backup) / 'timezone'
+        saved.mkdir(mode=0o700, parents=True, exist_ok=False)
+        (saved / 'before.json').write_text(json.dumps(setting, indent=2) + '\n')
+        for path in (LOCALTIME, TIMEZONE):
+            if path.exists() or path.is_symlink():
+                shutil.copy2(path, saved / path.name, follow_symlinks=False)
+        # Atomic per-file replacement; no automatic undo of a later failure.
+        if setting['before'] != setting['requested']:
+            with tempfile.TemporaryDirectory(prefix='.lab-timezone-', dir=LOCALTIME.parent) as tmp:
+                replacement = Path(tmp) / 'localtime'
+                replacement.symlink_to(target)
+                os.replace(replacement, LOCALTIME)
+        # Debian uses /etc/localtime. Keep an existing legacy file consistent;
+        # do not introduce /etc/timezone when the template does not maintain it.
+        desired = setting['requested'] + '\n'
+        if TIMEZONE.exists() and TIMEZONE.read_text() != desired:
+            with tempfile.TemporaryDirectory(prefix='.lab-timezone-', dir=TIMEZONE.parent) as tmp:
+                replacement = Path(tmp) / 'timezone'
+                replacement.write_text(desired)
+                replacement.chmod(0o644)
+                os.replace(replacement, TIMEZONE)
+    final = {**setting, 'files': fingerprints()}
+    if setting['preserve'] and final['files'] != setting['files_before']:
+        raise ValueError('Preserve mode detected a timezone-file change.')
+    verify(final)
+    return final
+
+
+def main():
+    guest_guard()
+    if len(sys.argv) == 4 and sys.argv[1] == 'plan':
+        print(json.dumps(plan(sys.argv[2], sys.argv[3])))
+    elif len(sys.argv) == 4 and sys.argv[1] == 'apply':
+        setting = json.loads(Path(sys.argv[2]).read_text())
+        print(json.dumps(apply(setting, sys.argv[3])))
+    elif len(sys.argv) == 3 and sys.argv[1] == 'check':
+        policy = json.loads(Path(sys.argv[2]).read_text())
+        print(verify(policy['timezone']))
+    else:
+        raise ValueError('Invalid timezone helper arguments.')
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except Exception as exc:
+        print('ERROR: LXC timezone: ' + str(exc), file=sys.stderr)
+        raise SystemExit(1)
+TIMEZONE_HELPER
+python3 "$stage/timezone.py" plan "$PRESERVE_TIMEZONE" "$REQUESTED_TIMEZONE" > "$stage/timezone-plan.json"
+python3 "$stage/timezone.py" apply "$stage/timezone-plan.json" "$backup" > "$stage/timezone-policy.json"
 install -d -m 0755 /var/lib/lab-hardening
 if [[ $(systemctl show lab-hardening-check.timer -p LoadState --value) == loaded ]]; then
   systemctl stop lab-hardening-check.timer
@@ -2248,6 +2823,7 @@ apt-get -o DPkg::Lock::Timeout=120 install -y --no-install-recommends \
 mkdir -p "$stage/etc/apt/apt.conf.d" "$stage/etc/needrestart/conf.d" \
   "$stage/etc/systemd/journald.conf.d" "$stage/etc/sysctl.d" \
   "$stage/etc/systemd/system" "$stage/usr/local/sbin" "$stage/etc/update-motd.d"
+install -m 0755 "$stage/timezone.py" "$stage/usr/local/sbin/lab-timezone"
 cat > "$stage/etc/apt/apt.conf.d/99-lab-hardening" <<'APT_POLICY'
 // Managed by lab-hardening-block.sh. Debian release stays fixed at trixie.
 #clear Unattended-Upgrade::Allowed-Origins;
@@ -2379,6 +2955,148 @@ ExecStartPre=-/usr/local/sbin/lab-apt-wait-online
 APT_DROPIN
 done
 
+# ── Postfix inventory and runtime verification (read-only) ────────────────────
+cat > "$stage/usr/local/sbin/lab-postfix-check" <<'POSTFIX_CHECK_HELPER'
+#!/usr/bin/python3
+"""Read-only Postfix inventory and removal checks for the native Debian service."""
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+
+os.environ['LC_ALL'] = 'C'
+os.environ['PATH'] = '/usr/sbin:/usr/bin:/sbin:/bin'
+STANDARD_UNITS = {
+    'postfix.service', 'postfix@.service',
+    'postfix.socket', 'postfix@.socket',
+    'postfix-resolvconf.service', 'postfix-resolvconf.path',
+}
+INSTANCE = re.compile(r'postfix@[^/\s]+\.(?:service|socket)')
+TEMPLATES = {'postfix@.service', 'postfix@.socket'}
+# Debian's packaged daemon names are only an ambiguity guard when procfs denies
+# executable inspection, never sufficient identity for stopping/killing a PID.
+DAEMON_NAMES = {'master', 'anvil', 'bounce', 'cleanup', 'discard', 'dnsblog', 'error',
+                'flush', 'fsstone', 'lmtp', 'local', 'nqmgr', 'oqmgr', 'pickup', 'pipe',
+                'postlogd', 'postscreen', 'proxymap', 'qmgr', 'qmqpd', 'scache', 'showq',
+                'smtp', 'smtpd', 'spawn', 'tlsmgr', 'tlsproxy', 'trivial-rewrite',
+                'verify', 'virtual', 'postfix', 'postmulti', 'postdrop', 'postqueue'}
+
+def is_postfix_unit(name):
+    return name in STANDARD_UNITS or INSTANCE.fullmatch(name) is not None
+
+def command(args):
+    result = subprocess.run(args, capture_output=True, text=True, timeout=30)
+    if result.returncode:
+        raise RuntimeError(f'{" ".join(args)} exited {result.returncode}: '
+                           + (result.stderr.strip()[:1500] or '(no stderr)'))
+    return result.stdout
+
+try:
+    if os.geteuid() != 0:
+        raise ValueError('Root is required to inspect process ownership.')
+    if len(sys.argv) != 2 or sys.argv[1] not in {
+            '--units', '--stop-units', '--check-stopped', '--check-removed'}:
+        raise ValueError('Use --units, --stop-units, --check-stopped or --check-removed.')
+    mode = sys.argv[1]
+    runtime = {}
+    # Include not-found/masked units that systemd still has in memory. Never
+    # equate LoadState=not-found or package absence with a stopped service.
+    output = command(['systemctl', 'list-units', '--all', '--plain', '--full',
+                      '--no-legend', '--no-pager', 'postfix*'])
+    for line in output.splitlines():
+        fields = line.split()
+        if not fields:
+            continue
+        if len(fields) < 4:
+            raise ValueError('Malformed systemd unit inventory.')
+        unit, load, active, sub = fields[:4]
+        if is_postfix_unit(unit):
+            runtime[unit] = (load, active, sub)
+    units = set(STANDARD_UNITS) | runtime.keys()
+    if mode in {'--units', '--check-removed'}:
+        output = command(['systemctl', 'list-unit-files', '--full', '--no-legend',
+                          '--no-pager', 'postfix*'])
+        for line in output.splitlines():
+            fields = line.split()
+            if fields and is_postfix_unit(fields[0]):
+                units.add(fields[0])
+    if mode == '--units':
+        print('\n'.join(sorted(units)))
+        raise SystemExit(0)
+    if mode == '--stop-units':
+        # Only instantiated runtime units need stopping. Templates cannot run;
+        # absent/inactive units would make systemctl stop fail needlessly.
+        pending = [unit for unit, (_, active, _) in runtime.items()
+                   if unit not in TEMPLATES and active != 'inactive']
+        print('\n'.join(sorted(pending, key=lambda u: (u.endswith('.service'), u))))
+        raise SystemExit(0)
+
+    errors = []
+    for unit, (load, active, sub) in sorted(runtime.items()):
+        if active != 'inactive':
+            errors.append(f'{unit}: LoadState={load}, ActiveState={active}, SubState={sub}')
+    # Executable paths catch detached daemons and deleted executables. Cgroup
+    # membership catches remaining workers even if the unit file has vanished.
+    # Do not match a bare process name such as "master" and never signal a PID.
+    for process in Path('/proc').iterdir():
+        if not process.name.isdecimal():
+            continue
+        try:
+            groups = process.joinpath('cgroup').read_text()
+            try:
+                executable = os.readlink(process / 'exe').removesuffix(' (deleted)')
+            except FileNotFoundError:
+                executable = ''  # exited process, kernel thread or zombie
+            except PermissionError:
+                executable = ''
+                # LXC root need not have ptrace access to every unrelated
+                # process. Keep cgroup detection and fail on ambiguous daemon
+                # names instead of requiring extra CT capabilities.
+                name = process.joinpath('comm').read_text().strip()
+                if name in DAEMON_NAMES:
+                    errors.append(f'Cannot exclude a Postfix process: PID={process.name}, '
+                                  f'comm={name}; executable inspection denied')
+            group_owned = any(is_postfix_unit(component)
+                              for line in groups.splitlines()
+                              for component in line.split(':', 2)[-1].split('/'))
+            exe_owned = (executable.startswith(('/usr/lib/postfix/', '/usr/libexec/postfix/'))
+                         or executable in {'/usr/sbin/postfix', '/usr/sbin/postmulti',
+                                           '/usr/sbin/postdrop', '/usr/sbin/postqueue'})
+            if group_owned or exe_owned:
+                errors.append(f'Postfix process remains: PID={process.name}, '
+                              f'executable={executable or "unavailable"}')
+        except FileNotFoundError:
+            continue  # process exited during the read-only scan
+        except OSError as exc:
+            errors.append(f'Cannot inspect PID {process.name}: {exc.strerror}')
+    if mode == '--check-removed':
+        package = subprocess.run(['dpkg-query', '-W', '-f=${db:Status-Status}', 'postfix'],
+                                 capture_output=True, text=True, timeout=30)
+        absent = (package.returncode == 0 and package.stdout.strip() == 'not-installed')
+        absent = absent or (package.returncode == 1 and not package.stdout.strip()
+                            and package.stderr.strip() == 'dpkg-query: no packages found matching postfix')
+        if not absent:
+            errors.append('Postfix package is not confirmed purged: '
+                          + (package.stdout.strip() or package.stderr.strip()[:500] or 'unknown status'))
+        for unit in sorted(units):
+            # is-enabled returns nonzero for masked units; validate its text
+            # and reject runtime-only masks, which would disappear at boot.
+            result = subprocess.run(['systemctl', 'is-enabled', unit],
+                                    capture_output=True, text=True, timeout=30)
+            if result.returncode not in (0, 1) or result.stdout.strip() != 'masked':
+                errors.append(f'Persistent Postfix mask missing: {unit}')
+    if errors:
+        for error in errors:
+            print('ERROR: ' + error, file=sys.stderr)
+        raise SystemExit(1)
+    print('Postfix units and processes stopped.' if mode == '--check-stopped' else
+          'Postfix package purged; units masked; no remaining Postfix processes.')
+except Exception as exc:
+    print('ERROR: Postfix verification: ' + str(exc), file=sys.stderr)
+    raise SystemExit(1)
+POSTFIX_CHECK_HELPER
+
 # ── Reusable verification/report helper ────────────────────────────────────────
 # This helper reads policy/runtime state. Its only writes are its lock and report.
 # It never changes firewall rules, installs updates or restarts applications.
@@ -2401,6 +3119,7 @@ os.environ['PATH'] = '/usr/sbin:/usr/bin:/sbin:/bin'
 
 STATE = Path('/var/lib/lab-hardening')
 errors, warnings, listeners = [], [], []
+timezone = None
 
 def run(args, timeout=30):
     try:
@@ -2436,6 +3155,13 @@ try:
                     f'Managed file changed: {path}; review and rerun the hardening block.')
         except OSError:
             errors.append(f'Managed file missing: {path}')
+
+    # Check selected zone and file identity without freezing tzdata database bytes.
+    tz_result = subprocess.run(['/usr/local/sbin/lab-timezone', 'check', str(STATE / 'policy.json')],
+                               text=True, capture_output=True, timeout=30)
+    timezone = tz_result.stdout.strip() if tz_result.returncode == 0 else None
+    require(tz_result.returncode == 0, 'Timezone policy verification failed: '
+            + (tz_result.stderr.strip()[:1000] or 'see guest timezone files'))
 
     # Runtime readback, including dotted interface names through procfs globbing.
     for line in read('/etc/sysctl.d/99-hardening.conf').splitlines():
@@ -2537,6 +3263,14 @@ try:
             require(run(['systemctl', 'is-enabled', unit])[1] == 'masked', f'{unit} is not masked.')
             require(run(['systemctl', 'is-active', '--quiet', unit])[0] != 0, f'{unit} is active.')
 
+    if policy['remove_postfix']:
+        # Keep the detailed diagnostic in the hardening report. This helper is
+        # read-only and checks runtime units/processes even after package purge.
+        postfix = subprocess.run(['/usr/local/sbin/lab-postfix-check', '--check-removed'],
+                                 capture_output=True, text=True, timeout=90)
+        require(postfix.returncode == 0,
+                'Postfix removal incomplete: ' + (postfix.stderr.strip()[:4000] or 'verification failed'))
+
     # Inventory excludes loopback; optional port lists verify external listeners.
     rc, sockets = run(['ss', '-H', '-lntu'])
     require(rc == 0, 'Cannot inspect listening sockets.')
@@ -2571,7 +3305,7 @@ except Exception as exc:
 
 status = 'FAIL' if errors else ('WARN' if warnings else 'OK')
 report = {'status': status, 'checked_at': int(time.time()), 'errors': errors,
-          'warnings': warnings, 'external_listeners': listeners}
+          'warnings': warnings, 'external_listeners': listeners, 'timezone': timezone}
 temporary = STATE / ('status.' + str(os.getpid()) + '.tmp')
 temporary.write_text(json.dumps(report, indent=2) + '\n')
 temporary.chmod(0o644)
@@ -2667,6 +3401,22 @@ install -m 0644 "$stage/index-refreshed" /var/lib/lab-hardening/last-index-refre
 
 # ── Remove and verify unwanted services ───────────────────────────────────────
 remove_packages=()
+if [[ $REMOVE_POSTFIX == 1 ]]; then
+  # Scope operations to known Debian Postfix units and actual instances only.
+  # Read inventory before masking/purging; a not-found unit can still be active.
+  postfix_unit_text=$(/usr/local/sbin/lab-postfix-check --units)
+  mapfile -t postfix_units <<< "$postfix_unit_text"
+  postfix_stop_text=$(/usr/local/sbin/lab-postfix-check --stop-units)
+  if [[ -n $postfix_stop_text ]]; then
+    mapfile -t postfix_stop_units <<< "$postfix_stop_text"
+    echo 'Stopping Postfix units before package removal...'
+    timeout 60 systemctl stop "${postfix_stop_units[@]}"
+  fi
+  # Mask without --force: never overwrite a local custom unit. No blanket
+  # process-name kills. If stopping or masking fails, preserve the CT and fail.
+  systemctl mask "${postfix_units[@]}"
+  /usr/local/sbin/lab-postfix-check --check-stopped
+fi
 if [[ $KEEP_SSH == 0 ]]; then
   for unit in ssh.service ssh.socket; do
     if [[ $(systemctl show "$unit" -p LoadState --value) != not-found ]]; then
@@ -2678,7 +3428,10 @@ fi
 [[ $REMOVE_POSTFIX == 0 ]] || remove_packages+=(postfix)
 installed_remove=()
 for package in "${remove_packages[@]}"; do
-  if [[ $(dpkg-query -W -f='${db:Status-Status}' "$package" 2>/dev/null || true) == installed ]]; then
+  package_status=$(dpkg-query -W -f='${db:Status-Status}' "$package" 2>/dev/null || true)
+  if [[ $package_status == installed ]] ||
+     [[ $package == postfix && -n $package_status && $package_status != not-installed ]]; then
+    # Include Postfix config-files/partial states, not just fully installed.
     installed_remove+=("$package")
   fi
 done
@@ -2692,6 +3445,11 @@ fi
 
 # ── Activate common policy ────────────────────────────────────────────────────
 systemctl daemon-reload
+if [[ $REMOVE_POSTFIX == 1 ]]; then
+  # Package maintainer scripts can remove a mask; restore our explicit policy.
+  systemctl mask "${postfix_units[@]}"
+  /usr/local/sbin/lab-postfix-check --check-removed
+fi
 install -d -o root -g systemd-journal -m 2755 /var/log/journal
 systemctl restart systemd-journald.service
 journalctl --flush
@@ -2717,6 +3475,8 @@ for source in stage.rglob('*'):
 policy = {'profile': profile, 'keep_ssh': keep == '1', 'remove_postfix': remove == '1',
           'update_max_age_hours': int(age), 'tcp_ports': list(map(int, tcp.split())),
           'udp_ports': list(map(int, udp.split())), 'files': files,
+          'version': '1.2.0',
+          'timezone': json.loads((stage / 'timezone-policy.json').read_text()),
           'journal': {'Storage': 'persistent', 'Compress': 'yes', 'SystemMaxUse': maximum + 'M',
                       'SystemKeepFree': '128M', 'RuntimeMaxUse': runtime + 'M',
                       'MaxRetentionSec': days + 'day', 'RateLimitIntervalSec': '30s', 'RateLimitBurst': '10000'}}
@@ -2732,6 +3492,9 @@ if ! systemctl start lab-hardening-check.service; then
   false
 fi
 cat /var/lib/lab-hardening/status.json
+effective_timezone=$(/usr/local/sbin/lab-timezone check /var/lib/lab-hardening/policy.json)
+timezone_action=set; [[ $PRESERVE_TIMEZONE != 1 ]] || timezone_action=preserved
+printf "Timezone: %s (%s; guest files verified).\n" "$effective_timezone" "$timezone_action"
 printf '\nShared hardening applied (%s). Backups: %s\n' "$PROFILE" "$backup"
 echo 'Manual check: /usr/local/sbin/lab-hardening-check'
 echo 'Local reports: /var/lib/lab-hardening/status.json and journalctl -u lab-hardening-check'
@@ -2739,286 +3502,189 @@ echo 'Application image updates, source-specific UFW rules and app health remain
 LAB_HARDENING_GUEST
 )
 # ── End shared hardening block ────────────────────────────────────────────────
-# END APPROVED BASELINE: lab-hardening-block-v1.1.1.sh
-
-STAGE="final verification"
-UFW_FILES_AFTER=$(pct exec "$CT_ID" -- sha256sum /etc/ufw/before.rules /etc/ufw/after.rules /etc/ufw/user.rules /etc/ufw/before6.rules /etc/ufw/after6.rules /etc/ufw/user6.rules)
-UFW_V4_AFTER=$(pct exec "$CT_ID" -- iptables -w 5 -S)
-UFW_V6_AFTER=$(pct exec "$CT_ID" -- ip6tables -w 5 -S)
-[[ $UFW_FILES_BEFORE == "$UFW_FILES_AFTER" && $UFW_V4_BEFORE == "$UFW_V4_AFTER" && $UFW_V6_BEFORE == "$UFW_V6_AFTER" ]] || {
-  echo "ERROR: Hardening changed persistent/effective UFW rules. CT preserved for diagnosis." >&2
+# END CANONICAL HARDENING: v1.2.0
+# BEGIN COMMON: UFW PRESERVATION CHECK
+# COMMON UFW PRESERVATION CHECK
+INSTALL_STAGE="final verification"
+UFW_RULES_AFTER=$(pct exec "$CT_ID" -- bash -s <<'UFW_SNAPSHOT_AFTER'
+set -euo pipefail
+sha256sum /etc/ufw/{before,after,user}{,6}.rules
+iptables -w 5 -S
+ip6tables -w 5 -S
+UFW_SNAPSHOT_AFTER
+)
+[[ $UFW_RULES_BEFORE == "$UFW_RULES_AFTER" ]] || {
+  echo 'ERROR: Persistent/effective UFW rules changed during hardening; CT preserved.' >&2
   false
 }
-pct exec "$CT_ID" -- /usr/local/sbin/matrix-verify
-# The common block already ran its check service: WARN is a successful outcome.
+unset UFW_RULES_BEFORE UFW_RULES_AFTER
+# END COMMON: UFW PRESERVATION CHECK
+
+pct exec "$CT_ID" -- /usr/local/bin/matrix-maint.sh check --initial
+pct exec "$CT_ID" -- /usr/local/sbin/lab-hardening-check
+# BEGIN COMMON: FINAL TIMEZONE CHECK
+# COMMON FINAL TIMEZONE CHECK
+EFFECTIVE_GUEST_TIMEZONE=$(pct exec "$CT_ID" -- /usr/local/sbin/lab-timezone check /var/lib/lab-hardening/policy.json)
+[[ $EFFECTIVE_GUEST_TIMEZONE == "$APP_TZ" ]] || {
+  echo 'ERROR: Planned application timezone differs from the final guest timezone; CT preserved.' >&2
+  false
+}
+unset TIMEZONE_PLAN
+# END COMMON: FINAL TIMEZONE CHECK
+
 HARDENING_STATUS=$(pct exec "$CT_ID" -- python3 -c 'import json; print(json.load(open("/var/lib/lab-hardening/status.json"))["status"])')
-[[ $HARDENING_STATUS == OK || $HARDENING_STATUS == WARN ]] || { echo "ERROR: Hardening did not pass." >&2; false; }
-echo "  UFW persistent/effective rules preserved; hardening: $HARDENING_STATUS"
+[[ $HARDENING_STATUS == OK || $HARDENING_STATUS == WARN ]] || {
+  echo 'ERROR: Hardening verification did not pass; CT preserved.' >&2
+  false
+}
 
-# ── Proxmox UI description ────────────────────────────────────────────────────
-LINK_STYLE="text-decoration: none; color: #00617f;"
-MX_DESC="Public: <a href='https://${ELEMENT_FQDN}/' target='_blank' rel='noopener noreferrer' style='${LINK_STYLE}'>Element Web</a> · <a href='https://${SYNAPSE_FQDN}/' target='_blank' rel='noopener noreferrer' style='${LINK_STYLE}'>Synapse</a>
-Backend ingress: UFW inside this CT; ${FIREWALL_ACCESS}.
-<details><summary>Details</summary>Matrix Synapse + Element Web (Podman/Quadlet) on Debian ${DEBIAN_VERSION} LXC
-Server name: ${SYNAPSE_SERVER_NAME} | Synapse: ${SYNAPSE_TAG} | Element: ${ELEMENT_TAG} | PostgreSQL: ${POSTGRES_TAG}
-Created by matrix-quadlet.sh</details>"
+INSTALL_STAGE="timer and protection"
+# Persistent image timers may catch up immediately. Activate only after all
+# final application/common/timezone verification above has succeeded.
+pct exec "$CT_ID" -- systemctl daemon-reload
+if [[ $AUTO_UPDATE == 1 ]]; then
+  pct exec "$CT_ID" -- systemctl enable --now matrix-update.timer
+else
+  pct exec "$CT_ID" -- systemctl disable --now matrix-update.timer
+fi
+pct exec "$CT_ID" -- python3 - "$AUTO_UPDATE" "$UPDATE_TIME" "$APP_TZ" <<'TIMER_VERIFY'
+import json, re, subprocess, sys
+from pathlib import Path
+enabled, schedule, zone = sys.argv[1:]
+def require(ok, message):
+    if not ok:
+        raise SystemExit('ERROR: Matrix timer: ' + message)
+def show(prop):
+    result = subprocess.run(['systemctl', 'show', 'matrix-update.timer', '-p', prop, '--value'],
+                            capture_output=True, text=True, timeout=15)
+    require(result.returncode == 0, 'cannot inspect timer state')
+    return result.stdout.strip()
+content = Path('/etc/systemd/system/matrix-update.timer').read_text()
+calendar = '*-*-* ' + schedule + ':00'
+require(re.findall(r'^OnCalendar=(.*)$', content, re.M) == [calendar], 'installed calendar differs')
+require(re.findall(r'^Persistent=(.*)$', content, re.M) == ['true'], 'persistent catch-up policy differs')
+require(re.findall(r'^WantedBy=(.*)$', content, re.M) == ['timers.target'], 'timer install target differs')
+require(calendar in show('TimersCalendar'), 'loaded calendar differs')
+require(show('Unit') == 'matrix-update.service', 'timer service differs')
+require(show('UnitFileState') == ('enabled' if enabled == '1' else 'disabled'), 'enablement differs')
+require(show('ActiveState') == ('active' if enabled == '1' else 'inactive'), 'active state differs')
+next_elapse = show('NextElapseUSecRealtime')
+require(enabled != '1' or next_elapse not in ('', 'n/a', '0'), 'active timer lacks next elapse')
+service = Path('/etc/systemd/system/matrix-update.service').read_text()
+require(re.findall(r'^ExecStart=(.*)$', service, re.M) == ['/usr/local/bin/matrix-maint.sh auto-update'], 'maintenance command differs')
+require(json.loads(Path('/var/lib/lab-hardening/policy.json').read_text())['timezone']['effective'] == zone,
+        'final timezone policy differs')
+result = subprocess.run(['systemd-analyze', 'calendar', '--iterations=1', calendar],
+                        text=True, capture_output=True, timeout=15)
+require(result.returncode == 0 and 'Next elapse:' in result.stdout, 'calendar has no computable next elapse')
+next_calendar = next(line.strip() for line in result.stdout.splitlines() if 'Next elapse:' in line)
+print('Image timer: ' + ('enabled/active' if enabled == '1' else 'disabled/inactive') + '; daily ' + schedule + ' (' + zone + ')')
+print('  ' + next_calendar + (' (calendar preview; timer inactive)' if enabled == '0' else ''))
+TIMER_VERIFY
+
+MX_DESC="Matrix Synapse + Element Web; Debian 13 unprivileged LXC.
+Element: https://${ELEMENT_FQDN}/ | Synapse: https://${SYNAPSE_FQDN}/
+Permanent Matrix ID: @user:${SYNAPSE_SERVER_NAME}
+UFW inside CT: ${FIREWALL_ACCESS}. PostgreSQL: loopback only.
+Hardening v1.2.0: ${HARDENING_STATUS}; timezone: ${EFFECTIVE_GUEST_TIMEZONE}.
+Image updates: AUTO_UPDATE=${AUTO_UPDATE}, daily ${UPDATE_TIME} local time."
 pct set "$CT_ID" --description "$MX_DESC"
-
-# ── Protect container ─────────────────────────────────────────────────────────
+# BEGIN COMMON: PROTECTION
 pct set "$CT_ID" --protection 1
+# END COMMON: PROTECTION
+pct config "$CT_ID" | grep -qx 'protection: 1'
+pct exec "$CT_ID" -- passwd -S root | awk '$2 == "P" {ok=1} END {exit !ok}'
+CT_IPV6=$(pct exec "$CT_ID" -- ip -6 -o addr show scope global | awk '{print $4}' | paste -sd ' ')
 
-# ── Terminal quality of life ──────────────────────────────────────────────────
-pct exec "$CT_ID" -- bash -lc '
-  set -euo pipefail
-  touch /root/.bashrc
-  grep -q "^export TERM=" /root/.bashrc 2>/dev/null || echo "export TERM=xterm-256color" >> /root/.bashrc
-'
-
-STAGE="success reporting"
-# ── Summary ───────────────────────────────────────────────────────────────────
+INSTALL_STAGE="summary"
 cat <<SUMMARY
 
-  MATRIX INSTALLATION COMPLETE
+  MATRIX INSTALLATION VERIFIED
 
-  OPEN ELEMENT       https://${ELEMENT_FQDN}/
-  HOMESERVER         https://${SYNAPSE_FQDN}/
-  CONTAINER          $HN | CT $CT_ID | $CT_IP
-  LOGIN              root password set
-  HARDENING          $HARDENING_STATUS (v1.1.1); SSH keep=$HARDENING_KEEP_SSH
-  LISTENER POLICY    TCP=${HARDENING_TCP_PORTS:-inventory-only}; UDP=${HARDENING_UDP_PORTS:-inventory-only}
-  PERMANENT ID       @user:${SYNAPSE_SERVER_NAME}
+  Container: $HN | CT $CT_ID | IPv4 $CT_IP | IPv6 ${CT_IPV6:-none}
+  Debian 13, unprivileged, protected. Root password set; console: pct enter $CT_ID.
+  SSH policy: keep=$HARDENING_KEEP_SSH (0=removed/masked; 1=preserved without new access).
 
-  IMPORTANT: Keep this Matrix server name. It is part of every user's identity.
+  Access:
+    Synapse: https://${SYNAPSE_FQDN}/ -> http://${CT_IP}:${SYNAPSE_PORT}
+    Element: https://${ELEMENT_FQDN}/ -> http://${CT_IP}:${ELEMENT_PORT}
+    Permanent Matrix ID: @user:${SYNAPSE_SERVER_NAME} — do not change server_name.
+    HTTP access: $FIREWALL_ACCESS
+    NPM/client IPv4 hosts: ${BACKEND_ALLOWED_IPV4[*]:-none selected}
+    NPM/client IPv6 hosts: ${BACKEND_ALLOWED_IPV6[*]:-none selected}
+    PostgreSQL: 127.0.0.1:5432, SCRAM; restricted synapse role, C locale.
+    Administrator API: use CT loopback; block /_synapse/admin at the public proxy.
 
-  FIRST SETUP
+  Firewall: UFW inside CT, IPv4/IPv6; no Proxmox firewall dependency.
+    All six UFW rule files and both full filter tables unchanged across hardening.
+    Listener inventory only: TCP=${HARDENING_TCP_PORTS:-inventory-only}; UDP=${HARDENING_UDP_PORTS:-inventory-only}
+    Inventory does not add UFW access. DHCP/control-traffic rules are retained.
 
-  1. RESERVE THE IP ADDRESSES
+  Timezone: $EFFECTIVE_GUEST_TIMEZONE ($TIMEZONE_ACTION).
+    TZ delivery verified for Synapse, Element and PostgreSQL; Synapse local-time
+    behavior checked. Element browser time and PostgreSQL SQL/log zones stay separate.
 
-     In your router/DHCP server, reserve the Matrix and NPM addresses:
-       Matrix IPv4   $CT_IP
-       NPM IPv4      ${BACKEND_ALLOWED_IPV4[*]}
-       NPM IPv6      ${BACKEND_ALLOWED_IPV6[*]:-(none)}
-     Selected backend access: $FIREWALL_ACCESS.
+  Runtime and files:
+    Synapse:    $SYNAPSE_IMAGE
+                $SYNAPSE_IMAGE_ID
+    Element:    $ELEMENT_IMAGE
+                $ELEMENT_IMAGE_ID
+    PostgreSQL: $POSTGRES_IMAGE
+                $POSTGRES_IMAGE_ID
+    Immutable IDs; Pull=never; host networking.
+    Quadlets: /etc/containers/systemd/matrix-*.container
+    State/policy: /opt/matrix/.env, install-policy.json, firewall-policy.json
+    Persistent data: /opt/matrix/postgresdata/18/docker, /opt/matrix/synapse
+    Element config: /opt/matrix/element-config.json
+    PRIVATE credentials: /opt/matrix/postgres.env and synapse/homeserver.yaml (0600).
 
-  2. CONFIGURE NGINX PROXY MANAGER (NPM)
+  Updates and recovery:
+    Image AUTO_UPDATE=$AUTO_UPDATE; daily $UPDATE_TIME ($EFFECTIVE_GUEST_TIMEZONE).
+    Common hardening checker: after boot and hourly; status=$HARDENING_STATUS.
+    Wait budgets: initial ${INITIAL_WAIT_SECONDS}s; maintenance ${UPDATE_WAIT_SECONDS}s.
+    PBS/PVE checkpoint is your responsibility; --yes creates/verifies no backup.
+    Cover the full CT: /opt/matrix, /var/lib/containers/storage, units and policies.
+    No external data mounts are created. A live snapshot alone proves no DB consistency.
+    FUSE=$PODMAN_FUSE_OVERLAY: with FUSE use stop-mode PBS; otherwise validate backups under I/O.
+    Old images are retained. Image reversal does not undo a database migration.
+    Stateful target starts never trigger automatic image/database downgrades.
 
-     Create these two proxy hosts:
-       ${SYNAPSE_FQDN} -> http://${CT_IP}:${SYNAPSE_PORT}
-       ${ELEMENT_FQDN} -> http://${CT_IP}:${ELEMENT_PORT}
+  Run on Proxmox:
+    pct exec $CT_ID -- /usr/local/bin/matrix-maint.sh check
+    pct exec $CT_ID -- /usr/local/bin/matrix-maint.sh version
+    pct exec $CT_ID -- /usr/local/sbin/lab-hardening-check
+    pct enter $CT_ID
 
-     For BOTH hosts:
-       Scheme               http
-       Forward Hostname/IP   $CT_IP
-       Forward Port          Synapse: ${SYNAPSE_PORT} | Element: ${ELEMENT_PORT}
-       Websockets Support    ON
+  Run inside CT:
+    /usr/local/bin/matrix-maint.sh check [--initial]
+    /usr/local/bin/matrix-maint.sh version
+    /usr/local/sbin/lab-hardening-check
+    journalctl -u matrix-synapse.service -u matrix-postgres.service -u matrix-element.service
+    /usr/local/bin/matrix-maint.sh --help
 
-     Synapse proxy host > Advanced tab (paste these nginx settings):
-       client_max_body_size ${MAX_UPLOAD_SIZE};
-       proxy_read_timeout 600s;
-       proxy_send_timeout 600s;
-       location ^~ /_synapse/admin { return 403; }
+  Verification: shared Matrix checks passed before and after common hardening.
+    Common result: $HARDENING_STATUS. WARN requires review; no automatic restart/reboot.
+    Still test: NPM/client reachability and denied sources, public DNS/HTTPS,
+    registration/login/federation, real calls/TURN, DHCP renewal, reviewed reboot
+    persistence, and a reviewed update/check cycle with verified PBS/PVE coverage.
 
-     HTTPS: Choose the setup that matches your ingress.
+  Initial public setup:
+    Reserve Matrix/NPM IPs. Route both names through NPM to the HTTP ports above;
+    enable WebSockets. Set client_max_body_size ${MAX_UPLOAD_SIZE}, proxy_read_timeout
+    600s, proxy_send_timeout 600s, and location ^~ /_synapse/admin { return 403; }.
+    Configure public HTTPS. With Cloudflare Tunnel -> NPM HTTP, TLS terminates at
+    Cloudflare. Matrix API/well-known paths must not receive browser challenges.
+    x_forwarded is enabled: UFW source access and proxy-header trust are separate.
+    Trust CF-Connecting-IP only from the actual cloudflared peer; loopback only
+    when cloudflared reaches NPM in that same namespace. Never trust all sources.
+    Enter-to-allow-any also permits direct HTTP; public client setup uses HTTPS.
 
-       CLOUDFLARE TUNNEL -> NPM PORT 80
-         Leave NPM's SSL tab empty; Force SSL stays OFF.
-         Cloudflare provides public HTTPS. Exempt Matrix API/well-known paths
-         from browser challenges using the appropriate Cloudflare settings.
+    First administrator (inside CT, interactive):
+      podman exec -it matrix-synapse register_new_matrix_user -c /data/homeserver.yaml http://127.0.0.1:${SYNAPSE_PORT}
+    Registration tokens: use the administrator API on CT loopback; keep tokens private.
+    Then sign in at https://${ELEMENT_FQDN}/.
 
-       DIRECT INTERNET -> NPM
-         Configure a valid certificate and HTTPS in NPM.
-
-     Public DNS and HTTPS must work for BOTH domains before Element login.
-     Preserve Matrix request paths. Synapse serves its own discovery endpoints:
-       /.well-known/matrix/server
-       /.well-known/matrix/client
-
-  3. CHECK ACCESS
-
-     RUN INSIDE THE NPM CT -- each command should print HTTP 200:
-       curl -sS -o /dev/null -w 'HTTP %{http_code}\n' --max-time 5 http://${CT_IP}:${SYNAPSE_PORT}/health
-       curl -sS -o /dev/null -w 'HTTP %{http_code}\n' --max-time 5 http://${CT_IP}:${ELEMENT_PORT}/
-
-     Restricted mode: other source hosts must be blocked on these URLs.
-     Any-source mode: these URLs are allowed from any routable source.
-     Element login still requires the public HTTPS domains above.
-     Installer rule checks do not prove this full network path.
-
-     Federation test (open in a browser):
-       https://federationtester.matrix.org/#${SYNAPSE_SERVER_NAME}
-
-  4. CREATE YOUR FIRST ADMINISTRATOR
-
-     RUN ON THE PROXMOX HOST to enter the Matrix CT:
-       pct enter $CT_ID
-
-     THEN RUN INSIDE THE MATRIX CT:
-       podman exec -it matrix-synapse register_new_matrix_user -c /data/homeserver.yaml http://127.0.0.1:${SYNAPSE_PORT}
-
-     Answer y when asked whether the new account should be an administrator.
-     Then sign in at https://${ELEMENT_FQDN}/
-
-     Registration tokens: use an administrator access token with the admin API
-     on CT loopback (127.0.0.1). Keep bearer tokens off unencrypted LAN HTTP.
-
-  BEFORE UPDATING -- VERIFY YOUR BACKUP
-
-     PBS/PVE is responsible for backup and recovery. The maintenance helper
-     does not create or verify backups and has no full-stack restore command.
-
-     BACK UP THE FULL CT, including:
-       /opt/matrix                         database, media, keys and app config
-       /var/lib/containers/storage         locally pinned container images
-       Quadlets, maintenance files and UFW configuration
-
-     For stateful updates, verify a suitable preupd recovery checkpoint with
-     applications stopped. A live snapshot alone does not prove consistency.
-SUMMARY
-if (( PODMAN_FUSE_OVERLAY )); then
-  echo "     BACKUP MODE: STOP -- FUSE is enabled; do not freeze a running FUSE CT."
-else
-  echo "     BACKUP MODE: Native overlay -- validate snapshot backups under I/O load."
-fi
-cat <<SUMMARY
-
-  MAINTENANCE COMMANDS
-
-     RUN ON THE PROXMOX HOST -- show current versions:
-       pct exec $CT_ID -- /usr/local/bin/matrix-maint.sh version
-
-     For interactive updates, enter the CT from the Proxmox host:
-       pct enter $CT_ID
-
-     THEN RUN INSIDE THE MATRIX CT -- one component at a time:
-
-       Synapse:
-         /usr/local/bin/matrix-maint.sh update ${SYNAPSE_TAG}
-
-       Element:
-         /usr/local/bin/matrix-maint.sh update-element ${ELEMENT_TAG}
-
-       PostgreSQL:
-         /usr/local/bin/matrix-maint.sh update-postgres ${POSTGRES_TAG}
-
-     These are the installed tags. Reusing them checks for image rebuilds.
-     To change versions, replace the tag with the desired full release tag.
-     PostgreSQL must remain on major 18 and the same image variant.
-     The helper prompts for confirmation; read the checkpoint reminder first.
-
-     REVERT ELEMENT ONLY -- previous captured image, no registry pull:
-       /usr/local/bin/matrix-maint.sh update-element previous
-
-     Element updates/reverts preserve the database and media; check client
-     compatibility. Synapse/PostgreSQL NEVER auto-downgrade after target start.
-     If a stateful update fails, inspect migration logs and recover matching
-     PBS/PVE state if needed. Earlier successful component updates stay applied.
-
-     UNATTENDED UPDATES -- --yes skips confirmation; it does NOT verify a backup.
-     Proxmox-host example, after you have verified the checkpoint:
-       pct exec $CT_ID -- /usr/local/bin/matrix-maint.sh update ${SYNAPSE_TAG} --yes
-     The same form works with update-element and update-postgres.
-
-     Wait limits: first install ${INITIAL_WAIT_SECONDS}s; Synapse upgrades ${SYNAPSE_WAIT_SECONDS}s.
-     Crashes fail earlier. A migration timeout does not kill Synapse.
-
-  AUTOMATIC IMAGE UPDATES
-SUMMARY
-if (( AUTO_UPDATE )); then
-  echo "     STATUS: ENABLED -- daily at $UPDATE_TIME ($APP_TZ)."
-else
-  echo "     STATUS: DISABLED -- the installed timer is inactive."
-  echo "     Configured time if enabled: $UPDATE_TIME ($APP_TZ)."
-fi
-cat <<SUMMARY
-     Auto-refresh checks the current pinned tags; it does not select new tags.
-     Policy: AUTO_UPDATE in /opt/matrix/.env; timer enablement is separate.
-     Schedule: OnCalendar in /etc/systemd/system/matrix-update.timer.
-     After editing the timer, reload systemd and restart it if it is enabled.
-
-  FIREWALL AND TROUBLESHOOTING
-
-     UFW filters IPv4 and IPv6 inside this CT. Incoming connections are denied
-     by default; ports ${SYNAPSE_PORT} and ${ELEMENT_PORT}: $FIREWALL_ACCESS.
-     Outgoing traffic is allowed. Standard loopback, replies, DHCP and ICMP remain.
-     PostgreSQL listens only on 127.0.0.1:5432, using SCRAM and a restricted role.
-     No Proxmox Datacenter firewall switch or PVE firewall rules are required.
-
-     RUN ON THE PROXMOX HOST:
-       pct exec $CT_ID -- ufw status verbose
-       pct exec $CT_ID -- /usr/local/sbin/matrix-verify
-       pct exec $CT_ID -- /usr/local/sbin/lab-hardening-check
-       pct enter $CT_ID
-
-     INSIDE THE MATRIX CT -- follow Synapse logs (Ctrl+C stops following):
-       journalctl -u matrix-synapse.service -f
-
-     NPM ADDRESS CHANGED? For a successfully installed CT, run inside it.
-     After a reviewed rule change, update the sources in
-     /opt/matrix/firewall-policy.json to match the intended policy.
-     Replace NEW_NPM_IP and OLD_NPM_IP with the exact host addresses.
-
-       FIRST add the new address:
-         ufw allow in proto tcp from NEW_NPM_IP to any port ${SYNAPSE_PORT}
-         ufw allow in proto tcp from NEW_NPM_IP to any port ${ELEMENT_PORT}
-
-       VERIFY access from NPM, THEN remove the old address:
-         ufw delete allow in proto tcp from OLD_NPM_IP to any port ${SYNAPSE_PORT}
-         ufw delete allow in proto tcp from OLD_NPM_IP to any port ${ELEMENT_PORT}
-
-     UFW allow/delete commands apply immediately. Do not restart ufw.service
-     for a rule edit: restarting it stops the dependent Matrix services.
-     If you did restart UFW, start those services again inside this CT:
-       systemctl start matrix-synapse.service matrix-element.service
-
-  CALLING
-
-     Legacy TURN mode: $TURN_MODE
-SUMMARY
-if [[ $TURN_MODE == disabled ]]; then
-  echo "     No TURN relay is configured for legacy calls."
-else
-  echo "     TURN URIs: ${TURN_URIS[*]}"
-  echo "     Test relay allocation from different networks; HTTP checks do not test calls."
-fi
-if [[ -n $MATRIX_RTC_AUTH_URL ]]; then
-  echo "     Modern Element Call: external MatrixRTC backend configured."
-  echo "     Authorization URL: $MATRIX_RTC_AUTH_URL"
-  echo "     LiveKit and authorization run separately; verify with a real call."
-else
-  echo "     Modern Element Call: NOT CONFIGURED."
-  echo "     It needs LiveKit + MatrixRTC authorization; TURN alone is insufficient."
-  echo "     Set both RTC URLs to integrate an existing backend."
-fi
-if [[ $TURN_MODE == openrelay ]]; then
-  echo "     Public test relay terms: https://www.metered.ca/tools/openrelay/"
-fi
-cat <<SUMMARY
-
-  CONFIGURATION REFERENCE
-
-     Maintenance policy     /opt/matrix/.env
-                            Comments and blank lines are accepted.
-     Synapse configuration  $SYNAPSE_DATA_DIR/homeserver.yaml
-     Database credentials   $POSTGRES_ENV_FILE
-     Element configuration  $ELEMENT_CONFIG_FILE
-     Quadlet units          /etc/containers/systemd/matrix-*.container
-
-     PRIVATE: homeserver.yaml and postgres.env contain secrets (permissions 0600).
-     Keep them private when sharing diagnostics.
-
-     Installed images:
-       Synapse     $SYNAPSE_IMAGE
-       Element     $ELEMENT_IMAGE
-       PostgreSQL  $POSTGRES_IMAGE
-     Quadlets use immutable image IDs with Pull=never.
-
-     Cloudflare client IP forwarding -- NPM Advanced settings:
-       ONLY if cloudflared reaches NPM through loopback in the same namespace:
-         set_real_ip_from 127.0.0.1;
-         real_ip_header CF-Connecting-IP;
-       Otherwise trust the actual cloudflared source address, never all sources.
-     Upload setting: ${MAX_UPLOAD_SIZE}; leave headroom below your upstream body cap.
-
-  NEXT: Complete FIRST SETUP above, then open https://${ELEMENT_FQDN}/
-
+    Legacy TURN: $TURN_MODE
+    MatrixRTC auth: ${MATRIX_RTC_AUTH_URL:-not configured}
+    LiveKit/MatrixRTC run separately. TURN alone is insufficient for modern calls.
 SUMMARY
