@@ -48,9 +48,6 @@ Any upstream firewall must also allow this traffic.
 | UDP | 3478 | TURN |
 | UDP | 40000–40199 | TURN relay range |
 
-
-The destination-specific syntax matches the installer's runtime checks. [UFW command reference](https://manpages.debian.org/trixie/ufw/ufw.8.en.html).
-
 **If a Hetzner Cloud Firewall is attached:** allow the same six rows inbound from `0.0.0.0/0`, plus your existing restricted SSH access. If outbound traffic is restricted, allow the backend's required outbound traffic as well. Both firewalls must permit the connection.
 
 Keep TCP **5349, 7880, 8080, 6379, 18080 and 18081 closed externally**. The installer protects these internal services. Ports on the home Matrix LXC remain restricted to NPM.
