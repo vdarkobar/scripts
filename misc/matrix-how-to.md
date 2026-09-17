@@ -37,7 +37,7 @@ Matrix API paths must work without an interactive Access login or browser challe
 
 ## 3. Firewall — RTC VPS only
 
-Finish cloud-init and phase 2 first, including any required reboot. **UFW must already be active.** Keep the existing SSH port and management-source rules.
+Any upstream firewall must also allow this traffic.
 
 | Protocol | Inbound port | Purpose |
 |---|---|---|
@@ -48,24 +48,6 @@ Finish cloud-init and phase 2 first, including any required reboot. **UFW must a
 | UDP | 3478 | TURN |
 | UDP | 40000–40199 | TURN relay range |
 
-These are **this installer's defaults**. The installer adds the UFW rules automatically. To restore them on an installed VPS:
-
-```bash
-sudo matrixrtc-maint firewall-repair
-```
-
-For manual setup, replace the IPv4 placeholder and run this whole block on the RTC VPS:
-
-```bash
-RTC_VPS_IPV4="REPLACE_WITH_VPS_PUBLIC_IPV4"
-sudo ufw allow proto tcp from any to "$RTC_VPS_IPV4" port 80
-sudo ufw allow proto tcp from any to "$RTC_VPS_IPV4" port 443
-sudo ufw allow proto tcp from any to "$RTC_VPS_IPV4" port 7881
-sudo ufw allow proto udp from any to "$RTC_VPS_IPV4" port 7882
-sudo ufw allow proto udp from any to "$RTC_VPS_IPV4" port 3478
-sudo ufw allow proto udp from any to "$RTC_VPS_IPV4" port 40000:40199
-sudo ufw status numbered
-```
 
 The destination-specific syntax matches the installer's runtime checks. [UFW command reference](https://manpages.debian.org/trixie/ufw/ufw.8.en.html).
 
